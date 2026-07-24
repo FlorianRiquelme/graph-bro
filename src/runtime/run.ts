@@ -94,14 +94,15 @@ function buildNodeFns(
 
 /**
  * Reconstructs join-barrier per-instance arrival state on resume (KTD-12's
- * resume seam): handles the mining-shaped join — a single declared source fed
- * by exactly one dynamic fan-out edge — by rebuilding the full per-instance id
- * universe from the resumed state's runtime `for_each` list and splitting it
- * into arrived (already in `completedInstanceIds`) vs. not-yet-arrived (which
- * re-arrive naturally as the resumed frontier's remaining branches complete).
- * A join backed by 2+ distinct declared sources is NOT reconstructed here —
- * a genuine limitation left for a later slice; the mining driver only has the
- * single-dynamic-source shape.
+ * resume seam): handles the dynamic-fan-out-shaped join — a single declared
+ * source fed by exactly one dynamic fan-out edge — by rebuilding the full
+ * per-instance id universe from the resumed state's runtime `for_each` list
+ * and splitting it into arrived (already in `completedInstanceIds`) vs.
+ * not-yet-arrived (which re-arrive naturally as the resumed frontier's
+ * remaining branches complete). A join backed by 2+ distinct declared
+ * sources is NOT reconstructed here — a genuine limitation left for a later
+ * slice; this slice's driving workload only has the single-dynamic-source
+ * shape.
  */
 function reconstructBarrierState(
   compiled: CompiledTopology,
