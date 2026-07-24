@@ -1,45 +1,11 @@
-import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { compile } from "../../src/topology/compile.js";
+import { REPO_ROOT, FAKE_CLAUDE, gitRepo, runCliSync, waitForRunStatus } from "../fixtures/cli-harness.js";
 
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const CLI_ENTRY = join(REPO_ROOT, "dist", "cli", "index.js");
-const FAKE_CLAUDE = join(REPO_ROOT, "test", "fixtures", "fake-claude.mjs");
 const EXAMPLE_TOPOLOGY_PATH = join(REPO_ROOT, "examples", "fanout-read-join", "topology.json");
-
-function gitRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "graph-bro-smoke-repo-"));
-  execFileSync("git", ["init", "-q"], { cwd: dir });
-  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
-  execFileSync("git", ["config", "user.name", "test"], { cwd: dir });
-  execFileSync("git", ["add", "-A"], { cwd: dir });
-  execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir });
-  return dir;
-}
-
-function runCliSync(
-  args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv },
-): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
-    cwd: opts.cwd,
-    env: opts.env,
-    encoding: "utf-8",
-  });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 100): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
-  }
-}
 
 describe("smoke: the shipped fanout-read-join example graph", () => {
   let home: string;
@@ -86,10 +52,7 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       const runId = start.stdout.trim();
       expect(runId).toMatch(/[0-9a-f-]{36}/);
 
-      await waitFor(() => {
-        const status = runCliSync(["status", runId], { cwd, env });
-        return JSON.parse(status.stdout).status === "completed";
-      }, 5000);
+      await waitForRunStatus(home, runId, "completed", 5000);
 
       const result = runCliSync(["result", runId], { cwd, env });
       const output = JSON.parse(result.stdout);

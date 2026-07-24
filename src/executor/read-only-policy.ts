@@ -35,7 +35,7 @@ export class ReadOnlyViolationError extends Error {
  * `ReadOnlyViolationError` if the cwd is left dirty.
  */
 export function assertRepoClean(cwd: string, nodeId: string): void {
-  const output = execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
+  const output = execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8", timeout: 10_000 });
   if (output.trim().length > 0) {
     throw new ReadOnlyViolationError(nodeId, output);
   }

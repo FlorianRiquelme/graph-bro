@@ -37,6 +37,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     execFileSync("git", ["init", "-q"], { cwd });
     execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
     execFileSync("git", ["config", "user.name", "test"], { cwd });
+    execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd }); // throwaway /tmp repo; no signing agent dependency
     execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd });
   });
 

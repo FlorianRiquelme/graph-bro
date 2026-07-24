@@ -1,13 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { compile } from "../topology/compile.js";
 import { openDb } from "../store/db.js";
 import { createRun } from "../store/pending-writes.js";
-
-const RUNTIME_ENTRY = resolve(dirname(fileURLToPath(import.meta.url)), "..", "runtime", "run.js");
+import { spawnDetachedEngine } from "./spawn-engine.js";
 
 /**
  * `graph-bro start <topology-path> [--input <path>]` (ADR-0004/ADR-0002):
@@ -50,20 +47,16 @@ export async function startCommand(args: string[]): Promise<void> {
   }
 
   const runId = randomUUID();
-  const child = spawn(process.execPath, [RUNTIME_ENTRY, "start", runId, topologyPath, JSON.stringify(input)], {
-    detached: true,
-    stdio: "ignore",
-  });
-  if (child.pid === undefined) {
+  const pid = spawnDetachedEngine(["start", runId, topologyPath, JSON.stringify(input)]);
+  if (pid === undefined) {
     console.error("graph-bro: failed to launch the engine process");
     process.exitCode = 1;
     return;
   }
 
   const db = openDb();
-  createRun(db, runId, child.pid, topologyPath);
+  createRun(db, runId, pid, topologyPath);
   db.close();
-  child.unref();
 
   console.log(runId);
 }

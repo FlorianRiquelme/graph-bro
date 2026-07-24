@@ -24,7 +24,7 @@ export function buildFanOutBranches(edge: FanOutEdge, state: EngineState): FanOu
     return {
       instanceId,
       itemKey,
-      activation: { nodeId: edge.to, instanceId, binding: { key: edge.as, value: item } },
+      activation: { nodeId: edge.to, instanceId, binding: { key: edge.as, value: item }, itemKey },
     };
   });
 }

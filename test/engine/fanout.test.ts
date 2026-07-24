@@ -255,7 +255,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       state: { batch: { items } },
       frontier: items.map((item, i) => ({
         nodeId: "reader",
-        instanceId: `reader:${i}`,
+        instanceId: `reader:idx:${i}`,
         binding: { key: "item", value: item },
       })),
       barrier: {},
@@ -268,7 +268,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
         runId,
         node: "reader",
         step: 1,
-        itemKey: String(i),
+        itemKey: `idx:${i}`,
         triggers: [],
         writes: { results: items[i] },
       });
@@ -306,7 +306,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       initialBarrierState: [
         {
           source: "reader",
-          expectedInstanceIds: items.map((_, i) => `reader:${i}`),
+          expectedInstanceIds: items.map((_, i) => `reader:idx:${i}`),
           arrivedInstanceIds: [...resumed.completedInstanceIds],
         },
       ],
@@ -350,7 +350,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
 
     const resumed = resume(db, runId, { reducerForKey: (key) => (key === "results" ? "dedup" : undefined) });
     expect(resumed.frontier).toHaveLength(1); // only "boom"'s branch is outstanding
-    expect(resumed.frontier[0].instanceId).toBe("reader:1");
+    expect(resumed.frontier[0].instanceId).toBe("reader:idx:1");
 
     // The retry now succeeds.
     const retryStub = new StubExecutor((prompt) => ({ text: prompt, isError: false }));
@@ -376,7 +376,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       initialBarrierState: [
         {
           source: "reader",
-          expectedInstanceIds: items.map((_, i) => `reader:${i}`),
+          expectedInstanceIds: items.map((_, i) => `reader:idx:${i}`),
           arrivedInstanceIds: [...resumed.completedInstanceIds],
         },
       ],

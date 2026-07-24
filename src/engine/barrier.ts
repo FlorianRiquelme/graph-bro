@@ -68,7 +68,10 @@ export class ResettableJoinBarrier {
     for (const source of this.sources) {
       const expected = this.expectedBySource.get(source)!;
       const arrived = this.arrivedBySource.get(source)!;
-      const complete = expected.size > 0 && [...expected].every((id) => arrived.has(id));
+      // A source armed with zero expected instances (a fan-out over a
+      // runtime-empty list) is vacuously satisfied — it must not block the
+      // barrier forever, the way `expected.size > 0 && ...` previously did.
+      const complete = [...expected].every((id) => arrived.has(id));
       if (!complete) missing.push(source);
     }
     return missing;

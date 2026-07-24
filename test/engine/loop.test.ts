@@ -62,6 +62,27 @@ describe("runLoop", () => {
     expect(collectorRuns).toBe(1);
   });
 
+  it("a join whose `to` targets END directly (no intermediate node) completes the run", async () => {
+    const graph = emptyGraph({
+      plainEdges: [
+        { from: START, to: "A" },
+        { from: START, to: "B" },
+      ],
+      joinBarriers: [
+        { id: "join-to-end", sources: ["A", "B"], mode: "all", reducer: "append", into: "results", to: END },
+      ],
+    });
+    const nodeFns: Record<string, NodeFn> = {
+      A: () => ({ results: "a" }),
+      B: () => ({ results: "b" }),
+    };
+
+    const result = await runLoop({ graph, nodeFns });
+
+    expect(result.status).toBe("completed");
+    expect(result.state.results).toEqual(["a", "b"]);
+  });
+
   it("snapshot isolation: two nodes in one super-step don't observe each other's writes", async () => {
     const graph = emptyGraph({
       plainEdges: [
@@ -172,4 +193,40 @@ describe("runLoop", () => {
 
     await expect(runLoop({ graph, nodeFns })).rejects.toThrow(UnreachableJoinError);
   });
+
+  it(
+    "resuming a 2-static-source join whose sources completed in different pre-crash super-steps raises " +
+      "UnreachableJoinError rather than silently reporting dead_end (documented KTD-12 scope limitation, pinned)",
+    async () => {
+      // Mirrors runtime/run.ts's reconstructBarrierState: it only reconstructs
+      // arrival state for a join fed by a fan-out edge (KTD-12's shape); a
+      // join with 2+ distinct static (non-fan-out) declared sources gets NO
+      // initialBarrierState at all, exactly as if source A's pre-crash
+      // arrival was never durably recorded (it isn't — the checkpoint's
+      // `barrier` field is unpopulated). This is a genuine slice-1 gap the
+      // driving workload never exercises (its only join has one dynamic
+      // fan-out source); this test exists to prove the failure mode is loud,
+      // not silent data loss.
+      const graph = emptyGraph({
+        joinBarriers: [
+          { id: "join-static", sources: ["A", "B"], mode: "all", reducer: "append", into: "results", to: "collector" },
+        ],
+      });
+      const nodeFns: Record<string, NodeFn> = { B: () => ({ results: "b" }) };
+
+      // Simulates: A already completed and its write ("a") is already folded
+      // into state from an earlier super-step; only B is still outstanding
+      // in the resumed frontier. No initialBarrierState is supplied for this
+      // join — a static source gets none, by design (see comment above).
+      await expect(
+        runLoop({
+          graph,
+          nodeFns,
+          initialState: { results: ["a"] },
+          initialFrontier: [{ nodeId: "B", instanceId: "B" }],
+          initialStep: 1,
+        }),
+      ).rejects.toThrow(UnreachableJoinError);
+    },
+  );
 });

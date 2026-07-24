@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { compile, type CompiledTopology } from "../topology/compile.js";
 import {
   runLoop,
@@ -16,7 +17,7 @@ import { resume as resumeRun, updateRunStatus } from "../store/pending-writes.js
 import { writeCheckpoint } from "../store/checkpoints.js";
 import { appendEvent } from "../store/trace.js";
 import { ClaudeCodeExecutor } from "../executor/claude-code.js";
-import { InMemoryNodeRegistry } from "../executor/executor.js";
+import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
@@ -66,16 +67,17 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
   };
 }
 
-/** Builds one `NodeFn` per compiled node: `agent` via `makeAgentNodeFn`, `set` as a deterministic closure (KTD-11's narrow seam). */
-function buildNodeFns(
-  compiled: CompiledTopology,
-  executor: ClaudeCodeExecutor,
-  db: ReturnType<typeof openDb>,
-  runId: string,
-): Record<string, NodeFn> {
+/**
+ * Builds one untraced `NodeFn` per compiled node: `agent` via
+ * `makeAgentNodeFn` (against the narrow `Executor` seam — a stub in tests,
+ * `ClaudeCodeExecutor` in production), `set` as a deterministic closure
+ * (KTD-11's narrow seam). Exported so integration tests build node fns the
+ * same way `main()` does, rather than hand-copying this wiring.
+ */
+export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Record<string, NodeFn> {
   const nodeFns: Record<string, NodeFn> = {};
   for (const node of compiled.nodes) {
-    const raw: NodeFn =
+    nodeFns[node.id] =
       node.kind === "agent"
         ? makeAgentNodeFn(executor, {
             nodeId: node.id,
@@ -87,7 +89,6 @@ function buildNodeFns(
             prompt: node.prompt,
           })
         : (): EngineUpdate => ({ ...node.update });
-    nodeFns[node.id] = withTracing(db, runId, node.id, raw);
   }
   return nodeFns;
 }
@@ -104,7 +105,7 @@ function buildNodeFns(
  * slice; this slice's driving workload only has the single-dynamic-source
  * shape.
  */
-function reconstructBarrierState(
+export function reconstructBarrierState(
   compiled: CompiledTopology,
   state: EngineState,
   completedInstanceIds: Set<string>,
@@ -166,7 +167,9 @@ async function main(): Promise<void> {
     maxSteps: compiled.maxSteps,
     maxConcurrency: compiled.maxConcurrency,
   };
-  const nodeFns = buildNodeFns(compiled, executor, db, runId);
+  const rawNodeFns = buildNodeFns(compiled, executor);
+  const nodeFns: Record<string, NodeFn> = {};
+  for (const [nodeId, fn] of Object.entries(rawNodeFns)) nodeFns[nodeId] = withTracing(db, runId, nodeId, fn);
 
   let runLoopOptions: RunLoopOptions;
   if (mode === "start") {
@@ -209,7 +212,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+// Only run as the CLI entrypoint (spawned directly), never when imported as a
+// module (integration tests import `buildNodeFns`/`reconstructBarrierState`
+// above without wanting `main()`'s process.argv-driven side effects to fire).
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
+}

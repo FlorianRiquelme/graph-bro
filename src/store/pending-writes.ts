@@ -138,6 +138,22 @@ export function createRun(db: Database.Database, runId: string, ownerPid: number
   ).run(runId, ownerPid, topologyPath ?? null);
 }
 
+/**
+ * Atomically claims ownership of a run away from a specific expected
+ * (presumed-dead) owner pid — `UPDATE ... WHERE owner_pid = expectedOwnerPid`
+ * — so two concurrent `resume` invocations racing past the same
+ * `isProcessAlive` liveness check can't both take ownership (KTD-14). Only
+ * the first writer's compare-and-swap actually matches a row; the loser's
+ * affects zero rows and must abort rather than spawn a second engine.
+ * Returns whether this call won the claim.
+ */
+export function claimOwnership(db: Database.Database, runId: string, expectedOwnerPid: number, newOwnerPid: number): boolean {
+  const result = db
+    .prepare(`UPDATE runs SET owner_pid = ? WHERE run_id = ? AND owner_pid = ?`)
+    .run(newOwnerPid, runId, expectedOwnerPid);
+  return result.changes === 1;
+}
+
 export function getRunOwnerPid(db: Database.Database, runId: string): number | undefined {
   const row = db.prepare(`SELECT owner_pid FROM runs WHERE run_id = ?`).get(runId) as
     | { owner_pid: number }

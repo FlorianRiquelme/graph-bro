@@ -1,22 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const CLI_ENTRY = join(REPO_ROOT, "dist", "cli", "index.js");
-const FAKE_CLAUDE = join(REPO_ROOT, "test", "fixtures", "fake-claude.mjs");
-
-function gitRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "graph-bro-kill-reaping-repo-"));
-  execFileSync("git", ["init", "-q"], { cwd: dir });
-  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
-  execFileSync("git", ["config", "user.name", "test"], { cwd: dir });
-  execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir });
-  return dir;
-}
+import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -36,35 +23,6 @@ function singleNodeTopology() {
     ],
     max_steps: 10,
   };
-}
-
-function runCliSync(
-  args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv },
-): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
-    cwd: opts.cwd,
-    env: opts.env,
-    encoding: "utf-8",
-  });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 100): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
-  }
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 describe("integration/kill-reaping: run-kill cascades through a forked grandchild (KTD-13 + R9 resume)", () => {
@@ -104,10 +62,13 @@ describe("integration/kill-reaping: run-kill cascades through a forked grandchil
       // Wait for the fake-claude node process to actually spawn, then find
       // its forked grandchild (spawned NOT detached, so it shares
       // fake-claude's own pgid — see test/fixtures/fake-claude.mjs's
-      // "grandchild-resist" mode).
+      // "grandchild-resist" mode). Scoped to `pgrep -P ownerPid` (a child of
+      // THIS test's own engine), not a global `-f fake-claude.mjs` name match
+      // that races against other test files' concurrently-running fake-claude
+      // processes (e.g. cli.test.ts's KTD-13 test).
       let fakeClaudePid = "";
       await waitFor(() => {
-        const pgrep = spawnSync("pgrep", ["-f", "fake-claude.mjs"], { encoding: "utf-8" });
+        const pgrep = spawnSync("pgrep", ["-P", String(ownerPid)], { encoding: "utf-8" });
         fakeClaudePid = pgrep.stdout.trim().split("\n")[0] ?? "";
         return fakeClaudePid.length > 0;
       }, 3000);
@@ -126,10 +87,7 @@ describe("integration/kill-reaping: run-kill cascades through a forked grandchil
       // Both the node process and its grandchild must be gone — proves the
       // group-kill's SIGKILL escalation reaps the SIGTERM-ignoring grandchild
       // too, not just fake-claude.mjs itself.
-      await waitFor(() => {
-        const pgrep = spawnSync("pgrep", ["-f", "fake-claude.mjs"], { encoding: "utf-8" });
-        return pgrep.stdout.trim().length === 0;
-      }, 6000);
+      await waitFor(() => !isAlive(Number(fakeClaudePid)), 6000);
       await waitFor(() => !isAlive(Number(grandchildPid)), 6000);
 
       await waitFor(() => !isAlive(ownerPid), 6000); // the engine itself exits after the kill cascade
@@ -142,10 +100,7 @@ describe("integration/kill-reaping: run-kill cascades through a forked grandchil
       expect(resume.status).toBe(0);
       expect(resume.stdout.trim()).toBe(runId);
 
-      await waitFor(() => {
-        const status = runCliSync(["status", runId], { cwd, env: successEnv });
-        return JSON.parse(status.stdout).status === "completed";
-      }, 5000);
+      await waitForRunStatus(home, runId, "completed", 5000);
 
       const result = runCliSync(["result", runId], { cwd, env: successEnv });
       expect(JSON.parse(result.stdout)).toMatchObject({ runId, status: "completed", output: { greeting: "pong" } });

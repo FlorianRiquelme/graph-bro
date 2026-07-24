@@ -146,14 +146,25 @@ describe("compile: per-instance identity (KTD-12)", () => {
 
     const instanceIds = itemKeys.map((key) => deriveInstanceId("reader", key));
     expect(new Set(instanceIds).size).toBe(3);
-    expect(instanceIds).toEqual(["reader:a", "reader:b", "reader:c"]);
+    expect(instanceIds).toEqual(["reader:id:a", "reader:id:b", "reader:id:c"]);
   });
 
   it("falls back to index when items carry no id field", () => {
     const items = ["a", "b", "c"];
     const itemKeys = items.map((item, index) => deriveItemKey(item, index));
-    expect(itemKeys).toEqual(["0", "1", "2"]);
+    expect(itemKeys).toEqual(["idx:0", "idx:1", "idx:2"]);
     expect(new Set(itemKeys).size).toBe(3);
+  });
+
+  it("does not alias an id-keyed item onto an index-keyed item at the same position", () => {
+    // A for_each list mixing {id: "0"} with a plain item at index 0 used to
+    // both derive the bare key "0" before namespacing, silently collapsing
+    // two distinct branches into one instance id.
+    const items = [{ id: "0" }, "plain-item"];
+    const itemKeys = items.map((item, index) => deriveItemKey(item, index));
+    expect(new Set(itemKeys).size).toBe(2);
+    const instanceIds = itemKeys.map((key) => deriveInstanceId("reader", key));
+    expect(new Set(instanceIds).size).toBe(2);
   });
 });
 

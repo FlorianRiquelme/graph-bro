@@ -19,6 +19,8 @@ export interface Activation {
   nodeId: string;
   instanceId: string;
   binding?: { key: string; value: unknown };
+  /** Set only for a fan-out branch instance (KTD-12) — the per-instance discriminator U3's pending-write key requires. */
+  itemKey?: string;
 }
 
 /**

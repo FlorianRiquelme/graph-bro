@@ -1,25 +1,12 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
-
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const CLI_ENTRY = join(REPO_ROOT, "dist", "cli", "index.js");
-const FAKE_CLAUDE = join(REPO_ROOT, "test", "fixtures", "fake-claude.mjs");
-
-function gitRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "graph-bro-cli-repo-"));
-  execFileSync("git", ["init", "-q"], { cwd: dir });
-  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
-  execFileSync("git", ["config", "user.name", "test"], { cwd: dir });
-  execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir });
-  return dir;
-}
+import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -75,26 +62,6 @@ function fanOutJoinTopology() {
   };
 }
 
-function runCliSync(
-  args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv },
-): { stdout: string; stderr: string; status: number | null } {
-  const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
-    cwd: opts.cwd,
-    env: opts.env,
-    encoding: "utf-8",
-  });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 100): Promise<void> {
-  const start = Date.now();
-  while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
-  }
-}
-
 describe("cli: graph-bro (five verbs + detached process model)", () => {
   let home: string;
   let cwdA: string;
@@ -131,6 +98,13 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     expect(result.stderr).toMatch(/not a valid topology/);
   });
 
+  it("resume on a run id that was never started fails loudly with a clear error", () => {
+    const result = runCliSync(["resume", "never-started-run-id"], { cwd: cwdA, env: baseEnv("success") });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/no such run/);
+  });
+
   it("Covers AE5: start returns promptly with a run id while the engine continues detached", async () => {
     const topologyPath = writeTopology(cwdA, singleNodeTopology());
     const env = { ...baseEnv("slow"), FAKE_CLAUDE_SILENT_MS: "1500" };
@@ -147,10 +121,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     const immediateStatus = runCliSync(["status", runId], { cwd: cwdB, env });
     expect(JSON.parse(immediateStatus.stdout).status).toBe("running");
 
-    await waitFor(() => {
-      const status = runCliSync(["status", runId], { cwd: cwdB, env });
-      return JSON.parse(status.stdout).status === "completed";
-    }, 5000);
+    await waitForRunStatus(home, runId, "completed", 5000);
   }, 10_000);
 
   it("status/tail/result read correct state when invoked from a different cwd than start ran", async () => {
@@ -160,10 +131,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     const start = runCliSync(["start", topologyPath], { cwd: cwdA, env });
     const runId = start.stdout.trim();
 
-    await waitFor(() => {
-      const status = runCliSync(["status", runId], { cwd: cwdB, env });
-      return JSON.parse(status.stdout).status === "completed";
-    }, 5000);
+    await waitForRunStatus(home, runId, "completed", 5000);
 
     const status = runCliSync(["status", runId], { cwd: cwdB, env });
     expect(JSON.parse(status.stdout)).toMatchObject({ runId, status: "completed" });
@@ -188,10 +156,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     const start = runCliSync(["start", topologyPath], { cwd: cwdA, env });
     const runId = start.stdout.trim();
 
-    await waitFor(() => {
-      const status = runCliSync(["status", runId], { cwd: cwdB, env });
-      return JSON.parse(status.stdout).status === "completed";
-    }, 5000);
+    await waitForRunStatus(home, runId, "completed", 5000);
 
     const full = runCliSync(["tail", runId], { cwd: cwdB, env });
     const allEvents = full.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
@@ -221,13 +186,15 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       // pending write; the checkpoint's frontier still lists all 4.
       const db = openDb({ baseDir: home });
       createRun(db, runId, 999_999, topologyPath); // a dead owner pid
+      // items are plain strings (no `id` field), so deriveItemKey derives
+      // "idx:${i}" for each — must match here for resume() to line up.
       writeCheckpoint(db, runId, {
         state: { batch: { items: ["a", "b", "c", "d"] } },
         frontier: [
-          { nodeId: "reader", instanceId: "reader:0", binding: { key: "item", value: "a" } },
-          { nodeId: "reader", instanceId: "reader:1", binding: { key: "item", value: "b" } },
-          { nodeId: "reader", instanceId: "reader:2", binding: { key: "item", value: "c" } },
-          { nodeId: "reader", instanceId: "reader:3", binding: { key: "item", value: "d" } },
+          { nodeId: "reader", instanceId: "reader:idx:0", binding: { key: "item", value: "a" } },
+          { nodeId: "reader", instanceId: "reader:idx:1", binding: { key: "item", value: "b" } },
+          { nodeId: "reader", instanceId: "reader:idx:2", binding: { key: "item", value: "c" } },
+          { nodeId: "reader", instanceId: "reader:idx:3", binding: { key: "item", value: "d" } },
         ],
         barrier: {},
         step: 0,
@@ -236,7 +203,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
         runId,
         node: "reader",
         step: 1,
-        itemKey: "0",
+        itemKey: "idx:0",
         triggers: [],
         writes: { results: "a" },
       });
@@ -244,7 +211,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
         runId,
         node: "reader",
         step: 1,
-        itemKey: "1",
+        itemKey: "idx:1",
         triggers: [],
         writes: { results: "b" },
       });
@@ -254,10 +221,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       expect(resume.status).toBe(0);
       expect(resume.stdout.trim()).toBe(runId);
 
-      await waitFor(() => {
-        const status = runCliSync(["status", runId], { cwd: cwdB, env });
-        return JSON.parse(status.stdout).status === "completed";
-      }, 5000);
+      await waitForRunStatus(home, runId, "completed", 5000);
 
       const result = runCliSync(["result", runId], { cwd: cwdB, env });
       const output = JSON.parse(result.stdout);
@@ -294,24 +258,14 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
 
       // Simulate a hard crash (bypasses graceful shutdown/kill cascade entirely).
       process.kill(ownerPid, "SIGKILL");
-      await waitFor(() => {
-        try {
-          process.kill(ownerPid, 0);
-          return false;
-        } catch {
-          return true;
-        }
-      }, 3000);
+      await waitFor(() => !isAlive(ownerPid), 3000);
 
       const successEnv = baseEnv("success");
       const heal = runCliSync(["resume", runId], { cwd: cwdA, env: successEnv });
       expect(heal.status).toBe(0);
       expect(heal.stdout.trim()).toBe(runId);
 
-      await waitFor(() => {
-        const status = runCliSync(["status", runId], { cwd: cwdB, env: successEnv });
-        return JSON.parse(status.stdout).status === "completed";
-      }, 5000);
+      await waitForRunStatus(home, runId, "completed", 5000);
     },
     15_000,
   );
@@ -328,27 +282,23 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       const statusJson = JSON.parse(runCliSync(["status", runId], { cwd: cwdB, env }).stdout);
       const ownerPid: number = statusJson.ownerPid;
 
-      // Give the engine time to actually spawn the fake-claude subprocess.
+      // Give the engine time to actually spawn the fake-claude subprocess, and
+      // capture its pid — scoped to `pgrep -P ownerPid` (a child of THIS
+      // test's own engine), not `pgrep -f fake-claude.mjs` (a global name
+      // match that races against other test files' concurrently-running
+      // fake-claude processes, e.g. kill-reaping.test.ts). Once known,
+      // re-checks use isAlive directly rather than spawning pgrep again.
+      let fakeClaudePid = "";
       await waitFor(() => {
-        const pgrep = spawnSync("pgrep", ["-f", "fake-claude.mjs"], { encoding: "utf-8" });
-        return pgrep.stdout.trim().length > 0;
+        const pgrep = spawnSync("pgrep", ["-P", String(ownerPid)], { encoding: "utf-8" });
+        fakeClaudePid = pgrep.stdout.trim().split("\n")[0] ?? "";
+        return fakeClaudePid.length > 0;
       }, 3000);
 
       process.kill(ownerPid, "SIGTERM"); // KTD-13: the run-kill signal
 
-      await waitFor(() => {
-        const pgrep = spawnSync("pgrep", ["-f", "fake-claude.mjs"], { encoding: "utf-8" });
-        return pgrep.stdout.trim().length === 0;
-      }, 5000);
-
-      await waitFor(() => {
-        try {
-          process.kill(ownerPid, 0);
-          return false;
-        } catch {
-          return true;
-        }
-      }, 5000);
+      await waitFor(() => !isAlive(Number(fakeClaudePid)), 5000);
+      await waitFor(() => !isAlive(ownerPid), 5000);
     },
     15_000,
   );

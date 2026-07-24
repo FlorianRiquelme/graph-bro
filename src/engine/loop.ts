@@ -261,17 +261,14 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
           ? { ...snapshot, [activation.binding.key]: activation.binding.value }
           : snapshot;
         const update = await fn(input);
-        // A fan-out branch's instanceId ("${nodeId}:${itemKey}") differs
-        // from its bare nodeId; only branches carry the per-instance item
-        // key U3's pending-write key requires (KTD-12) — a plain node's
-        // durability is left to the next step's checkpoint, per U5's scope.
-        if (persistence && activation.instanceId !== activation.nodeId) {
-          const itemKey = activation.instanceId.slice(activation.nodeId.length + 1);
+        // Only a fan-out branch instance carries `itemKey` (KTD-12) — a plain
+        // node's durability is left to the next step's checkpoint, per U5's scope.
+        if (persistence && activation.itemKey !== undefined) {
           commitPendingWrite(persistence.db, {
             runId: persistence.runId,
             node: activation.nodeId,
             step: steps,
-            itemKey,
+            itemKey: activation.itemKey,
             triggers: [],
             writes: update,
           });
@@ -307,13 +304,12 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         const activation = stepFrontier.find((candidate) => candidate.instanceId === result.id);
         if (!activation) continue;
         if (persistence) {
-          if (activation.instanceId !== activation.nodeId) {
-            const itemKey = activation.instanceId.slice(activation.nodeId.length + 1);
+          if (activation.itemKey !== undefined) {
             commitPendingWrite(persistence.db, {
               runId: persistence.runId,
               node: activation.nodeId,
               step: steps,
-              itemKey,
+              itemKey: activation.itemKey,
               triggers: [],
               writes: {},
               isError: true,
@@ -344,5 +340,13 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     frontier = next;
   }
 
+  // Reached only when the loop starts with an already-empty frontier (e.g. a
+  // resumed run whose every pending activation had already completed in an
+  // earlier super-step) — the mid-drain path above already ran this same
+  // check when `next.length === 0`. Without it here, a join stalled before
+  // the crash (one static source arrived, the other never will) would
+  // silently report dead_end instead of the diagnosable UnreachableJoinError.
+  const stalled = detectStalledJoin(barriers);
+  if (stalled) throw new UnreachableJoinError(stalled.joinId, stalled.missingSources);
   return { status: "dead_end", state, steps };
 }

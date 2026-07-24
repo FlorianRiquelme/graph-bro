@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import {
+  claimOwnership,
   commitPendingWrite,
   createRun,
   getRunOwnerPid,
@@ -79,6 +80,17 @@ describe("store: pending-writes crash core", () => {
     expect(isProcessAlive(deadPid)).toBe(false);
   });
 
+  it("claimOwnership is an atomic compare-and-swap: only one of two racing claims against the same dead pid wins", () => {
+    createRun(db, "run-race", 999_999); // a dead owner pid
+
+    const first = claimOwnership(db, "run-race", 999_999, 1001);
+    const second = claimOwnership(db, "run-race", 999_999, 1002); // same expected old pid, racing
+
+    expect(first).toBe(true);
+    expect(second).toBe(false); // lost the race: owner_pid was already 1001 by the time this ran
+    expect(getRunOwnerPid(db, "run-race")).toBe(1001); // the winner's pid, not the loser's
+  });
+
   it("Covers AE2: resume replays 12 of 17 fan-out branch pending writes and does not re-execute them", () => {
     const runId = "run-fanout";
     const items = Array.from({ length: 17 }, (_, i) => `item-${i}`);
@@ -113,8 +125,13 @@ describe("store: pending-writes crash core", () => {
     expect(result.frontier).toHaveLength(5); // 17 - 12 remaining, not re-executed
     expect((result.state.results as string[]).sort()).toEqual(items.slice(0, 12).sort());
 
-    // Only the 5 still-outstanding instances get (re)executed — assert call
-    // counts, not just final state (Gate 2's airtight proof).
+    // This only proves the recomputed frontier excludes the 12 completed
+    // instances (a frontier-shape assertion) — it does not itself invoke any
+    // node function, so it is not a call-count proof. The actual call-count
+    // proof that the 12 are never re-invoked lives in
+    // test/engine/fanout.test.ts's "Crash mid-drain" test and
+    // test/integration/crash-resume.test.ts, which run this frontier through
+    // a real (stub) executor and assert on `stub.calls`.
     for (const activation of result.frontier) {
       readerCalls.push(activation.instanceId);
     }
@@ -185,6 +202,14 @@ describe("store: pending-writes crash core", () => {
     const parts = { runId: "run-key-space", node: "reader", step: 1, itemKey: "0", triggers: ["dispatch"] };
 
     expect(pendingWriteKey(parts, false)).not.toBe(pendingWriteKey(parts, true));
+  });
+
+  it("resume() on a run with no checkpoint yet returns the documented empty default rather than throwing", () => {
+    createRun(db, "run-never-checkpointed", process.pid);
+
+    const result = resume(db, "run-never-checkpointed");
+
+    expect(result).toEqual({ step: 0, state: {}, frontier: [], completedInstanceIds: new Set() });
   });
 
   it("two concurrent writer connections against one DB serialize under WAL + busy_timeout without SQLITE_BUSY", async () => {

@@ -1,24 +1,37 @@
+import { z } from "zod";
 import type Database from "better-sqlite3";
 
-/** One trace event (ADR-0009: model/token/cost/duration captured from inception). */
-export interface EventInput {
-  runId: string;
-  node?: string;
-  step?: number;
-  model?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheCreationTokens?: number;
-  cacheReadTokens?: number;
-  durationMs?: number;
-  costUsd?: number;
-  payload?: unknown;
-}
+/**
+ * The run-trace schema (ADR-0009: model/token/cost/duration captured from
+ * inception; KTD-1: "topology grammar, trace schema, and the CLI-agent JSON
+ * envelope are all zod-defined"). `payload` stays `z.unknown()` — it carries
+ * heterogeneous shapes (`node_start`/`node_complete`/`node_error`/
+ * `run_error`/`envelope_parse_error`, each with different fields) with no
+ * single closed union across the codebase yet; the schema still validates
+ * every other field's shape and gives write/read a formal, checked contract.
+ */
+export const EventInputSchema = z.object({
+  runId: z.string().min(1),
+  node: z.string().optional(),
+  step: z.number().int().optional(),
+  model: z.string().optional(),
+  inputTokens: z.number().optional(),
+  outputTokens: z.number().optional(),
+  cacheCreationTokens: z.number().optional(),
+  cacheReadTokens: z.number().optional(),
+  durationMs: z.number().optional(),
+  costUsd: z.number().optional(),
+  payload: z.unknown().optional(),
+});
 
-export interface EventRow extends EventInput {
-  id: number;
-  createdAt: string;
-}
+export type EventInput = z.infer<typeof EventInputSchema>;
+
+export const EventRowSchema = EventInputSchema.extend({
+  id: z.number().int(),
+  createdAt: z.string(),
+});
+
+export type EventRow = z.infer<typeof EventRowSchema>;
 
 interface RawEventRow {
   id: number;
@@ -37,7 +50,7 @@ interface RawEventRow {
 }
 
 function toEventRow(row: RawEventRow): EventRow {
-  return {
+  return EventRowSchema.parse({
     id: row.id,
     runId: row.run_id,
     node: row.node ?? undefined,
@@ -51,11 +64,12 @@ function toEventRow(row: RawEventRow): EventRow {
     costUsd: row.cost_usd ?? undefined,
     payload: row.payload !== null ? JSON.parse(row.payload) : undefined,
     createdAt: row.created_at,
-  };
+  });
 }
 
 /** Appends one trace event; returns its row id. */
-export function appendEvent(db: Database.Database, input: EventInput): number {
+export function appendEvent(db: Database.Database, rawInput: EventInput): number {
+  const input = EventInputSchema.parse(rawInput);
   const result = db
     .prepare(
       `INSERT INTO events (

@@ -1,32 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { compile, type CompiledTopology } from "../../src/topology/compile.js";
-import { runLoop, makeAgentNodeFn, type EngineGraph, type NodeFn } from "../../src/engine/loop.js";
+import { compile } from "../../src/topology/compile.js";
+import { runLoop, type EngineGraph } from "../../src/engine/loop.js";
 import { StubExecutor } from "../fixtures/stub-executor.js";
-
-/**
- * Mirrors `runtime/run.ts`'s `buildNodeFns` (agent -> `makeAgentNodeFn`, set ->
- * a deterministic closure) but with the `StubExecutor` standing in for the
- * real `ClaudeCodeExecutor` — the "one layer above a hand-built `EngineGraph`"
- * this unit's tests are meant to exercise.
- */
-function buildNodeFns(compiled: CompiledTopology, executor: StubExecutor): Record<string, NodeFn> {
-  const nodeFns: Record<string, NodeFn> = {};
-  for (const node of compiled.nodes) {
-    nodeFns[node.id] =
-      node.kind === "agent"
-        ? makeAgentNodeFn(executor, {
-            nodeId: node.id,
-            model: node.model,
-            readOnly: node.read_only,
-            cwd: ".",
-            timeout: 1_000,
-            outputKey: node.output_key,
-            prompt: node.prompt,
-          })
-        : (): Record<string, unknown> => ({ ...node.update });
-  }
-  return nodeFns;
-}
+import { buildNodeFns } from "../../src/runtime/run.js";
 
 /** The mining-shaped fan-out -> join topology (KTD-12), same shape `cli.test.ts` uses. */
 function fanOutJoinTopology(itemCount: number) {

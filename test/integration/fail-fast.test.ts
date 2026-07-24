@@ -2,32 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { compile, type CompiledTopology } from "../../src/topology/compile.js";
-import { runLoop, makeAgentNodeFn, type EngineGraph, type NodeFn } from "../../src/engine/loop.js";
+import { compile } from "../../src/topology/compile.js";
+import { runLoop, type EngineGraph } from "../../src/engine/loop.js";
 import { openDb } from "../../src/store/db.js";
 import { createRun, getRun, updateRunStatus } from "../../src/store/pending-writes.js";
 import { listEvents } from "../../src/store/trace.js";
 import { StubExecutor } from "../fixtures/stub-executor.js";
-
-/** Mirrors `runtime/run.ts`'s `buildNodeFns`, `StubExecutor` standing in for `ClaudeCodeExecutor`. */
-function buildNodeFns(compiled: CompiledTopology, executor: StubExecutor): Record<string, NodeFn> {
-  const nodeFns: Record<string, NodeFn> = {};
-  for (const node of compiled.nodes) {
-    nodeFns[node.id] =
-      node.kind === "agent"
-        ? makeAgentNodeFn(executor, {
-            nodeId: node.id,
-            model: node.model,
-            readOnly: node.read_only,
-            cwd: ".",
-            timeout: 1_000,
-            outputKey: node.output_key,
-            prompt: node.prompt,
-          })
-        : (): Record<string, unknown> => ({ ...node.update });
-  }
-  return nodeFns;
-}
+import { buildNodeFns } from "../../src/runtime/run.js";
 
 function fanOutJoinTopology(itemCount: number) {
   return {

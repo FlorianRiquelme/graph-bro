@@ -2,60 +2,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { compile, type CompiledTopology } from "../../src/topology/compile.js";
-import { buildFanOutBranches } from "../../src/engine/fanout.js";
-import {
-  runLoop,
-  makeAgentNodeFn,
-  type EngineGraph,
-  type InitialBarrierState,
-  type NodeFn,
-} from "../../src/engine/loop.js";
-import type { EngineState } from "../../src/engine/state.js";
+import { compile } from "../../src/topology/compile.js";
+import { runLoop, type EngineGraph } from "../../src/engine/loop.js";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { commitPendingWrite, createRun, resume } from "../../src/store/pending-writes.js";
 import { StubExecutor } from "../fixtures/stub-executor.js";
-
-/** Mirrors `runtime/run.ts`'s `buildNodeFns`, `StubExecutor` standing in for `ClaudeCodeExecutor`. */
-function buildNodeFns(compiled: CompiledTopology, executor: StubExecutor): Record<string, NodeFn> {
-  const nodeFns: Record<string, NodeFn> = {};
-  for (const node of compiled.nodes) {
-    nodeFns[node.id] =
-      node.kind === "agent"
-        ? makeAgentNodeFn(executor, {
-            nodeId: node.id,
-            model: node.model,
-            readOnly: node.read_only,
-            cwd: ".",
-            timeout: 1_000,
-            outputKey: node.output_key,
-            prompt: node.prompt,
-          })
-        : (): Record<string, unknown> => ({ ...node.update });
-  }
-  return nodeFns;
-}
-
-/** Mirrors `runtime/run.ts`'s `reconstructBarrierState` (KTD-12's resume seam), the single-dynamic-source shape. */
-function reconstructBarrierState(
-  compiled: CompiledTopology,
-  state: EngineState,
-  completedInstanceIds: Set<string>,
-): InitialBarrierState[] {
-  const result: InitialBarrierState[] = [];
-  for (const barrier of compiled.joinBarriers) {
-    if (barrier.sources.length !== 1) continue;
-    const source = barrier.sources[0];
-    const fanOutEdge = compiled.fanOutEdges.find((edge) => edge.to === source);
-    if (!fanOutEdge) continue;
-    const branches = buildFanOutBranches(fanOutEdge, state);
-    const expectedInstanceIds = branches.map((branch) => branch.instanceId);
-    const arrivedInstanceIds = expectedInstanceIds.filter((id) => completedInstanceIds.has(id));
-    result.push({ source, expectedInstanceIds, arrivedInstanceIds });
-  }
-  return result;
-}
+import { buildNodeFns, reconstructBarrierState } from "../../src/runtime/run.js";
 
 function fanOutJoinTopology(itemCount: number) {
   return {
@@ -101,11 +54,14 @@ describe("integration/crash-resume: compiled-from-topology-JSON crash mid-drain 
 
       // Simulate the crash: dispatch already ran (step 0), 12 of the 17
       // fan-out branches committed their pending write before the "crash".
+      // items are plain strings (no `id` field), so deriveItemKey derives
+      // "idx:${i}" for each — must match here so resume()'s
+      // deriveInstanceId(node, itemKey) lines up with the frontier below.
       writeCheckpoint(db, runId, {
         state: { batch: { items } },
         frontier: items.map((item, i) => ({
           nodeId: "reader",
-          instanceId: `reader:${i}`,
+          instanceId: `reader:idx:${i}`,
           binding: { key: "item", value: item },
         })),
         barrier: {},
@@ -116,7 +72,7 @@ describe("integration/crash-resume: compiled-from-topology-JSON crash mid-drain 
           runId,
           node: "reader",
           step: 1,
-          itemKey: String(i),
+          itemKey: `idx:${i}`,
           triggers: [],
           writes: { results: "read-ok" },
         });

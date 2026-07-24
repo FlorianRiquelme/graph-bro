@@ -91,16 +91,7 @@ export function compile(input: unknown): CompileResult {
         checkRef(source, `edges[${index}].from[${sourceIndex}]`);
       });
       checkRef(edge.to, `edges[${index}].to`);
-    } else if (isFanOutEdge(edge)) {
-      if (edge.from === END) {
-        errors.push({
-          message: `edge source cannot be END`,
-          path: `edges[${index}].from`,
-        });
-      }
-      checkRef(edge.from, `edges[${index}].from`);
-      checkRef(edge.to, `edges[${index}].to`);
-    } else if (isPlainEdge(edge)) {
+    } else if (isFanOutEdge(edge) || isPlainEdge(edge)) {
       if (edge.from === END) {
         errors.push({
           message: `edge source cannot be END`,
@@ -147,6 +138,11 @@ export function compile(input: unknown): CompileResult {
  * field if present, else its index.
  */
 export function deriveItemKey(item: unknown, index: number): string {
+  // Namespaced so the id-keyed and index-keyed derivation paths can never
+  // collide: a `for_each` list mixing `{id: "0"}` objects with plain items
+  // (index 0) would otherwise both derive the bare key "0", silently
+  // aliasing two distinct branches onto one instance id (KTD-12 violation —
+  // one branch's output is dropped with no error).
   if (
     item !== null &&
     typeof item === "object" &&
@@ -154,9 +150,9 @@ export function deriveItemKey(item: unknown, index: number): string {
     (typeof (item as { id: unknown }).id === "string" ||
       typeof (item as { id: unknown }).id === "number")
   ) {
-    return String((item as { id: string | number }).id);
+    return `id:${(item as { id: string | number }).id}`;
   }
-  return String(index);
+  return `idx:${index}`;
 }
 
 /** `${node}:${itemKey}` — the per-instance id threaded into the barrier and pending-write key. */

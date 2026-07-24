@@ -29,6 +29,7 @@ describe("executor: read-only-policy", () => {
       execFileSync("git", ["init", "-q"], { cwd: repoDir });
       execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
       execFileSync("git", ["config", "user.name", "test"], { cwd: repoDir });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: repoDir }); // throwaway /tmp repo; no signing agent dependency
       writeFileSync(join(repoDir, "committed.txt"), "hello\n");
       execFileSync("git", ["add", "."], { cwd: repoDir });
       execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repoDir });

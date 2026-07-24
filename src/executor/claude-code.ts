@@ -105,7 +105,17 @@ export class ClaudeCodeExecutor implements Executor {
       }
       options.onEvent?.(event);
       if (typeof event === "object" && event !== null && (event as { type?: unknown }).type === "result") {
-        terminalEnvelope = parseEnvelope(event);
+        try {
+          terminalEnvelope = parseEnvelope(event);
+        } catch (err) {
+          // A malformed terminal envelope must fail only this node, never
+          // crash the whole engine process — an uncaught throw here would
+          // propagate out of the readline 'line' event and take down every
+          // other in-flight node in the run. Leave terminalEnvelope unset;
+          // the existing "no terminal event before EOF" fallback below
+          // already reports this as a synthetic isError result.
+          options.onEvent?.({ type: "envelope_parse_error", error: err instanceof Error ? err.message : String(err) });
+        }
       }
     });
 
