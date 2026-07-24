@@ -5,6 +5,7 @@ import { compile, type CompiledTopology } from "../topology/compile.js";
 import {
   runLoop,
   makeAgentNodeFn,
+  readNodeTraceMeta,
   type EngineGraph,
   type NodeFn,
   type RunLoopOptions,
@@ -54,7 +55,21 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
     appendEvent(db, { runId, node: nodeId, payload: { type: "node_start" } });
     try {
       const update = await fn(state);
-      appendEvent(db, { runId, node: nodeId, payload: { type: "node_complete", update } });
+      // ADR-0009: fold the executor's per-node cost/token/model/duration
+      // (carried out-of-band on the update) into the node_complete event.
+      const meta = readNodeTraceMeta(update);
+      appendEvent(db, {
+        runId,
+        node: nodeId,
+        model: meta?.model,
+        inputTokens: meta?.inputTokens,
+        outputTokens: meta?.outputTokens,
+        cacheCreationTokens: meta?.cacheCreationTokens,
+        cacheReadTokens: meta?.cacheReadTokens,
+        durationMs: meta?.durationMs,
+        costUsd: meta?.costUsd,
+        payload: { type: "node_complete", update },
+      });
       return update;
     } catch (err) {
       appendEvent(db, {
