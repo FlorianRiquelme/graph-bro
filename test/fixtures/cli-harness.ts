@@ -30,16 +30,32 @@ export interface CliResult {
   stdout: string;
   stderr: string;
   status: number | null;
+  signal: NodeJS.Signals | null;
 }
 
-/** Spawns the real built CLI (`dist/cli/index.js`) synchronously — the actual invocation shape a consumer uses. */
+/**
+ * Spawns the real built CLI (`dist/cli/index.js`) synchronously — the actual
+ * invocation shape a consumer uses. Throws immediately if the spawn itself
+ * failed (`result.error`) or the process was killed by a signal rather than
+ * exiting normally — both leave `status: null`, which a bare `toBe(0)`
+ * assertion on the caller side can't distinguish from "the CLI legitimately
+ * exited null" and would otherwise report as an opaque `null !== 0` failure.
+ */
 export function runCliSync(args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv }): CliResult {
   const result = spawnSync(process.execPath, [CLI_ENTRY, ...args], {
     cwd: opts.cwd,
     env: opts.env,
     encoding: "utf-8",
   });
-  return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+  if (result.error) {
+    throw new Error(`runCliSync(${args.join(" ")}) failed to spawn: ${result.error.message}`);
+  }
+  if (result.signal) {
+    throw new Error(
+      `runCliSync(${args.join(" ")}) was killed by signal ${result.signal}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    );
+  }
+  return { stdout: result.stdout, stderr: result.stderr, status: result.status, signal: result.signal };
 }
 
 export async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 50): Promise<void> {
