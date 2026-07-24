@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { compile } from "../../src/topology/compile.js";
+import { openDb } from "../../src/store/db.js";
+import { listEvents } from "../../src/store/trace.js";
 import { REPO_ROOT, FAKE_CLAUDE, gitRepo, runCliSync, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const EXAMPLE_TOPOLOGY_PATH = join(REPO_ROOT, "examples", "fanout-read-join", "topology.json");
@@ -62,6 +64,44 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       // fan-out branches (one per `batch.items` entry) regardless of prompt,
       // so the dedup join must collapse all 3 duplicate outputs to one.
       expect(output.output.results).toEqual(["pong"]);
+    },
+    10_000,
+  );
+
+  it(
+    "Covers ADR-0009: an agent node's cost/token/model/duration is captured on its trace event (regression: #3)",
+    async () => {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        GRAPH_BRO_HOME: home,
+        GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
+        FAKE_CLAUDE_MODE: "success",
+      };
+
+      const start = runCliSync(["start", EXAMPLE_TOPOLOGY_PATH], { cwd, env });
+      const runId = start.stdout.trim();
+      await waitForRunStatus(home, runId, "completed", 5000);
+
+      const db = openDb({ baseDir: home });
+      try {
+        const events = listEvents(db, runId);
+        // The `reader` node is the only `agent` kind — its completion events must
+        // carry the executor's reported cost/usage, not NULL. The fake CLI's
+        // success envelope reports total_cost_usd: 0.001, usage {input:10, output:5}.
+        const readerCompletions = events.filter(
+          (e) => e.node === "reader" && (e.payload as { type?: string } | undefined)?.type === "node_complete",
+        );
+        expect(readerCompletions).toHaveLength(3);
+        for (const event of readerCompletions) {
+          expect(event.costUsd).toBe(0.001);
+          expect(event.inputTokens).toBe(10);
+          expect(event.outputTokens).toBe(5);
+          expect(event.model).toBe("claude-haiku-4-5");
+          expect(event.durationMs).toBe(30);
+        }
+      } finally {
+        db.close();
+      }
     },
     10_000,
   );

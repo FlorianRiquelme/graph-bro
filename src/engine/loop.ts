@@ -15,6 +15,32 @@ import type { Executor } from "../executor/executor.js";
 /** A plain function node (R4) — no executor/subprocess concept in this unit. */
 export type NodeFn = (state: EngineState) => EngineUpdate | Promise<EngineUpdate>;
 
+/** Per-node-run trace metadata (ADR-0009): what the executor reports for one node invocation. */
+export interface NodeTraceMeta {
+  model?: string;
+  costUsd?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+  durationMs?: number;
+}
+
+/**
+ * Out-of-band channel for a node fn to hand per-invocation trace metadata
+ * (cost/tokens/model/duration) to the trace writer (`withTracing`). A `Symbol`
+ * key deliberately, so the metadata rides the *specific* returned update object
+ * — invocation-safe under fan-out (N concurrent instances of one node fn) — yet
+ * stays invisible to `Object.entries` (the state-merge in `runLoop`) and to
+ * `JSON.stringify` (the pending-writes persist), which both skip symbol keys.
+ */
+export const NODE_TRACE_META = Symbol("graph-bro.nodeTraceMeta");
+
+/** Reads the trace metadata a node fn attached via {@link NODE_TRACE_META}, if any. */
+export function readNodeTraceMeta(update: EngineUpdate): NodeTraceMeta | undefined {
+  return (update as Record<symbol, NodeTraceMeta | undefined>)[NODE_TRACE_META];
+}
+
 /**
  * The subset of a compiled topology the super-step loop needs. Deliberately
  * decoupled from `CompiledTopology`'s `nodes: TopologyNode[]` — U2's nodes
@@ -96,7 +122,20 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
     if (result.isError) {
       throw new Error(`agent node '${config.nodeId}' failed: ${result.text}`);
     }
-    return { [config.outputKey]: result.text };
+    const update: EngineUpdate = { [config.outputKey]: result.text };
+    // Attach the executor's cost/token report out-of-band (ADR-0009) so the
+    // trace writer records it, without leaking into state or pending writes.
+    const meta: NodeTraceMeta = {
+      model: config.model,
+      costUsd: result.cost,
+      inputTokens: result.tokens?.inputTokens,
+      outputTokens: result.tokens?.outputTokens,
+      cacheCreationTokens: result.tokens?.cacheCreationTokens,
+      cacheReadTokens: result.tokens?.cacheReadTokens,
+      durationMs: result.durationMs,
+    };
+    Object.defineProperty(update, NODE_TRACE_META, { value: meta, enumerable: false });
+    return update;
   };
 }
 
