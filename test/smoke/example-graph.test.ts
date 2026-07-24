@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { compile } from "../../src/topology/compile.js";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -44,10 +44,6 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 100
 describe("smoke: the shipped fanout-read-join example graph", () => {
   let home: string;
   let cwd: string;
-
-  beforeAll(() => {
-    execFileSync("npm", ["run", "build"], { cwd: REPO_ROOT, stdio: "inherit" });
-  }, 30_000);
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "graph-bro-smoke-home-"));

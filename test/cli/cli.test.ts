@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
@@ -99,10 +99,6 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
   let home: string;
   let cwdA: string;
   let cwdB: string;
-
-  beforeAll(() => {
-    execFileSync("npm", ["run", "build"], { cwd: REPO_ROOT, stdio: "inherit" });
-  }, 30_000);
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "graph-bro-cli-home-"));
