@@ -54,7 +54,12 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       const runId = start.stdout.trim();
       expect(runId).toMatch(/[0-9a-f-]{36}/);
 
-      await waitForRunStatus(home, runId, "completed", 5000);
+      // 15s (not 5s): the smoke suite spawns a detached engine per run, and on
+      // a 2-core CI runner the parallel process-heavy integration files
+      // oversubscribe the CPU — an identical run that finishes in ~350ms locally
+      // was starved past 5s in CI (#4). Keep a wide headroom under the per-test
+      // timeout so a slow runner can't false-fail a correctness check.
+      await waitForRunStatus(home, runId, "completed", 15_000);
 
       const result = runCliSync(["result", runId], { cwd, env });
       const output = JSON.parse(result.stdout);
@@ -65,7 +70,7 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       // so the dedup join must collapse all 3 duplicate outputs to one.
       expect(output.output.results).toEqual(["pong"]);
     },
-    10_000,
+    20_000,
   );
 
   it(
@@ -80,7 +85,9 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
 
       const start = runCliSync(["start", EXAMPLE_TOPOLOGY_PATH], { cwd, env });
       const runId = start.stdout.trim();
-      await waitForRunStatus(home, runId, "completed", 5000);
+      // 15s wait / 20s test: see the R13 case above — CI CPU starvation, not
+      // latency under test, is what timed this out at 5147ms in #4.
+      await waitForRunStatus(home, runId, "completed", 15_000);
 
       const db = openDb({ baseDir: home });
       try {
@@ -103,6 +110,6 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
         db.close();
       }
     },
-    10_000,
+    20_000,
   );
 });
