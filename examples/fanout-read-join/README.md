@@ -9,11 +9,18 @@ a `dedup` reducer.
 - `dispatch` (`set`): writes a runtime list, `batch.items`, into state.
 - `dispatch -> reader` (fan-out edge): spawns one `reader` instance per item
   in `batch.items`.
-- `reader` (`agent`, `read_only: true`, cheap model `claude-haiku-4-5`): reads
-  and reports on its assigned item; never mutates anything.
+- `reader` (`agent`, `read_only: true`, cheap model `claude-haiku-4-5`): its
+  `prompt` is a **prompt template** —
+  `"Read the item \"{{ item }}\" and report back what you find. Do not modify
+  anything."` — whose **interpolation token** `{{ item }}` resolves against
+  each branch's own `as` binding. Each fan-out instance therefore runs a
+  distinct **resolved prompt** naming its own item, never mutates anything,
+  and reports back what it found.
 - `reader -> END` (join edge, `mode: "all"`, `reducer: "dedup"`): waits for
   every fan-out branch, then collapses duplicate outputs into one `results`
-  list before the run ends.
+  list before the run ends. Since each branch's resolved prompt differs,
+  `dedup` here collapses only genuine duplicate reports, not every branch's
+  output down to one.
 
 ## Running it
 

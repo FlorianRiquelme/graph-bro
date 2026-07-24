@@ -10,7 +10,7 @@
       "kind": "agent",
       "read_only": true,
       "model": "claude-haiku-4-5",
-      "prompt": "Read the current item and report back what you find. Do not modify anything.",
+      "prompt": "Read the item \"{{ item }}\" and report back what you find. Do not modify anything.",
       "output_key": "results"
     }
   ],
