@@ -1,12 +1,7 @@
 import type Database from "better-sqlite3";
-import type { EngineState } from "../engine/state.js";
+import type { Activation, EngineState } from "../engine/state.js";
 
-/** A single frontier entry — a node instance queued to run next super-step. */
-export interface Activation {
-  nodeId: string;
-  instanceId: string;
-  binding?: { key: string; value: unknown };
-}
+export type { Activation };
 
 /**
  * Whole-state snapshot per super-step (the coarse resume point, §8.8's

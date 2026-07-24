@@ -15,6 +15,8 @@ export interface TokenUsage {
 
 export interface RunOptions {
   cwd: string;
+  /** The topology node id this run belongs to — attributes the KTD-10 read-only backstop's failure. */
+  nodeId: string;
   readOnly: boolean;
   model: string;
   /** Hard wall-clock timeout in ms; also the heartbeat hard-kill threshold. */

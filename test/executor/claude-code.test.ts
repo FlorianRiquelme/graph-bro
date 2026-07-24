@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -5,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ClaudeCodeExecutor, PROMPT_TOKEN, resolvePromptDelivery } from "../../src/executor/claude-code.js";
 import { InMemoryNodeRegistry } from "../../src/executor/executor.js";
-import { assertRepoClean } from "../../src/executor/read-only-policy.js";
 import { openDb } from "../../src/store/db.js";
 import { appendEvent, listEvents } from "../../src/store/trace.js";
 
@@ -31,7 +31,13 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
   let cwd: string;
 
   beforeEach(() => {
+    // A real read-only node always runs inside a real consumer git repo (KTD-10's
+    // premise), so every test gets one — not just the two backstop-focused tests.
     cwd = mkdtempSync(join(tmpdir(), "graph-bro-claude-code-"));
+    execFileSync("git", ["init", "-q"], { cwd });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+    execFileSync("git", ["config", "user.name", "test"], { cwd });
+    execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd });
   });
 
   afterEach(() => {
@@ -48,6 +54,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
 
     const result = await executor.run("ping", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000,
@@ -74,6 +81,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
 
     const result = await executor.run("do something forbidden", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000,
@@ -91,6 +99,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     let duringRun: unknown[] = [];
     await executor.run("ping", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000,
@@ -111,6 +120,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
 
     const result = await executor.run("ping", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000, // hard threshold far above the 250ms silence — must not fire
@@ -137,6 +147,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
 
     const result = await executor.run("ping", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 100, // hard threshold — must fire well before the 5s silence ends
@@ -151,21 +162,13 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
   }, 10_000);
 
   it("Covers R7: a read-only node is spawned with the mutation-denying allowlist, no --dangerously-skip-permissions, and leaves the cwd clean", async () => {
-    const { execFileSync } = await import("node:child_process");
-    execFileSync("git", ["init", "-q"], { cwd });
-    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
-    execFileSync("git", ["config", "user.name", "test"], { cwd });
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(join(cwd, "committed.txt"), "hello\n");
-    execFileSync("git", ["add", "."], { cwd });
-    execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
-
     process.env.FAKE_CLAUDE_MODE = "success";
     const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
     let initEvent: { argv: string[] } | undefined;
 
     await executor.run("attempt an edit", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000,
@@ -181,24 +184,21 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     expect(allowlistArg).not.toContain("Write");
     expect(initEvent!.argv.join(" ")).not.toContain("--dangerously-skip-permissions");
 
-    // R7 backstop (KTD-10): the fake CLI never touched the fixture's real cwd, so it must still be clean.
-    expect(() => assertRepoClean(cwd, "reader")).not.toThrow();
+    // R7 backstop (KTD-10): run() itself enforces this on every read-only completion
+    // (see below) — reaching this point without throwing already proves it passed.
   });
 
-  it("Covers R7 backstop (KTD-10): a dirty cwd after a read-only node's completion raises a loud, node-attributed failure", async () => {
-    const { execFileSync } = await import("node:child_process");
-    execFileSync("git", ["init", "-q"], { cwd });
-    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
-    execFileSync("git", ["config", "user.name", "test"], { cwd });
+  it("Covers R7 backstop (KTD-10): run() raises a loud, node-attributed failure when a read-only node's completion leaves the cwd dirty", async () => {
     const { writeFileSync } = await import("node:fs");
-    writeFileSync(join(cwd, "committed.txt"), "hello\n");
-    execFileSync("git", ["add", "."], { cwd });
-    execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
-
     // Simulate an allowlist gap: something slipped through and mutated the cwd anyway.
     writeFileSync(join(cwd, "mutated-by-slipped-bash.txt"), "oops\n");
 
-    expect(() => assertRepoClean(cwd, "reader-node")).toThrowError(/reader-node/);
+    process.env.FAKE_CLAUDE_MODE = "success";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+
+    await expect(
+      executor.run("ping", { cwd, nodeId: "reader-node", readOnly: true, model: "claude-haiku-4-5", timeout: 5000 }),
+    ).rejects.toThrowError(/reader-node/);
   });
 
   it("Covers cost capture: envelope tokens/total_cost_usd/duration_ms land in the events row via appendEvent", async () => {
@@ -207,6 +207,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
 
     const result = await executor.run("ping", {
       cwd,
+      nodeId: "reader",
       readOnly: true,
       model: "claude-haiku-4-5",
       timeout: 5000,

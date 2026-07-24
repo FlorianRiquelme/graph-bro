@@ -1,6 +1,6 @@
 import { END, START, type FanOutEdge, type PlainEdge, type ReducerName } from "../topology/schema.js";
 import { deriveInstanceId, deriveItemKey, type JoinBarrier } from "../topology/compile.js";
-import { getPath, snapshotState, type EngineState, type EngineUpdate } from "./state.js";
+import { getPath, snapshotState, type Activation, type EngineState, type EngineUpdate } from "./state.js";
 import { mergeWrites, StateConflictError, type Write } from "./reducers.js";
 import { ResettableJoinBarrier } from "./barrier.js";
 import { detectStalledJoin, UnreachableJoinError } from "./watchdog.js";
@@ -44,12 +44,6 @@ export class MaxStepsExceededError extends Error {
   }
 }
 
-interface Activation {
-  nodeId: string;
-  instanceId: string;
-  binding?: { key: string; value: unknown };
-}
-
 /**
  * The super-step loop (§13.2 runner loop / §13.3 channel-driven activation):
  * frontier -> snapshot -> run -> merge (reducers) -> transitions -> next
@@ -76,6 +70,22 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     }
   }
 
+  // Precomputed once (mirrors barriersBySource above) so `transition` looks up
+  // a node's out-edges in O(out-degree) instead of scanning every edge in the
+  // graph per activation, per super-step.
+  const plainEdgesBySource = new Map<string, PlainEdge[]>();
+  for (const edge of graph.plainEdges) {
+    const list = plainEdgesBySource.get(edge.from) ?? [];
+    list.push(edge);
+    plainEdgesBySource.set(edge.from, list);
+  }
+  const fanOutEdgesBySource = new Map<string, FanOutEdge[]>();
+  for (const edge of graph.fanOutEdges) {
+    const list = fanOutEdgesBySource.get(edge.from) ?? [];
+    list.push(edge);
+    fanOutEdgesBySource.set(edge.from, list);
+  }
+
   function transition(
     completed: Activation[],
     currentState: EngineState,
@@ -91,8 +101,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     };
 
     for (const { nodeId, instanceId } of completed) {
-      for (const edge of graph.plainEdges) {
-        if (edge.from !== nodeId) continue;
+      for (const edge of plainEdgesBySource.get(nodeId) ?? []) {
         if (edge.to === END) {
           reachedEnd = true;
           continue;
@@ -100,8 +109,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         pushUnique({ nodeId: edge.to, instanceId: edge.to });
       }
 
-      for (const edge of graph.fanOutEdges) {
-        if (edge.from !== nodeId) continue;
+      for (const edge of fanOutEdgesBySource.get(nodeId) ?? []) {
         const list = getPath(currentState, edge.for_each);
         const items = Array.isArray(list) ? list : [];
         const instanceIds: string[] = [];

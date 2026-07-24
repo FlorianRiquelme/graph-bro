@@ -2,7 +2,7 @@ import readline from "node:readline";
 import type { Executor, NodeRegistry, RunOptions, RunResult, TokenUsage } from "./executor.js";
 import { spawnDetached, killProcessGroup } from "./subprocess.js";
 import { parseEnvelope, type ResultEnvelope } from "./envelope.js";
-import { buildReadOnlyArgs } from "./read-only-policy.js";
+import { assertRepoClean, buildReadOnlyArgs } from "./read-only-policy.js";
 
 /** The literal token a command template substitutes the prompt into, when present. */
 export const PROMPT_TOKEN = "{prompt}";
@@ -135,6 +135,11 @@ export class ClaudeCodeExecutor implements Executor {
       // §14.7: always group-kill in `finally`, even on the success path — reaps any child the CLI itself leaked.
       await killProcessGroup(spawned.pgid, spawned.child, this.opts.killGraceMs);
     }
+
+    // KTD-10 backstop: per read-only node completion (not once after a whole fan-out
+    // drains), so a permission-policy gap is attributed to the offending node. Folded
+    // into the shared `run()` path rather than left for callers to remember.
+    if (options.readOnly) assertRepoClean(options.cwd, options.nodeId);
 
     if (terminalEnvelope) {
       return {

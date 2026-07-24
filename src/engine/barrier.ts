@@ -43,21 +43,8 @@ export class ResettableJoinBarrier {
 
   /** Whether the barrier's `mode` condition (`all`/`any`) is satisfied. */
   isComplete(): boolean {
-    if (this.mode === "any") {
-      for (const arrived of this.arrivedBySource.values()) {
-        if (arrived.size > 0) return true;
-      }
-      return false;
-    }
-    for (const source of this.sources) {
-      const expected = this.expectedBySource.get(source)!;
-      const arrived = this.arrivedBySource.get(source)!;
-      if (expected.size === 0) return false;
-      for (const id of expected) {
-        if (!arrived.has(id)) return false;
-      }
-    }
-    return true;
+    if (this.mode === "any") return this.hasAnyArrival();
+    return this.unreportedSources().length === 0;
   }
 
   /** Clears arrivals so the barrier can fire again on a later cycle. Expected sets survive until re-armed. */

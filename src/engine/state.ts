@@ -10,6 +10,18 @@ export type EngineState = Record<string, unknown>;
 export type EngineUpdate = Record<string, unknown>;
 
 /**
+ * A single frontier entry — a node instance queued to run next super-step.
+ * The canonical shape; `store/checkpoints.ts` imports this rather than
+ * redeclaring it, since the frontier it persists is exactly what the loop
+ * produces.
+ */
+export interface Activation {
+  nodeId: string;
+  instanceId: string;
+  binding?: { key: string; value: unknown };
+}
+
+/**
  * A frozen shallow copy of `state`, taken once per super-step, so every node
  * in the step's frontier reads the same view regardless of what siblings in
  * the same step write (§13.2 runner loop: "nodes never see each other's
