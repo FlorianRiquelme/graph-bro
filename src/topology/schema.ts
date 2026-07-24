@@ -138,5 +138,7 @@ export const TopologySchema = z.object({
   nodes: z.array(NodeSchema).min(1),
   edges: z.array(EdgeSchema),
   max_steps: z.number().int().positive(),
+  /** Per-topology override of the bounded fan-out pool's width (ADR-0011); defaults to the engine's K=5 if omitted. */
+  max_concurrency: z.number().int().positive().optional(),
 });
 export type Topology = z.infer<typeof TopologySchema>;

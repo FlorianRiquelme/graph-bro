@@ -3,9 +3,13 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "bin": {
+    "graph-bro": "dist/cli/index.js"
+  },
   "scripts": {
     "test": "vitest run",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "postbuild": "mkdir -p dist/store/migrations && cp src/store/migrations/*.sql dist/store/migrations/ && chmod +x dist/cli/index.js"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.1",

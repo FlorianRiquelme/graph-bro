@@ -32,6 +32,8 @@ export interface JoinBarrier {
 
 export interface CompiledTopology {
   maxSteps: number;
+  /** Per-topology override of the bounded fan-out pool's width (ADR-0011), threaded into `EngineGraph.maxConcurrency`. */
+  maxConcurrency?: number;
   nodes: TopologyNode[];
   plainEdges: PlainEdge[];
   fanOutEdges: FanOutEdge[];
@@ -128,6 +130,7 @@ export function compile(input: unknown): CompileResult {
 
   const compiled: CompiledTopology = {
     maxSteps: topology.max_steps,
+    maxConcurrency: topology.max_concurrency,
     nodes: topology.nodes,
     plainEdges,
     fanOutEdges,

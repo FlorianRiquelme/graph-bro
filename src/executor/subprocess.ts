@@ -72,3 +72,18 @@ export function killProcessGroup(pgid: number, child: ChildProcess, graceMs = 30
     }, graceMs);
   });
 }
+
+/**
+ * Fire-and-forget process-group signal (KTD-13's run-kill cascade): the
+ * runtime's in-flight node registry only survives pid/pgid across an
+ * `executor.run()` call, not the `ChildProcess` handle `killProcessGroup`
+ * needs to await confirmed exit — so this just signals, swallowing ESRCH
+ * (already-exited).
+ */
+export function signalProcessGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, signal);
+  } catch {
+    // Already gone.
+  }
+}

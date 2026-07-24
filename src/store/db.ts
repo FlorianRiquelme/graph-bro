@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MIGRATION_ID = "001_init";
+/** Applied in order; each id is tracked independently in `schema_migrations` (§8.8). */
+const MIGRATION_IDS = ["001_init", "002_run_topology_path"];
 
 export interface OpenDbOptions {
   /**
@@ -30,11 +31,13 @@ function migrationsDir(): string {
  */
 export function runMigrations(db: Database.Database): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY)`);
-  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(MIGRATION_ID);
-  if (applied) return;
-  const sql = readFileSync(join(migrationsDir(), "001_init.sql"), "utf-8");
-  db.exec(sql);
-  db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(MIGRATION_ID);
+  for (const id of MIGRATION_IDS) {
+    const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(id);
+    if (applied) continue;
+    const sql = readFileSync(join(migrationsDir(), `${id}.sql`), "utf-8");
+    db.exec(sql);
+    db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(id);
+  }
 }
 
 /**
@@ -43,7 +46,10 @@ export function runMigrations(db: Database.Database): void {
  * throwing `SQLITE_BUSY` (ADR-0003), and runs the idempotent migration.
  */
 export function openDb(options: OpenDbOptions = {}): Database.Database {
-  const baseDir = options.baseDir ?? defaultBaseDir();
+  // GRAPH_BRO_HOME: overrides the default `~/.graph-bro` for the CLI/runtime's own
+  // child processes under test, without requiring every call site to thread `baseDir`
+  // through argv (the CLI itself never takes a `--home` flag — KTD-2 is one global DB).
+  const baseDir = options.baseDir ?? process.env.GRAPH_BRO_HOME ?? defaultBaseDir();
   mkdirSync(baseDir, { recursive: true });
   const db = new Database(join(baseDir, "graph-bro.db"));
   db.pragma("journal_mode = WAL");

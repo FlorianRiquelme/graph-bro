@@ -123,12 +123,19 @@ export function listPendingWrites(db: Database.Database, runId: string, opts: { 
   return (rows as RawPendingWriteRow[]).map(toPendingWriteRow);
 }
 
-/** Registers/updates the run's owner pid (KTD-14 single-owner guard). */
-export function createRun(db: Database.Database, runId: string, ownerPid: number): void {
+/**
+ * Registers/updates the run's owner pid (KTD-14 single-owner guard). `start`
+ * sets `topologyPath` on the first insert; `resume` (self-healing ownership
+ * of an already-recorded run) omits it and the existing value survives, so
+ * `graph-bro resume <run_id>` only needs the run id to know what to recompile.
+ */
+export function createRun(db: Database.Database, runId: string, ownerPid: number, topologyPath?: string): void {
   db.prepare(
-    `INSERT INTO runs (run_id, owner_pid) VALUES (?, ?)
-     ON CONFLICT(run_id) DO UPDATE SET owner_pid = excluded.owner_pid`,
-  ).run(runId, ownerPid);
+    `INSERT INTO runs (run_id, owner_pid, topology_path) VALUES (?, ?, ?)
+     ON CONFLICT(run_id) DO UPDATE SET
+       owner_pid = excluded.owner_pid,
+       topology_path = COALESCE(excluded.topology_path, runs.topology_path)`,
+  ).run(runId, ownerPid, topologyPath ?? null);
 }
 
 export function getRunOwnerPid(db: Database.Database, runId: string): number | undefined {
@@ -136,6 +143,40 @@ export function getRunOwnerPid(db: Database.Database, runId: string): number | u
     | { owner_pid: number }
     | undefined;
   return row?.owner_pid;
+}
+
+export interface RunRow {
+  runId: string;
+  ownerPid: number;
+  status: string;
+  topologyPath?: string;
+  createdAt: string;
+}
+
+interface RawRunRow {
+  run_id: string;
+  owner_pid: number;
+  status: string;
+  topology_path: string | null;
+  created_at: string;
+}
+
+/** Reads a run's row (owner/status/topology path) — the source `status`/`result`/`resume` read from. */
+export function getRun(db: Database.Database, runId: string): RunRow | undefined {
+  const row = db.prepare(`SELECT * FROM runs WHERE run_id = ?`).get(runId) as RawRunRow | undefined;
+  if (!row) return undefined;
+  return {
+    runId: row.run_id,
+    ownerPid: row.owner_pid,
+    status: row.status,
+    topologyPath: row.topology_path ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
+/** Writes the run's final/current status (`running` | `completed` | `dead_end` | `failed`). */
+export function updateRunStatus(db: Database.Database, runId: string, status: string): void {
+  db.prepare(`UPDATE runs SET status = ? WHERE run_id = ?`).run(status, runId);
 }
 
 /** Liveness check (signal 0) for `owner_pid` — the guard `resume`/`start` consume (KTD-14). */

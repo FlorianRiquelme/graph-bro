@@ -85,3 +85,11 @@ export function listEvents(db: Database.Database, runId: string): EventRow[] {
   const rows = db.prepare(`SELECT * FROM events WHERE run_id = ? ORDER BY id`).all(runId) as RawEventRow[];
   return rows.map(toEventRow);
 }
+
+/** Cursor-based paging (`graph-bro tail`, §13.2 `tail(cursor, limit)`): events with `id > cursor`, oldest first. */
+export function listEventsSince(db: Database.Database, runId: string, cursor: number, limit = 200): EventRow[] {
+  const rows = db
+    .prepare(`SELECT * FROM events WHERE run_id = ? AND id > ? ORDER BY id LIMIT ?`)
+    .all(runId, cursor, limit) as RawEventRow[];
+  return rows.map(toEventRow);
+}

@@ -91,6 +91,18 @@ describe("schema", () => {
     expect(TopologySchema.safeParse(topology).success).toBe(false);
   });
 
+  it("accepts an optional max_concurrency override (ADR-0011), positive int only", () => {
+    const base = {
+      nodes: [{ id: "reader", kind: "agent", read_only: true, model: "claude-cheap", prompt: "read", output_key: "finding" }],
+      edges: [],
+      max_steps: 10,
+    };
+    expect(TopologySchema.safeParse({ ...base, max_concurrency: 3 }).success).toBe(true);
+    expect(TopologySchema.safeParse(base).success).toBe(true); // omitted is valid
+    expect(TopologySchema.safeParse({ ...base, max_concurrency: 0 }).success).toBe(false);
+    expect(TopologySchema.safeParse({ ...base, max_concurrency: 1.5 }).success).toBe(false);
+  });
+
   it("rejects an unknown reducer name", () => {
     const edge = {
       from: ["a", "b"],

@@ -22,6 +22,7 @@ exports[`compile: happy path > golden-file snapshot of compiled output (nodes, e
       "to": "collector",
     },
   ],
+  "maxConcurrency": undefined,
   "maxSteps": 25,
   "nodes": [
     {

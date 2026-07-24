@@ -62,6 +62,16 @@ describe("compile: happy path", () => {
     });
   });
 
+  it("threads a topology-level max_concurrency override (ADR-0011) into CompiledTopology; omitted stays undefined", () => {
+    const withOverride = compile({ ...validTopology(), max_concurrency: 2 });
+    expect(withOverride.ok).toBe(true);
+    if (withOverride.ok) expect(withOverride.compiled.maxConcurrency).toBe(2);
+
+    const withoutOverride = compile(validTopology());
+    expect(withoutOverride.ok).toBe(true);
+    if (withoutOverride.ok) expect(withoutOverride.compiled.maxConcurrency).toBeUndefined();
+  });
+
   it("golden-file snapshot of compiled output (nodes, edges, join barriers, reducer assignments)", () => {
     const result = compile(validTopology());
     expect(result.ok).toBe(true);
