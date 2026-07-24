@@ -17,6 +17,8 @@ jobs:
 
       - run: npm ci
 
+      - run: node -e "console.log(process.version, process.platform, process.arch); console.log(require('better-sqlite3/package.json').version); new (require('better-sqlite3'))(':memory:').prepare('select 1').get()"
+
       - run: npm run build
 
       - run: npm test
