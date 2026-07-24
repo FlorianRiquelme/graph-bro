@@ -30,8 +30,9 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
 - **Checkpoint** — the durable per-super-step state snapshot: `{state, frontier, barrier state, step,
   history}`. The whole resumability contract; resume loads one snapshot and skips completed nodes (R9).
 - **Pending writes** — per-task durable writes keyed by the deterministic `(run_id, node, step,
-  triggers)` hash. The single most load-bearing correctness property (§8.5): a succeeded sibling is
-  never re-run when a failing sibling retries.
+  item_key, triggers)` hash — `item_key` is the fan-out per-instance discriminator (KTD-12), without
+  which N siblings of one node id at one step collapse to a single row. The single most load-bearing
+  correctness property (§8.5): a succeeded sibling is never re-run when a failing sibling retries.
 - **Run** — one detached execution of a topology, identified by a **run id**. Persists to SQLite;
   survives crashes; addressed by id from any consumer repo via the CLI.
 - **Trace** — the agent-legible record of "what happened on the way" (R12): per-node start/end,
