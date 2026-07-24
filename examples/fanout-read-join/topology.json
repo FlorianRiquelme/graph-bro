@@ -1,0 +1,23 @@
+{
+  "nodes": [
+    {
+      "id": "dispatch",
+      "kind": "set",
+      "update": { "batch": { "items": ["one", "two", "three"] } }
+    },
+    {
+      "id": "reader",
+      "kind": "agent",
+      "read_only": true,
+      "model": "claude-haiku-4-5",
+      "prompt": "Read the current item and report back what you find. Do not modify anything.",
+      "output_key": "results"
+    }
+  ],
+  "edges": [
+    { "from": "START", "to": "dispatch" },
+    { "from": "dispatch", "for_each": "batch.items", "as": "item", "to": "reader" },
+    { "from": ["reader"], "mode": "all", "reducer": "dedup", "into": "results", "to": "END" }
+  ],
+  "max_steps": 10
+}

@@ -1,0 +1,66 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`compile: happy path > golden-file snapshot of compiled output (nodes, edges, join barriers, reducer assignments) 1`] = `
+{
+  "fanOutEdges": [
+    {
+      "as": "item",
+      "for_each": "batch.items",
+      "from": "dispatch",
+      "to": "reader",
+    },
+  ],
+  "joinBarriers": [
+    {
+      "id": "reader=>collector",
+      "into": "results",
+      "mode": "all",
+      "reducer": "dedup",
+      "sources": [
+        "reader",
+      ],
+      "to": "collector",
+    },
+  ],
+  "maxConcurrency": undefined,
+  "maxSteps": 25,
+  "nodes": [
+    {
+      "id": "dispatch",
+      "kind": "set",
+      "update": {
+        "batch.items": [
+          "a",
+          "b",
+          "c",
+        ],
+      },
+    },
+    {
+      "id": "reader",
+      "kind": "agent",
+      "model": "claude-haiku",
+      "output_key": "finding",
+      "prompt": "read \${item}",
+      "read_only": true,
+    },
+    {
+      "id": "collector",
+      "kind": "set",
+      "update": {
+        "collected": true,
+      },
+    },
+  ],
+  "plainEdges": [
+    {
+      "from": "START",
+      "to": "dispatch",
+    },
+    {
+      "from": "collector",
+      "to": "END",
+    },
+  ],
+}
+`;
