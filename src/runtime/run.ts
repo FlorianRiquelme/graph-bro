@@ -12,6 +12,7 @@ import {
   type InitialBarrierState,
 } from "../engine/loop.js";
 import { buildFanOutBranches } from "../engine/fanout.js";
+import { renderPromptTemplate } from "../engine/prompt-template.js";
 import type { EngineState, EngineUpdate } from "../engine/state.js";
 import { openDb } from "../store/db.js";
 import { resume as resumeRun, updateRunStatus } from "../store/pending-writes.js";
@@ -68,7 +69,7 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
         cacheReadTokens: meta?.cacheReadTokens,
         durationMs: meta?.durationMs,
         costUsd: meta?.costUsd,
-        payload: { type: "node_complete", update },
+        payload: { type: "node_complete", update, prompt: meta?.resolvedPrompt },
       });
       return update;
     } catch (err) {
@@ -101,7 +102,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Re
             cwd: process.cwd(),
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,
-            prompt: node.prompt,
+            prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
           })
         : (): EngineUpdate => ({ ...node.update });
   }

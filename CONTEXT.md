@@ -40,6 +40,18 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
   CLI (`tail`/`result`/`trace`), never by the consumer running SQL.
 - **Consumer** — the external repo that authors a topology and invokes the engine (slice 1: sensei).
   graph-bro never names a consumer or its domain (R1, boundary invariant).
+- **Prompt template** — an `agent` node's `prompt` string bearing **interpolation tokens**, resolved
+  against the node's input snapshot at activation (a fan-out branch additionally sees its `as` binding).
+  A prompt with no tokens is not a template — it passes through byte-identical. _Not:_ an expression
+  language; there are no conditionals, loops, or computation, only value interpolation with dotted-path
+  access.
+- **Interpolation token** — a placeholder in a prompt template addressing a value in the input snapshot
+  by dotted path (same `getPath` semantics as `for_each`). Resolves **single-pass** (a substituted value
+  is never re-scanned) against **trusted** consumer-authored data. A token addressing an absent path
+  **fails loud** (R5); a present `null`/empty value is serialized, not a failure.
+- **Resolved prompt** — the concrete instruction a branch actually ran with, after its template's tokens
+  were substituted. This — not the template — is what the trace records (R6), so per-branch
+  differentiation is observable after the fact.
 
 ## Settled decisions (see `docs/adr/`)
 

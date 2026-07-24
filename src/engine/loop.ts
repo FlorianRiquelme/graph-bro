@@ -24,6 +24,8 @@ export interface NodeTraceMeta {
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
   durationMs?: number;
+  /** The agent node's prompt after template resolution (R6) — what the executor actually ran with. */
+  resolvedPrompt?: string;
 }
 
 /**
@@ -133,6 +135,7 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
       cacheCreationTokens: result.tokens?.cacheCreationTokens,
       cacheReadTokens: result.tokens?.cacheReadTokens,
       durationMs: result.durationMs,
+      resolvedPrompt: prompt,
     };
     Object.defineProperty(update, NODE_TRACE_META, { value: meta, enumerable: false });
     return update;
