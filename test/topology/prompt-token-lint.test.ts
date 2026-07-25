@@ -132,6 +132,32 @@ describe("topology: prompt-token root-key check (graph-bro#7)", () => {
       expect(errors[0].message).toContain("knwon");
     });
 
+    it("scopes the message's claim to this topology, since that is all it checked (graph-bro#13)", () => {
+      // The check is whole-topology, never "when does the writer run" — so it
+      // must not assert the absolute "no node writes this key".
+      const errors = checkOne("use {{ knwon }}");
+      expect(errors[0].message).toContain("no node in this topology writes");
+    });
+
+    it("accepts a token whose root only a strictly LATER node writes — whole-topology by design", () => {
+      // Pins the documented scope limit: this clears the gate and then fails at
+      // activation time with UnresolvedPromptTokenError (R5). Deliberate — the
+      // per-node reachability analysis it would take is out of graph-bro#7's scope.
+      const topology = {
+        nodes: [
+          agent("reader", "use {{ written_later }}"),
+          { id: "late", kind: "set", update: { written_later: "too late" } },
+        ],
+        edges: [
+          { from: "START", to: "reader" },
+          { from: "reader", to: "late" },
+          { from: "late", to: "END" },
+        ],
+        max_steps: 10,
+      };
+      expect(checkPromptTokens(compiled(topology), [])).toEqual([]);
+    });
+
     it("accepts a root key supplied only via the run's --input", () => {
       expect(checkOne("use {{ seeded }}", { inputRootKeys: ["seeded"] })).toEqual([]);
     });

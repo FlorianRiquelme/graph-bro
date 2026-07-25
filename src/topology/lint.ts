@@ -106,6 +106,13 @@ export function collectStateRootKeys(compiled: CompiledTopology, inputRootKeys: 
  * Takes `inputRootKeys` separately rather than reading them off the topology
  * because a root key can arrive purely via `--input`, which `compile` never
  * sees; the CLI supplies both at `start`.
+ *
+ * Passing means every root is produced *somewhere* in the run — not that it is
+ * in scope at the node reading it. A key written only by a strictly later node,
+ * by the reading node itself, or on a branch that never fires all clear this
+ * gate and still fail at activation time with `UnresolvedPromptTokenError`
+ * (R5). Hence the message's scoped wording — "no node in this topology writes"
+ * is the claim the check can actually make (graph-bro#13).
  */
 export function checkPromptTokens(
   compiled: CompiledTopology,
@@ -124,7 +131,7 @@ export function checkPromptTokens(
         nodeId: node.id,
         path,
         root,
-        message: `agent node '${node.id}': prompt token '{{ ${path} }}' reads state key '${root}', which no node writes and no input supplies`,
+        message: `agent node '${node.id}': prompt token '{{ ${path} }}' reads state key '${root}', which no node in this topology writes and no run input supplies`,
       });
     }
   }
