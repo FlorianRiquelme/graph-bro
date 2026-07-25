@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb } from "../../src/store/db.js";
 import { getRun } from "../../src/store/pending-writes.js";
+import { listEvents } from "../../src/store/trace.js";
 import { createWorkspace, resolveBaseRef, runBranchForRun, workspacePathForRun } from "../../src/workspace/lifecycle.js";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -59,10 +60,12 @@ export function runCliSync(args: string[], opts: { cwd: string; env: NodeJS.Proc
   return { stdout: result.stdout, stderr: result.stderr, status: result.status, signal: result.signal };
 }
 
-export async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 50): Promise<void> {
+export async function waitFor(predicate: () => boolean, timeoutMs: number, pollMs = 50, describeState?: () => string): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor: timed out after ${timeoutMs}ms${describeState ? `\n${describeState()}` : ""}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 }
@@ -72,16 +75,41 @@ export async function waitFor(predicate: () => boolean, timeoutMs: number, pollM
  * instead of shelling out to a full CLI subprocess every tick — a poll loop
  * driving `status` through `runCliSync` pays a fresh Node start + native
  * `better-sqlite3` load per tick, which adds up over a 5-20s wait.
+ *
+ * On timeout, reports the status actually observed plus the run's trace tail.
+ * A bare "timed out" cannot distinguish the three failure modes that reach
+ * here — the run never started, the run is genuinely slow, or the run reached
+ * a *different* terminal status (a `failed` run never becomes `completed`, so
+ * it burns the whole timeout looking exactly like starvation). Diagnosing that
+ * from a CI log with no reproduction is otherwise guesswork.
  */
 export function waitForRunStatus(home: string, runId: string, status: string, timeoutMs: number): Promise<void> {
-  return waitFor(() => {
+  const readRun = (): { status: string } | undefined => {
     const db = openDb({ baseDir: home });
     try {
-      return getRun(db, runId)?.status === status;
+      return getRun(db, runId);
     } finally {
       db.close();
     }
-  }, timeoutMs);
+  };
+  return waitFor(
+    () => readRun()?.status === status,
+    timeoutMs,
+    50,
+    () => {
+      const db = openDb({ baseDir: home });
+      try {
+        const observed = getRun(db, runId)?.status ?? "<no run row>";
+        const tail = listEvents(db, runId)
+          .slice(-12)
+          .map((event) => `  #${event.id}${event.node ? ` [${event.node}]` : ""} ${JSON.stringify(event.payload)}`)
+          .join("\n");
+        return `waiting for run ${runId} status '${status}', observed '${observed}'\ntrace tail:\n${tail || "  <no events>"}`;
+      } finally {
+        db.close();
+      }
+    },
+  );
 }
 
 /**
