@@ -8,6 +8,7 @@ import {
   makeAgentNodeFn,
   readNodeTraceMeta,
   type EngineGraph,
+  type LoopStatus,
   type NodeFn,
   type RunLoopOptions,
   type InitialBarrierState,
@@ -27,6 +28,13 @@ import { signalProcessGroup } from "../executor/subprocess.js";
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 /** Grace period between the SIGTERM and SIGKILL sweep of the kill cascade. */
 const KILL_GRACE_MS = 3000;
+
+/** R7: `not_converged` is a distinct exit code — it reads as "did the work, reviewer still objects", never conflated with the generic failure code a crash or `dead_end` maps to. */
+export function mapStatusToExitCode(status: LoopStatus): number {
+  if (status === "completed") return 0;
+  if (status === "not_converged") return 2;
+  return 1;
+}
 
 /**
  * KTD-13: cascades a SIGTERM/SIGINT sent to this (detached) engine process to
@@ -177,12 +185,19 @@ async function main(): Promise<void> {
     return;
   }
 
+  // R6: nodeId -> declared max_attempts, for every agent node bounding a loop it's re-entered by.
+  const attemptBounds: Record<string, number> = {};
+  for (const node of compiled.nodes) {
+    if (node.kind === "agent" && node.max_attempts !== undefined) attemptBounds[node.id] = node.max_attempts;
+  }
+
   const graph: EngineGraph = {
     plainEdges: compiled.plainEdges,
     fanOutEdges: compiled.fanOutEdges,
     joinBarriers: compiled.joinBarriers,
     maxSteps: compiled.maxSteps,
     maxConcurrency: compiled.maxConcurrency,
+    attemptBounds,
   };
   const rawNodeFns = buildNodeFns(compiled, executor);
   const nodeFns: Record<string, NodeFn> = {};
@@ -203,6 +218,7 @@ async function main(): Promise<void> {
       initialFrontier: resumed.frontier,
       initialStep: resumed.step,
       initialBarrierState,
+      initialAttempts: resumed.attempts,
       persistence: { db, runId },
     };
   }
@@ -236,7 +252,7 @@ async function main(): Promise<void> {
       writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
     }
     updateRunStatus(db, runId, result.status);
-    process.exitCode = result.status === "completed" ? 0 : 1;
+    process.exitCode = mapStatusToExitCode(result.status);
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
     updateRunStatus(db, runId, "failed");

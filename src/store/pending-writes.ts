@@ -216,6 +216,8 @@ export interface ResumeResult {
   state: EngineState;
   frontier: Activation[];
   completedInstanceIds: Set<string>;
+  /** KTD-5: nodeId -> attempts taken so far, continued (not restarted) from the checkpoint. */
+  attempts: Record<string, number>;
 }
 
 /**
@@ -228,7 +230,7 @@ export interface ResumeResult {
 export function resume(db: Database.Database, runId: string, options: ResumeOptions = {}): ResumeResult {
   const checkpoint = readLatestCheckpoint(db, runId);
   if (!checkpoint) {
-    return { step: 0, state: {}, frontier: [], completedInstanceIds: new Set() };
+    return { step: 0, state: {}, frontier: [], completedInstanceIds: new Set(), attempts: {} };
   }
 
   const inFlightStep = checkpoint.step + 1;
@@ -240,5 +242,5 @@ export function resume(db: Database.Database, runId: string, options: ResumeOpti
 
   const frontier = checkpoint.frontier.filter((activation) => !completedInstanceIds.has(activation.instanceId));
 
-  return { step: checkpoint.step, state, frontier, completedInstanceIds };
+  return { step: checkpoint.step, state, frontier, completedInstanceIds, attempts: checkpoint.attempts ?? {} };
 }

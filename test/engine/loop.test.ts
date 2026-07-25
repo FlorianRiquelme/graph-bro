@@ -17,6 +17,7 @@ import { StubExecutor } from "../fixtures/stub-executor.js";
 import { openDb } from "../../src/store/db.js";
 import { createRun } from "../../src/store/pending-writes.js";
 import { listEvents } from "../../src/store/trace.js";
+import { readLatestCheckpoint } from "../../src/store/checkpoints.js";
 
 function emptyGraph(overrides: Partial<EngineGraph>): EngineGraph {
   return {
@@ -653,5 +654,141 @@ describe("engine/loop: when evaluation, routing trace, loud unmatched router (U3
     expect(toB.result).toBe(false);
 
     db.close();
+  });
+});
+
+describe("engine/loop: attempt bound and not_converged (U4, R5/R6/R7, KTD-5)", () => {
+  let baseDir: string;
+
+  beforeEach(() => {
+    baseDir = mkdtempSync(join(tmpdir(), "graph-bro-loop-attempts-"));
+  });
+
+  afterEach(() => {
+    rmSync(baseDir, { recursive: true, force: true });
+  });
+
+  function reviewLoopGraph(bound: number, maxSteps = 50): EngineGraph {
+    return {
+      plainEdges: [
+        { from: START, to: "review" },
+        { from: "review", to: "pass", when: { key: "ok", truthy: true } },
+        { from: "review", to: "fix", when: { key: "ok", falsy: true } },
+        { from: "fix", to: "review" },
+        { from: "pass", to: END },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps,
+      attemptBounds: { review: bound },
+    };
+  }
+
+  it("Covers AE4: a loop whose review never passes halts at the bound as not_converged, distinct from failed", async () => {
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: false }), fix: () => ({}) };
+
+    const result = await runLoop({ graph: reviewLoopGraph(3), nodeFns });
+
+    expect(result.status).toBe("not_converged");
+    expect(result.status).not.toBe("failed");
+    expect(result.attempts.review).toBe(3);
+  });
+
+  it("a loop that converges before its bound reports completed, with the attempt count reflecting attempts actually taken", async () => {
+    let calls = 0;
+    const nodeFns: Record<string, NodeFn> = {
+      review: () => {
+        calls += 1;
+        return { ok: calls >= 2 };
+      },
+      fix: () => ({}),
+      pass: () => ({}),
+    };
+
+    const result = await runLoop({ graph: reviewLoopGraph(5), nodeFns });
+
+    expect(result.status).toBe("completed");
+    expect(result.attempts.review).toBe(2);
+  });
+
+  it("the step budget and the attempt bound are independent: exhausting max_steps inside a bounded loop reports the step-budget outcome, not the bound", async () => {
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: false }), fix: () => ({}) };
+
+    const result = await runLoop({ graph: reviewLoopGraph(1000, 3), nodeFns });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(MaxStepsExceededError);
+  });
+
+  it("two back-edges into one bounded node share the one bound", async () => {
+    const graph: EngineGraph = {
+      plainEdges: [
+        { from: START, to: "review" },
+        { from: "review", to: "fix_a", when: { key: "path", equals: "a" } },
+        { from: "review", to: "fix_b", when: { key: "path", equals: "b" } },
+        { from: "fix_a", to: "review" },
+        { from: "fix_b", to: "review" },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 50,
+      attemptBounds: { review: 2 },
+    };
+    let calls = 0;
+    const nodeFns: Record<string, NodeFn> = {
+      review: () => {
+        calls += 1;
+        return { path: calls % 2 === 0 ? "b" : "a" };
+      },
+      fix_a: () => ({}),
+      fix_b: () => ({}),
+    };
+
+    const result = await runLoop({ graph, nodeFns });
+
+    expect(result.status).toBe("not_converged");
+    expect(result.attempts.review).toBe(2);
+  });
+
+  it("the attempt count is present in the checkpoint after each attempt (KTD-5)", async () => {
+    const db = openDb({ baseDir });
+    const runId = "run-attempt-checkpoint";
+    createRun(db, runId, process.pid);
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: false }), fix: () => ({}) };
+
+    await runLoop({ graph: reviewLoopGraph(5), nodeFns, persistence: { db, runId } });
+
+    const latest = readLatestCheckpoint(db, runId);
+    expect(latest?.attempts?.review).toBe(5);
+    db.close();
+  });
+
+  it("a bounded node reached exactly once, with no loop, does not trip the bound", async () => {
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: true }), pass: () => ({}) };
+
+    const result = await runLoop({ graph: reviewLoopGraph(1), nodeFns });
+
+    expect(result.status).toBe("completed");
+    expect(result.attempts.review).toBe(1);
+  });
+
+  it("an unbounded node in a loop is governed only by max_steps — slice-1 behavior unchanged", async () => {
+    const graph: EngineGraph = {
+      plainEdges: [
+        { from: START, to: "review" },
+        { from: "review", to: "fix", when: { key: "ok", falsy: true } },
+        { from: "fix", to: "review" },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 4,
+      // no attemptBounds declared at all
+    };
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: false }), fix: () => ({}) };
+
+    const result = await runLoop({ graph, nodeFns });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(MaxStepsExceededError);
   });
 });

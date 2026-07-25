@@ -58,6 +58,8 @@ export interface EngineGraph {
   maxSteps: number;
   /** Per-topology override of the bounded pool's width (ADR-0011); defaults to `DEFAULT_MAX_CONCURRENCY`. */
   maxConcurrency?: number;
+  /** R6: nodeId -> declared `max_attempts`, for the nodes a loop re-enters. Absent entirely means no node in this topology declared a bound. */
+  attemptBounds?: Record<string, number>;
 }
 
 /** Durable wiring (U3): when provided, branches commit pending writes as they drain and the loop checkpoints each step's incoming frontier before dispatch, so a crash mid-drain resumes cleanly. */
@@ -93,6 +95,8 @@ export interface RunLoopOptions {
   initialBarrierState?: InitialBarrierState[];
   /** Overrides `graph.maxConcurrency`/the default K=5 (ADR-0011) for this run. */
   maxConcurrency?: number;
+  /** KTD-5: per-node attempt counts to continue from on resume — a resumed run does not restart the count, so it can hit `not_converged` immediately if it already spent its attempts. */
+  initialAttempts?: Record<string, number>;
   persistence?: RunLoopPersistence;
 }
 
@@ -157,13 +161,16 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
   };
 }
 
-export type LoopStatus = "completed" | "dead_end" | "failed";
+/** R6/R7: `not_converged` means the run did its work and the reviewer still objects — distinct from `failed`, and from `max_steps` exhaustion (also `failed`). */
+export type LoopStatus = "completed" | "dead_end" | "failed" | "not_converged";
 
 export interface LoopResult {
   status: LoopStatus;
   state: EngineState;
   steps: number;
   error?: Error;
+  /** KTD-5: nodeId -> attempts taken so far, for every node declaring `max_attempts`. Mirrors `steps`' always-present shape. */
+  attempts: Record<string, number>;
 }
 
 /** Raised when a run exceeds `max_steps` — a visible failure, never a hang (R8). */
@@ -207,6 +214,11 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
   const barriersBySource = new Map<string, ResettableJoinBarrier[]>();
   const joinBarrierMetaById = new Map<string, JoinBarrier>();
   const reducerForKey = new Map<string, ReducerName>();
+  // R6/KTD-5: nodeId -> attempts taken. Continues from `initialAttempts` on
+  // resume rather than restarting, so a resumed run cannot launder itself
+  // past its declared bound.
+  const attemptCounts = new Map<string, number>(Object.entries(options.initialAttempts ?? {}));
+  const attemptsSnapshot = (): Record<string, number> => Object.fromEntries(attemptCounts);
 
   for (const jb of graph.joinBarriers) {
     const barrier = new ResettableJoinBarrier(jb.id, jb.sources, jb.mode);
@@ -348,8 +360,9 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     steps = options.initialStep ?? 0;
   } else {
     const seed = transition([{ nodeId: START, instanceId: START }], state, 0);
-    if (seed.unmatchedRouterError) return { status: "failed", state, steps: 0, error: seed.unmatchedRouterError };
-    if (seed.reachedEnd) return { status: "completed", state, steps: 0 };
+    if (seed.unmatchedRouterError)
+      return { status: "failed", state, steps: 0, error: seed.unmatchedRouterError, attempts: attemptsSnapshot() };
+    if (seed.reachedEnd) return { status: "completed", state, steps: 0, attempts: attemptsSnapshot() };
     frontier = seed.next;
     steps = 0;
   }
@@ -359,7 +372,30 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
   while (frontier.length > 0) {
     steps += 1;
     if (steps > graph.maxSteps) {
-      return { status: "failed", state, steps, error: new MaxStepsExceededError(graph.maxSteps) };
+      return { status: "failed", state, steps, error: new MaxStepsExceededError(graph.maxSteps), attempts: attemptsSnapshot() };
+    }
+
+    // R6/R7: count this step's activations of any bounded node BEFORE
+    // dispatch — independent of the step budget above, per the Product
+    // Contract decision (whichever bound the actual run trips fires; this
+    // check never overrides a max_steps failure that already returned).
+    // Hitting the bound halts the run rather than spending one more attempt:
+    // the prior step's checkpoint (the last one written) already reflects
+    // "attempts spent, about to try again", so a resume recomputes this same
+    // check and can hit not_converged immediately (KTD-5) — deliberately, per
+    // its trade-off over laundering a run past its declared bound.
+    for (const activation of frontier) {
+      const bound = graph.attemptBounds?.[activation.nodeId];
+      if (bound === undefined) continue;
+      const nextCount = (attemptCounts.get(activation.nodeId) ?? 0) + 1;
+      if (nextCount > bound) {
+        return { status: "not_converged", state, steps, attempts: attemptsSnapshot() };
+      }
+    }
+    for (const activation of frontier) {
+      const bound = graph.attemptBounds?.[activation.nodeId];
+      if (bound === undefined) continue;
+      attemptCounts.set(activation.nodeId, (attemptCounts.get(activation.nodeId) ?? 0) + 1);
     }
 
     // Checkpoint this step's incoming frontier BEFORE dispatch (ADR-0008):
@@ -372,6 +408,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         frontier,
         barrier: {},
         step: steps - 1,
+        attempts: attemptsSnapshot(),
       });
     }
 
@@ -416,7 +453,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     try {
       state = mergeWrites(state, writes, (key) => reducerForKey.get(key));
     } catch (err) {
-      if (err instanceof StateConflictError) return { status: "failed", state, steps, error: err };
+      if (err instanceof StateConflictError) return { status: "failed", state, steps, error: err, attempts: attemptsSnapshot() };
       throw err;
     }
 
@@ -452,17 +489,18 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
       }
       const error =
         poolResult.firstError instanceof Error ? poolResult.firstError : new Error(String(poolResult.firstError));
-      return { status: "failed", state, steps, error };
+      return { status: "failed", state, steps, error, attempts: attemptsSnapshot() };
     }
 
     const { next, reachedEnd, unmatchedRouterError } = transition(stepFrontier, state, steps);
-    if (unmatchedRouterError) return { status: "failed", state, steps, error: unmatchedRouterError };
-    if (reachedEnd) return { status: "completed", state, steps };
+    if (unmatchedRouterError)
+      return { status: "failed", state, steps, error: unmatchedRouterError, attempts: attemptsSnapshot() };
+    if (reachedEnd) return { status: "completed", state, steps, attempts: attemptsSnapshot() };
 
     if (next.length === 0) {
       const stalled = detectStalledJoin(barriers);
       if (stalled) throw new UnreachableJoinError(stalled.joinId, stalled.missingSources);
-      return { status: "dead_end", state, steps };
+      return { status: "dead_end", state, steps, attempts: attemptsSnapshot() };
     }
 
     frontier = next;
@@ -476,5 +514,5 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
   // silently report dead_end instead of the diagnosable UnreachableJoinError.
   const stalled = detectStalledJoin(barriers);
   if (stalled) throw new UnreachableJoinError(stalled.joinId, stalled.missingSources);
-  return { status: "dead_end", state, steps };
+  return { status: "dead_end", state, steps, attempts: attemptsSnapshot() };
 }
