@@ -48,7 +48,13 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
 - **Interpolation token** — a placeholder in a prompt template addressing a value in the input snapshot
   by dotted path (same `getPath` semantics as `for_each`). Resolves **single-pass** (a substituted value
   is never re-scanned) against **trusted** consumer-authored data. A token addressing an absent path
-  **fails loud** (R5); a present `null`/empty value is serialized, not a failure.
+  **fails loud** (R5); a present `null`/empty value is serialized, not a failure. Escapable as
+  `\{{ path }}` when a prompt needs to emit the literal delimiters as text.
+- **Prompt-token root check** — the `start`-time check that every interpolation token's **root** state key
+  is one the run can actually produce (a `set` update key, an `output_key`, a fan-out `as`, a join `into`,
+  or an `--input` top-level key). Fatal before a run id is minted, so a typo'd root surfaces before any
+  node executes rather than mid-run. Roots only: anything deeper is a runtime fact, since per-branch item
+  shape varies branch to branch. _Not:_ a reachability analysis — a key produced anywhere counts everywhere.
 - **Resolved prompt** — the concrete instruction a branch actually ran with, after its template's tokens
   were substituted. This — not the template — is what the trace records (R6), so per-branch
   differentiation is observable after the fact.

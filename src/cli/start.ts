@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { compile } from "../topology/compile.js";
+import { checkPromptTokens } from "../topology/lint.js";
 import { openDb } from "../store/db.js";
 import { createRun } from "../store/pending-writes.js";
 import { spawnDetachedEngine } from "./spawn-engine.js";
@@ -40,10 +41,27 @@ export async function startCommand(args: string[]): Promise<void> {
     return; // AE5: no run id printed on a malformed topology
   }
 
+  for (const warning of compileResult.warnings) {
+    console.error(`graph-bro: warning: ${warning.message}`);
+  }
+
   let input: unknown = {};
   if (inputArg) {
     const inputPath = resolve(process.cwd(), inputArg);
     input = JSON.parse(readFileSync(inputPath, "utf-8"));
+  }
+
+  // graph-bro#7: a typo'd prompt-token root key would otherwise surface only
+  // when the branch runs. Checked here rather than inside `compile` because a
+  // root key can arrive purely via `--input`, which `compile` never sees.
+  const inputRootKeys =
+    input !== null && typeof input === "object" && !Array.isArray(input) ? Object.keys(input) : [];
+  const tokenErrors = checkPromptTokens(compileResult.compiled, inputRootKeys);
+  if (tokenErrors.length > 0) {
+    console.error(`graph-bro: '${topologyArg}' has unresolvable prompt tokens:`);
+    for (const error of tokenErrors) console.error(`  ${error.message}`);
+    process.exitCode = 1;
+    return; // AE5 parity: no run id printed, nothing spawned
   }
 
   const runId = randomUUID();

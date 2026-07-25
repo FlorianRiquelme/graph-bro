@@ -1,3 +1,5 @@
+import { extractTokenPaths } from "../engine/prompt-template.js";
+import type { CompiledTopology } from "./compile.js";
 import type { Edge, JoinEdge, Topology } from "./schema.js";
 import { isJoinEdge, isPlainEdge } from "./schema.js";
 
@@ -10,6 +12,22 @@ export interface JoinDesyncWarning {
 }
 
 export type LintWarning = JoinDesyncWarning;
+
+/**
+ * A prompt token whose *root* state key is produced by nothing in the run —
+ * a typo, caught before a run id is minted rather than mid-run (graph-bro#7).
+ * Fatal, not advisory: the same fail-loud stance as `UnresolvedPromptTokenError`
+ * (ADR-0006), just moved earlier.
+ */
+export interface UnknownPromptTokenRootError {
+  code: "unknown-prompt-token-root";
+  nodeId: string;
+  /** The full dotted path as written in the prompt. */
+  path: string;
+  /** Its first segment — the only part statically checkable. */
+  root: string;
+  message: string;
+}
 
 /**
  * §14.9 compile-time join-desync lint: warn when a join's declared source is
@@ -42,4 +60,71 @@ export function lintJoinDesync(topology: Topology): JoinDesyncWarning[] {
   }
 
   return warnings;
+}
+
+/**
+ * Every root state key the run can produce: `set` update keys, `agent`
+ * `output_key`s, fan-out `as` bindings, join `into` keys, plus the top-level
+ * keys of the run's `--input` snapshot.
+ *
+ * Root keys only, and deliberately flat: `mergeWrites` assigns each write key
+ * verbatim, so an update key written as `"batch.items"` produces one top-level
+ * key *named* `batch.items` — not a nested `{batch: {items}}`. Read paths, by
+ * contrast, are dotted and traverse nesting. Enumerating roots is therefore
+ * exact, while anything deeper is a runtime fact (graph-bro#7's Why-deferred:
+ * per-branch item shape varies branch to branch).
+ *
+ * Whole-topology, not per-node reachability — a key produced anywhere counts
+ * everywhere. That is the cheap half of the check: it catches typos without
+ * the "what keys exist at node X" analysis the issue rules out as oversized.
+ */
+export function collectStateRootKeys(compiled: CompiledTopology, inputRootKeys: string[]): string[] {
+  const roots = new Set<string>(inputRootKeys);
+
+  for (const node of compiled.nodes) {
+    if (node.kind === "set") {
+      for (const key of Object.keys(node.update)) roots.add(key);
+    } else {
+      roots.add(node.output_key);
+    }
+  }
+  for (const edge of compiled.fanOutEdges) roots.add(edge.as);
+  for (const barrier of compiled.joinBarriers) roots.add(barrier.into);
+
+  return [...roots];
+}
+
+/**
+ * Checks every `agent` prompt's template tokens against the keys the run can
+ * actually produce (graph-bro#7). Escaped tokens are skipped — they are text,
+ * not tokens (graph-bro#8), which is why the escape grammar has to exist for
+ * this check to be safe to make fatal.
+ *
+ * Takes `inputRootKeys` separately rather than reading them off the topology
+ * because a root key can arrive purely via `--input`, which `compile` never
+ * sees; the CLI supplies both at `start`.
+ */
+export function checkPromptTokens(
+  compiled: CompiledTopology,
+  inputRootKeys: string[],
+): UnknownPromptTokenRootError[] {
+  const known = new Set(collectStateRootKeys(compiled, inputRootKeys));
+  const errors: UnknownPromptTokenRootError[] = [];
+
+  for (const node of compiled.nodes) {
+    if (node.kind !== "agent") continue;
+    for (const path of extractTokenPaths(node.prompt)) {
+      const root = path.split(".")[0];
+      if (known.has(root)) continue;
+      errors.push({
+        code: "unknown-prompt-token-root",
+        nodeId: node.id,
+        path,
+        root,
+        message: `agent node '${node.id}': prompt token '{{ ${path} }}' reads state key '${root}', which no node writes and no input supplies`,
+      });
+    }
+  }
+
+  return errors;
 }
