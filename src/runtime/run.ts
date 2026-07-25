@@ -99,7 +99,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Re
         ? makeAgentNodeFn(executor, {
             nodeId: node.id,
             model: node.model,
-            readOnly: node.read_only,
+            capability: node.read_only ? "read_only" : "write",
             cwd: process.cwd(),
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,

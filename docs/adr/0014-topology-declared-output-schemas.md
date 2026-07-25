@@ -22,7 +22,7 @@ The generic version also composes better, which makes the boundary argument chea
 - The existing prompt-template primitive then carries R4 for free: a fix node's prompt reads `{{ verdict.findings }}` and the findings reach the fixer without a dedicated mechanism, exactly as the requirements assumed.
 - Any node gains structured output, not only review nodes. That is worth more than a verdict type.
 
-It also lands the zod-everywhere convention where the convention actually intends it — on the JSON-schema contracts for agents, not only at HTTP request-body edges. A node's schema is authored as zod and emitted via `z.toJSONSchema()`.
+It also lands the zod-everywhere convention where the convention actually intends it — on the JSON-schema contracts for agents, not only at HTTP request-body edges. ~~A node's schema is authored as zod and emitted via `z.toJSONSchema()`.~~ **Superseded by KTD-8 (Engine Slice 2 planning):** a topology is a JSON file, so zod cannot be authored inside one. A node's `output_schema` is authored as JSON Schema directly, which is the contract the backend (`--json-schema`) consumes; zod continues to validate the topology document itself, including that a declared `output_schema` is a well-formed schema (U2). Validation against it at runtime uses `ajv`, a mature JSON Schema validator, per the standing preference for the broad ecosystem over a hand-rolled subset.
 
 ## Consequences
 

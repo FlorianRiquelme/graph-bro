@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { END, START } from "../../src/topology/schema.js";
-import { runLoop, MaxStepsExceededError, type EngineGraph, type NodeFn } from "../../src/engine/loop.js";
+import { runLoop, makeAgentNodeFn, MaxStepsExceededError, type EngineGraph, type NodeFn } from "../../src/engine/loop.js";
 import { UnreachableJoinError } from "../../src/engine/watchdog.js";
+import { MissingStructuredOutputError, OutputSchemaViolationError } from "../../src/engine/output-schema.js";
+import { StubExecutor } from "../fixtures/stub-executor.js";
 
 function emptyGraph(overrides: Partial<EngineGraph>): EngineGraph {
   return {
@@ -229,4 +231,117 @@ describe("runLoop", () => {
       ).rejects.toThrow(UnreachableJoinError);
     },
   );
+});
+
+describe("engine/loop: makeAgentNodeFn — declared output schema (U1, R2/AE2)", () => {
+  const SCHEMA = {
+    type: "object",
+    properties: { verdict: { type: "string", enum: ["pass", "fail"] } },
+    required: ["verdict"],
+  };
+
+  function graphThroughReviewer(): EngineGraph {
+    return {
+      plainEdges: [
+        { from: START, to: "reviewer" },
+        { from: "reviewer", to: END },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 10,
+    };
+  }
+
+  it("Covers AE2: a conforming structured response lands as the parsed object (not a string) at output_key", async () => {
+    const stub = new StubExecutor(() => ({
+      text: '{"verdict":"pass"}',
+      isError: false,
+      structuredOutput: { verdict: "pass" },
+    }));
+    const nodeFns: Record<string, NodeFn> = {
+      reviewer: makeAgentNodeFn(stub, {
+        nodeId: "reviewer",
+        model: "stub-model",
+        capability: "read_only",
+        cwd: ".",
+        timeout: 1_000,
+        outputKey: "review",
+        outputSchema: SCHEMA,
+        prompt: "review it",
+      }),
+    };
+
+    const result = await runLoop({ graph: graphThroughReviewer(), nodeFns });
+
+    expect(result.status).toBe("completed");
+    expect(result.state.review).toEqual({ verdict: "pass" });
+    expect(typeof result.state.review).not.toBe("string");
+  });
+
+  it("Covers AE2: a non-conforming structured response fails the run, naming the node and the violation", async () => {
+    const stub = new StubExecutor(() => ({
+      text: '{"verdict":"maybe"}',
+      isError: false,
+      structuredOutput: { verdict: "maybe" },
+    }));
+    const nodeFns: Record<string, NodeFn> = {
+      reviewer: makeAgentNodeFn(stub, {
+        nodeId: "reviewer",
+        model: "stub-model",
+        capability: "read_only",
+        cwd: ".",
+        timeout: 1_000,
+        outputKey: "review",
+        outputSchema: SCHEMA,
+        prompt: "review it",
+      }),
+    };
+
+    const result = await runLoop({ graph: graphThroughReviewer(), nodeFns });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(OutputSchemaViolationError);
+    expect(result.error?.message).toContain("reviewer");
+  });
+
+  it("an envelope missing structured_output while a schema was declared fails the run, not an empty success", async () => {
+    const stub = new StubExecutor(() => ({ text: "", isError: false })); // no structuredOutput field at all
+    const nodeFns: Record<string, NodeFn> = {
+      reviewer: makeAgentNodeFn(stub, {
+        nodeId: "reviewer",
+        model: "stub-model",
+        capability: "read_only",
+        cwd: ".",
+        timeout: 1_000,
+        outputKey: "review",
+        outputSchema: SCHEMA,
+        prompt: "review it",
+      }),
+    };
+
+    const result = await runLoop({ graph: graphThroughReviewer(), nodeFns });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(MissingStructuredOutputError);
+  });
+
+  it("with no schema declared, the text result lands at output_key unchanged (slice-1 behavior)", async () => {
+    const stub = new StubExecutor(() => ({ text: "plain text result", isError: false }));
+    const nodeFns: Record<string, NodeFn> = {
+      reviewer: makeAgentNodeFn(stub, {
+        nodeId: "reviewer",
+        model: "stub-model",
+        capability: "read_only",
+        cwd: ".",
+        timeout: 1_000,
+        outputKey: "review",
+        prompt: "review it",
+      }),
+    };
+
+    const result = await runLoop({ graph: graphThroughReviewer(), nodeFns });
+
+    expect(result.status).toBe("completed");
+    expect(result.state.review).toBe("plain text result");
+  });
 });

@@ -13,16 +13,21 @@ export interface TokenUsage {
   cacheReadTokens?: number;
 }
 
+/** KTD-12: named capability discriminant, replacing the old `readOnly` boolean now that write nodes get their own enforcement (U6) rather than just the absence of one. */
+export type NodeCapability = "read_only" | "write";
+
 export interface RunOptions {
   cwd: string;
   /** The topology node id this run belongs to — attributes the KTD-10 read-only backstop's failure. */
   nodeId: string;
-  readOnly: boolean;
+  capability: NodeCapability;
   model: string;
   /** Hard wall-clock timeout in ms; also the heartbeat hard-kill threshold. */
   timeout: number;
   /** Streaming callback: every parsed NDJSON event, plus synthetic `heartbeat` events. */
   onEvent?: (event: unknown) => void;
+  /** KTD-8: a JSON Schema an agent node declares for its response, forwarded to the backend as a structured-output contract. */
+  outputSchema?: Record<string, unknown>;
 }
 
 export interface RunResult {
@@ -31,6 +36,8 @@ export interface RunResult {
   cost?: number;
   tokens?: TokenUsage;
   durationMs?: number;
+  /** KTD-2: the parsed structured value — present only when the node declared an `outputSchema` and the backend returned one. */
+  structuredOutput?: unknown;
 }
 
 export interface Executor {

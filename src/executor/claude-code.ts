@@ -71,7 +71,11 @@ export class ClaudeCodeExecutor implements Executor {
       "stream-json",
       "--model",
       options.model,
-      ...(options.readOnly ? buildReadOnlyArgs() : []),
+      ...(options.capability === "read_only" ? buildReadOnlyArgs() : []),
+      // KTD-8: forwards the topology-declared output schema as the backend's
+      // structured-output contract; the response's parsed value comes back
+      // on the envelope's `structured_output` field (see envelope.ts).
+      ...(options.outputSchema ? ["--json-schema", JSON.stringify(options.outputSchema)] : []),
       "-p",
       PROMPT_TOKEN,
     ];
@@ -149,7 +153,7 @@ export class ClaudeCodeExecutor implements Executor {
     // KTD-10 backstop: per read-only node completion (not once after a whole fan-out
     // drains), so a permission-policy gap is attributed to the offending node. Folded
     // into the shared `run()` path rather than left for callers to remember.
-    if (options.readOnly) assertRepoClean(options.cwd, options.nodeId);
+    if (options.capability === "read_only") assertRepoClean(options.cwd, options.nodeId);
 
     if (terminalEnvelope) {
       return {
@@ -158,6 +162,7 @@ export class ClaudeCodeExecutor implements Executor {
         cost: terminalEnvelope.total_cost_usd,
         tokens: extractTokens(terminalEnvelope),
         durationMs: terminalEnvelope.duration_ms,
+        structuredOutput: terminalEnvelope.structured_output,
       };
     }
     // Process exited with no terminal event before EOF — a real hang (hard-killed) or an

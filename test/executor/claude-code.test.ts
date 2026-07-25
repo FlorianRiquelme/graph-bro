@@ -56,7 +56,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: (event) => {
@@ -83,7 +83,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("do something forbidden", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
     });
@@ -101,7 +101,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: () => {
@@ -122,7 +122,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000, // hard threshold far above the 250ms silence — must not fire
       onEvent: (event) => events.push(event),
@@ -149,7 +149,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 100, // hard threshold — must fire well before the 5s silence ends
       onEvent: (event) => events.push(event),
@@ -170,7 +170,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     await executor.run("attempt an edit", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: (event) => {
@@ -198,8 +198,55 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
 
     await expect(
-      executor.run("ping", { cwd, nodeId: "reader-node", readOnly: true, model: "claude-haiku-4-5", timeout: 5000 }),
+      executor.run("ping", { cwd, nodeId: "reader-node", capability: "read_only", model: "claude-haiku-4-5", timeout: 5000 }),
     ).rejects.toThrowError(/reader-node/);
+  });
+
+  it("Covers AE2/KTD-2: forwards --json-schema on the invocation and surfaces the parsed structured_output, nested object intact", async () => {
+    process.env.FAKE_CLAUDE_MODE = "structured";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+    let initEvent: { argv: string[] } | undefined;
+    const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+
+    const result = await executor.run("review this", {
+      cwd,
+      nodeId: "reviewer",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+      outputSchema: schema,
+      onEvent: (event) => {
+        const typed = event as { type?: string; argv?: string[] };
+        if (typed.type === "system") initEvent = event as { argv: string[] };
+      },
+    });
+
+    expect(initEvent?.argv).toContain("--json-schema");
+    const schemaArg = initEvent!.argv[initEvent!.argv.indexOf("--json-schema") + 1];
+    expect(JSON.parse(schemaArg)).toEqual(schema);
+
+    expect(result.isError).toBe(false);
+    expect(typeof result.text).toBe("string"); // the text contract is untouched (KTD-2)
+    expect(result.structuredOutput).toEqual({ verdict: "pass", findings: [{ note: "looks good", nested: { depth: 2 } }] });
+    expect(result.cost).toBe(0.002);
+    expect(result.tokens?.inputTokens).toBe(12);
+    expect(result.durationMs).toBe(30);
+  });
+
+  it("leaves structuredOutput undefined when no schema is declared (unchanged slice-1 behavior)", async () => {
+    process.env.FAKE_CLAUDE_MODE = "success";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+
+    const result = await executor.run("ping", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+    });
+
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.text).toBe("pong");
   });
 
   it("Covers cost capture: envelope tokens/total_cost_usd/duration_ms land in the events row via appendEvent", async () => {
@@ -209,7 +256,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
     });

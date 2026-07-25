@@ -10,7 +10,8 @@ import { DEFAULT_MAX_CONCURRENCY, runBoundedPool, type PoolTask } from "./concur
 import { commitPendingWrite } from "../store/pending-writes.js";
 import { writeCheckpoint } from "../store/checkpoints.js";
 import { appendEvent } from "../store/trace.js";
-import type { Executor } from "../executor/executor.js";
+import type { Executor, NodeCapability } from "../executor/executor.js";
+import { MissingStructuredOutputError, validateOutput, type JsonSchema } from "./output-schema.js";
 
 /** A plain function node (R4) — no executor/subprocess concept in this unit. */
 export type NodeFn = (state: EngineState) => EngineUpdate | Promise<EngineUpdate>;
@@ -104,11 +105,13 @@ export interface RunLoopOptions {
 export interface AgentNodeConfig {
   nodeId: string;
   model: string;
-  readOnly: boolean;
+  capability: NodeCapability;
   cwd: string;
   timeout: number;
   outputKey: string;
   prompt: string | ((state: EngineState) => string);
+  /** KTD-8: when declared, the response is validated against it and the *parsed* value — not raw text — lands at `outputKey` (R2). */
+  outputSchema?: JsonSchema;
 }
 
 export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): NodeFn {
@@ -117,14 +120,25 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
     const result = await executor.run(prompt, {
       cwd: config.cwd,
       nodeId: config.nodeId,
-      readOnly: config.readOnly,
+      capability: config.capability,
       model: config.model,
       timeout: config.timeout,
+      outputSchema: config.outputSchema,
     });
     if (result.isError) {
       throw new Error(`agent node '${config.nodeId}' failed: ${result.text}`);
     }
-    const update: EngineUpdate = { [config.outputKey]: result.text };
+    // KTD-8: validation lives here, next to the output_key write, not behind
+    // the executor seam — a future backend must not be able to skip it.
+    let value: unknown = result.text;
+    if (config.outputSchema) {
+      if (result.structuredOutput === undefined) {
+        throw new MissingStructuredOutputError(config.nodeId);
+      }
+      validateOutput(config.nodeId, config.outputSchema, result.structuredOutput);
+      value = result.structuredOutput;
+    }
+    const update: EngineUpdate = { [config.outputKey]: value };
     // Attach the executor's cost/token report out-of-band (ADR-0009) so the
     // trace writer records it, without leaking into state or pending writes.
     const meta: NodeTraceMeta = {

@@ -51,6 +51,26 @@ async function main() {
       process.exit(1);
       break;
     }
+    case "structured": {
+      // KTD-2 shape: `result` stays a JSON string; `structured_output` carries
+      // the parsed object alongside it. Nested, to prove it crosses the seam intact.
+      emit({ type: "system", subtype: "init", argv: process.argv.slice(2) });
+      await sleep(15);
+      const parsed = { verdict: "pass", findings: [{ note: "looks good", nested: { depth: 2 } }] };
+      emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify(parsed),
+        structured_output: parsed,
+        num_turns: 1,
+        duration_ms: 30,
+        total_cost_usd: 0.002,
+        usage: { input_tokens: 12, output_tokens: 6 },
+      });
+      process.exit(0);
+      break;
+    }
     case "slow": {
       // Silent for FAKE_CLAUDE_SILENT_MS then completes — for the "soft heartbeat, not hard-killed" scenario.
       const silentMs = Number(process.env.FAKE_CLAUDE_SILENT_MS ?? "300");

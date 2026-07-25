@@ -42,6 +42,17 @@ export const ResultEnvelopeSchema = z
     modelUsage: z.record(z.string(), z.unknown()).optional(),
     permission_denials: z.array(PermissionDenialSchema).optional(),
     api_error_status: z.union([z.string(), z.null()]).optional(),
+    /**
+     * KTD-2: structured-output field, live-verified against `claude` v2.1.220
+     * with `--json-schema` set (2026-07-25 probe). `result` stays the
+     * JSON-stringified text above — it is NOT replaced — and the parsed
+     * object arrives here, alongside it, on the same terminal envelope.
+     * `parseEnvelope` never throws in structured-output mode; the
+     * feared silent-failure path does not exist. Absent when no schema was
+     * declared, or when structured output failed to materialize (the
+     * documented-but-unobserved retry-exhaustion path).
+     */
+    structured_output: z.unknown().optional(),
   })
   .passthrough();
 export type ResultEnvelope = z.infer<typeof ResultEnvelopeSchema>;
