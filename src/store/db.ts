@@ -24,19 +24,44 @@ function migrationsDir(): string {
   return join(dirname(fileURLToPath(import.meta.url)), "migrations");
 }
 
+export interface RunMigrationsOptions {
+  /**
+   * Test seam only (never set by `openDb`): overrides where migration `.sql`
+   * files are read from and/or which ids are applied, so the half-apply
+   * failure mode (R17) can be forced with a real broken migration file
+   * instead of mocking `db.exec`.
+   */
+  migrationsDir?: string;
+  migrationIds?: string[];
+}
+
 /**
  * Idempotent migration runner (§8.8 minimal migration runner pattern): a
  * `schema_migrations` ledger tracks applied migration ids so re-running
  * `openDb`/`runMigrations` against an already-migrated file is a no-op.
+ *
+ * KTD-14: `db.exec()` is not transactional across the multiple statements a
+ * migration file can hold — e.g. the workspace migration's three `ALTER
+ * TABLE` statements. A mid-file failure (transient lock, disk error) would
+ * otherwise leave the first statement committed while the ledger insert
+ * never runs, so the next `openDb()` retries the same file from scratch and
+ * throws `duplicate column name` on every future invocation. Wrapping each
+ * migration's DDL and its ledger insert in one `db.transaction()` makes a
+ * retry safe: either both land, or neither does.
  */
-export function runMigrations(db: Database.Database): void {
+export function runMigrations(db: Database.Database, options: RunMigrationsOptions = {}): void {
+  const dir = options.migrationsDir ?? migrationsDir();
+  const ids = options.migrationIds ?? MIGRATION_IDS;
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY)`);
-  for (const id of MIGRATION_IDS) {
+  for (const id of ids) {
     const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE id = ?").get(id);
     if (applied) continue;
-    const sql = readFileSync(join(migrationsDir(), `${id}.sql`), "utf-8");
-    db.exec(sql);
-    db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(id);
+    const sql = readFileSync(join(dir, `${id}.sql`), "utf-8");
+    const applyMigration = db.transaction(() => {
+      db.exec(sql);
+      db.prepare("INSERT INTO schema_migrations (id) VALUES (?)").run(id);
+    });
+    applyMigration();
   }
 }
 

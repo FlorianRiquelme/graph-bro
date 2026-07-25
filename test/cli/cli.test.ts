@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
-import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
+import { commitPendingWrite, createRun, getRunOwnerPid } from "../../src/store/pending-writes.js";
 import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
@@ -221,6 +221,66 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/no such run/);
+  });
+
+  it(
+    "Covers R18 (KTD-14): resume refuses a pre-workspace-migration run row (null workspace columns) without claiming ownership, and a later resume of the repaired row still works",
+    () => {
+      const runId = "pre-upgrade-run";
+      const topologyPath = writeTopology(cwdA, singleNodeTopology());
+      const env = baseEnv("success");
+      const deadPid = 999_999;
+
+      const db = openDb({ baseDir: home });
+      // No workspace fields: mirrors a run row written before the workspace
+      // migration ever ran (or one migrated with a still-null legacy row).
+      createRun(db, runId, deadPid, topologyPath);
+      db.close();
+
+      const refusal = runCliSync(["resume", runId], { cwd: cwdA, env });
+      expect(refusal.status).not.toBe(0);
+      expect(refusal.stderr).toMatch(/no recorded workspace/);
+
+      // The refusal happened before the ownership CAS: the dead owner pid is
+      // untouched, not left claimed by this (now-exited) resume invocation.
+      const dbCheck = openDb({ baseDir: home });
+      expect(getRunOwnerPid(dbCheck, runId)).toBe(deadPid);
+      dbCheck.close();
+
+      // Once the row is repaired (as a real migration/backfill would do),
+      // resume works normally.
+      const dbRepair = openDb({ baseDir: home });
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
+      createRun(dbRepair, runId, deadPid, topologyPath, workspace);
+      dbRepair.close();
+
+      const heal = runCliSync(["resume", runId], { cwd: cwdA, env });
+      expect(heal.status).toBe(0);
+      expect(heal.stdout.trim()).toBe(runId);
+    },
+    10_000,
+  );
+
+  it("Covers R18: the missing-workspace error is distinguishable from the missing-topology-path error", () => {
+    const noTopologyRunId = "no-topology-run";
+    const noWorkspaceRunId = "no-workspace-run";
+    const topologyPath = writeTopology(cwdA, singleNodeTopology());
+    const env = baseEnv("success");
+
+    const db = openDb({ baseDir: home });
+    createRun(db, noTopologyRunId, 999_999); // no topology path, no workspace
+    createRun(db, noWorkspaceRunId, 999_999, topologyPath); // topology path present, workspace absent
+    db.close();
+
+    const noTopology = runCliSync(["resume", noTopologyRunId], { cwd: cwdA, env });
+    expect(noTopology.status).not.toBe(0);
+    expect(noTopology.stderr).toMatch(/no recorded topology path/);
+    expect(noTopology.stderr).not.toMatch(/no recorded workspace/);
+
+    const noWorkspace = runCliSync(["resume", noWorkspaceRunId], { cwd: cwdA, env });
+    expect(noWorkspace.status).not.toBe(0);
+    expect(noWorkspace.stderr).toMatch(/no recorded workspace/);
+    expect(noWorkspace.stderr).not.toMatch(/no recorded topology path/);
   });
 
   it("Covers AE5: start returns promptly with a run id while the engine continues detached", async () => {

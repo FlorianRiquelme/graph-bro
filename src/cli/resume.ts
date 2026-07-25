@@ -43,6 +43,21 @@ export async function resumeCommand(args: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // R18/KTD-14: a run row from before the workspace migration (003_workspace)
+  // has null base_ref/workspace_path/run_branch. Passing those through as
+  // empty strings would spawn a detached engine that the CLI never observes
+  // fail — the usage error lands on stdio the engine is started with
+  // `ignore`d — so ownership would be claimed against a process that's
+  // already dead, silently repeating on every later resume. Fail loudly here,
+  // before the CAS below claims ownership.
+  if (!run.baseRef || !run.workspacePath || !run.runBranch) {
+    db.close();
+    console.error(
+      `graph-bro: run '${runId}' has no recorded workspace (base ref/workspace path/run branch); predates the workspace migration and cannot resume`,
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   if (!claimOwnership(db, runId, run.ownerPid, process.pid)) {
     db.close();
