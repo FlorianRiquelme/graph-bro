@@ -1,3 +1,6 @@
+// Named import, not default: see src/engine/output-schema.ts for why ajv's
+// default import breaks under this project's NodeNext module resolution.
+import { Ajv } from "ajv";
 import {
   END,
   START,
@@ -14,6 +17,8 @@ import {
   type TopologyNode,
 } from "./schema.js";
 import { lintJoinDesync, type LintWarning } from "./lint.js";
+
+const ajv = new Ajv({ allErrors: true, strict: false });
 
 export interface CompileError {
   message: string;
@@ -34,6 +39,8 @@ export interface CompiledTopology {
   maxSteps: number;
   /** Per-topology override of the bounded fan-out pool's width (ADR-0011), threaded into `EngineGraph.maxConcurrency`. */
   maxConcurrency?: number;
+  /** R14: the declared base ref, carried through for `start` to resolve; undefined means "current branch's tip". */
+  baseRef?: string;
   nodes: TopologyNode[];
   plainEdges: PlainEdge[];
   fanOutEdges: FanOutEdge[];
@@ -65,12 +72,21 @@ export function compile(input: unknown): CompileResult {
   const errors: CompileError[] = [];
 
   const nodeIds = new Set<string>();
-  for (const node of topology.nodes) {
+  topology.nodes.forEach((node, nodeIndex) => {
     if (nodeIds.has(node.id)) {
       errors.push({ message: `duplicate node id '${node.id}'`, path: "nodes" });
     }
     nodeIds.add(node.id);
-  }
+
+    if (node.kind === "agent" && node.output_schema !== undefined) {
+      if (!ajv.validateSchema(node.output_schema)) {
+        errors.push({
+          message: `agent node '${node.id}' declares an output_schema that is not a well-formed JSON Schema: ${ajv.errorsText(ajv.errors)}`,
+          path: `nodes[${nodeIndex}].output_schema`,
+        });
+      }
+    }
+  });
   const knownIds = new Set([...nodeIds, START, END]);
 
   const checkRef = (id: string, path: string) => {
@@ -103,6 +119,26 @@ export function compile(input: unknown): CompileResult {
     }
   });
 
+  // Single-track scope boundary (slice 2b defers fan-out write lanes): a
+  // write-capable node running N-wide concurrent instances in one shared
+  // workspace is exactly the silent-loss failure mode this milestone cites
+  // as its reason to isolate at all. Only a fan-out edge's *direct* target
+  // ever runs N-wide — `transition()` collapses any further downstream node
+  // back to one instance per step via `pushUnique`'s instanceId dedup — so
+  // checking direct targets is the complete check, not an approximation.
+  const writeCapableIds = new Set(
+    topology.nodes.filter((node) => node.kind === "agent" && node.read_only === false).map((node) => node.id),
+  );
+  topology.edges.forEach((edge: Edge, index: number) => {
+    if (!isFanOutEdge(edge)) return;
+    if (writeCapableIds.has(edge.to)) {
+      errors.push({
+        message: `write-capable node '${edge.to}' cannot be reached from a fan-out edge — fan-out write lanes are deferred to slice 2b`,
+        path: `edges[${index}].to`,
+      });
+    }
+  });
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -122,6 +158,7 @@ export function compile(input: unknown): CompileResult {
   const compiled: CompiledTopology = {
     maxSteps: topology.max_steps,
     maxConcurrency: topology.max_concurrency,
+    baseRef: topology.base_ref,
     nodes: topology.nodes,
     plainEdges,
     fanOutEdges,

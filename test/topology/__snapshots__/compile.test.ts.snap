@@ -2,6 +2,7 @@
 
 exports[`compile: happy path > golden-file snapshot of compiled output (nodes, edges, join barriers, reducer assignments) 1`] = `
 {
+  "baseRef": undefined,
   "fanOutEdges": [
     {
       "as": "item",
