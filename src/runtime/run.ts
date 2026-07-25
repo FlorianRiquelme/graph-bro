@@ -386,7 +386,16 @@ async function main(): Promise<void> {
   // U9: seeded from the same continued counts on resume, so the trace's
   // attempt attribution picks up where a crashed run's left off rather than
   // restarting at 0 and re-using attempt numbers a prior process already spent.
-  const attemptState: AttemptState = { current: Math.max(0, ...Object.values(resumed?.attempts ?? {})) };
+  // U12/R20: a topology with any bounded node floors that seed at 1 rather
+  // than 0 — otherwise a fresh start's write node(s) run before the bounded
+  // node's own hook (`withAttemptCommit`) ever advances the shared counter,
+  // get stamped at attempt 0, and `aggregateAttempts` silently discards
+  // that bucket, dropping the invocation's cost from the report entirely.
+  // A topology with no bound leaves the floor at 0, so the all-zero,
+  // no-attempts-array slice-1 shape is unaffected.
+  const attemptState: AttemptState = {
+    current: Math.max(Object.keys(attemptBounds).length > 0 ? 1 : 0, ...Object.values(resumed?.attempts ?? {})),
+  };
 
   const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
   const nodeFns: Record<string, NodeFn> = {};
@@ -426,7 +435,12 @@ async function main(): Promise<void> {
   // against, so an unedited topology that cleared `start` cannot fail here.
   const tokenErrors = checkPromptTokens(compiled, Object.keys(runLoopOptions.initialState ?? {}));
   if (tokenErrors.length > 0) {
-    appendEvent(db, { runId, payload: { type: "run_error", error: tokenErrors.map((error) => error.message).join("; ") } });
+    // The disposal below is named in the error itself, not left implicit: an
+    // operator's natural next move after fixing the topology is `resume`, and
+    // that will fail a second time for a reason this message is the only place
+    // to explain. The attempt commits are still on the run branch either way.
+    const tokenError = `${tokenErrors.map((error) => error.message).join("; ")} — workspace discarded; fix the topology and start a new run (this run cannot be resumed; its attempt commits remain on ${runBranch})`;
+    appendEvent(db, { runId, payload: { type: "run_error", error: tokenError } });
     updateRunStatus(db, runId, "failed");
     process.exitCode = 1;
     // R12: the workspace was already created (or reattached-to, on resume)

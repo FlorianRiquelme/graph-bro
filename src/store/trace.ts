@@ -127,6 +127,18 @@ export interface AttemptSummary {
  * `0` — returned as an empty array (not a single "attempt 0" bucket), so a
  * slice-1-shaped read-only run's `graph-bro result` output is unchanged
  * (U9's "no attempt aggregation" case, not a spurious one-attempt summary).
+ *
+ * U12/R20 residual skew: the runtime's shared counter (`src/runtime/run.ts`)
+ * is seeded to 1 rather than 0 whenever the topology declares a bound, so no
+ * invocation's cost is ever discarded here — but the counter only advances
+ * when the bounded node is *invoked*, not when its next activation is
+ * scheduled. A write node that runs after the bounded node closes an attempt
+ * (but before the bounded node's own next run) is still attributed to the
+ * attempt that just closed, one step later than the work it did. Exact
+ * alignment would mean advancing the counter at scheduling time instead —
+ * a larger change than the dropped bucket warranted; every invocation's
+ * cost is accounted for, just not always in the attempt a human would draw
+ * the boundary at.
  */
 export function aggregateAttempts(events: EventRow[]): AttemptSummary[] {
   const byAttempt = new Map<number, AttemptSummary>();

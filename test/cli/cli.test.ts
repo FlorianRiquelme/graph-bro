@@ -560,6 +560,18 @@ describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)
     };
   }
 
+  /** Every `node_complete` event's cost, straight off the trace — independent of `aggregateAttempts`'s own grouping, so it's a fair thing to compare the per-attempt sum against (U12/R20). */
+  function totalNodeCompleteCost(runId: string, env: NodeJS.ProcessEnv): number {
+    const events = runCliSync(["tail", runId], { cwd, env })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    return events
+      .filter((e) => e.payload?.type === "node_complete")
+      .reduce((sum: number, e: { costUsd?: number }) => sum + (e.costUsd ?? 0), 0);
+  }
+
   it("Covers R26: a four-attempt run's result shows exactly four per-attempt attributions, each with tokens and USD", async () => {
     const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
     const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(4) });
@@ -576,7 +588,80 @@ describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)
       expect(attempt.outputTokens).toBeGreaterThan(0);
       expect(attempt.costUsd).toBeGreaterThan(0);
     }
+    // U12/R20: the assertion that would have caught the dropped-attempt-zero
+    // bucket — every node_complete's cost must land in some attempt, so the
+    // per-attempt sum must equal the run's real total.
+    const attemptedCost = result.attempts.reduce((sum: number, a: { costUsd: number }) => sum + a.costUsd, 0);
+    expect(attemptedCost).toBeCloseTo(totalNodeCompleteCost(runId, fixReviewEnv(4)), 5);
   }, 20_000);
+
+  it("Covers R20: a three-attempt loop's per-attempt costs sum to the run's total node-completion cost, with no invocation unattributed", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(3) });
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env: fixReviewEnv(3) }).stdout);
+    expect(result.status).toBe("completed");
+
+    const attemptedCost = result.attempts.reduce((sum: number, a: { costUsd: number }) => sum + a.costUsd, 0);
+    expect(attemptedCost).toBeCloseTo(totalNodeCompleteCost(runId, fixReviewEnv(3)), 5);
+
+    // The dropped bucket was always the write node's *first* invocation,
+    // stamped attempt 0 before the bounded node's own hook ever advanced the
+    // shared counter. It must land in attempt one instead.
+    const events = runCliSync(["tail", runId], { cwd, env: fixReviewEnv(3) })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const writerFirstComplete = events.find((e) => e.node === "writer" && e.payload?.type === "node_complete");
+    expect(writerFirstComplete.step).toBe(1);
+  }, 20_000);
+
+  it(
+    "Covers R20: a resumed run's attempt attribution continues from the recorded counts rather than restarting",
+    async () => {
+      const runId = "resume-attempt-attribution-run";
+      const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+      const env = fixReviewEnv(1); // the resumed review call is its counter's first real call — pass immediately
+
+      // Simulate a crash after 2 attempts already completed (review's own
+      // hook committed attempt 2), with the frontier back at the write node
+      // for what would be attempt 3.
+      const workspace = seedWorkspaceForRun(cwd, runId, join(home, "workspaces"));
+      const db = openDb({ baseDir: home });
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
+      writeCheckpoint(db, runId, {
+        state: {},
+        frontier: [{ nodeId: "writer", instanceId: "writer" }],
+        barrier: {},
+        step: 2,
+        attempts: { review: 2 },
+      });
+      db.close();
+
+      const resume = runCliSync(["resume", runId], { cwd, env });
+      expect(resume.status).toBe(0);
+
+      await waitForRunStatus(home, runId, "completed", 10_000);
+
+      const events = runCliSync(["tail", runId], { cwd, env })
+        .stdout.trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+      // Continuing from the recorded count of 2, not restarting at 0 or 1:
+      // the resumed writer picks up the seeded counter (attempt 2), and
+      // review's own hook then advances it to 3.
+      const writerComplete = events.find((e) => e.node === "writer" && e.payload?.type === "node_complete");
+      const reviewComplete = events.find((e) => e.node === "review" && e.payload?.type === "node_complete");
+      expect(writerComplete.step).toBe(2);
+      expect(reviewComplete.step).toBe(3);
+    },
+    15_000,
+  );
 
   it("Covers R25: the three stop reasons are distinguishable in result's output — converged, bound hit, and failed", async () => {
     const convergedCwd = gitRepo();
