@@ -5,8 +5,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb } from "../../src/store/db.js";
 import { getRun } from "../../src/store/pending-writes.js";
-import { listEvents } from "../../src/store/trace.js";
+import { appendEvent, listEvents } from "../../src/store/trace.js";
 import { createWorkspace, resolveBaseRef, runBranchForRun, workspacePathForRun } from "../../src/workspace/lifecycle.js";
+import { captureWorkspaceIntegrityManifest, WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE } from "../../src/workspace/integrity.js";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const CLI_ENTRY = join(REPO_ROOT, "dist", "cli", "index.js");
@@ -119,6 +120,17 @@ export function waitForRunStatus(home: string, runId: string, status: string, ti
  * run now executes inside one (R13). Creates it via the same lifecycle
  * `createWorkspace` production code uses, so the test's premise matches
  * what `start` actually produces.
+ *
+ * U4/R8/KTD-8: also records the workspace-integrity manifest as a trace
+ * event, exactly as `main()`'s own `start` path does immediately after
+ * `createWorkspace` — without this, every hand-seeded run here would look
+ * to `resume` like a workspace whose manifest never got recorded (a real
+ * crash between `createWorkspace` and that append, not "a workspace created
+ * by some means other than `start`"), and `resume`'s own integrity check
+ * would refuse to proceed on every one of these tests. `workspacesRoot`'s
+ * parent is `GRAPH_BRO_HOME` (`join(home, "workspaces")` is what every
+ * caller passes), so this opens the same store the caller's own `openDb`
+ * calls will, briefly, just to append the one event.
  */
 export function seedWorkspaceForRun(
   consumerRepoPath: string,
@@ -129,6 +141,15 @@ export function seedWorkspaceForRun(
   const workspacePath = workspacePathForRun(runId, workspacesRoot);
   const runBranch = runBranchForRun(runId);
   createWorkspace({ consumerRepoPath, baseRefSha: baseRef, workspacePath, runBranch });
+
+  const db = openDb({ baseDir: dirname(workspacesRoot) });
+  try {
+    const manifest = captureWorkspaceIntegrityManifest(workspacePath);
+    appendEvent(db, { runId, payload: { type: WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE, manifest } });
+  } finally {
+    db.close();
+  }
+
   return { baseRef, workspacePath, runBranch };
 }
 

@@ -19,13 +19,20 @@ import type { EngineState, EngineUpdate } from "../engine/state.js";
 import { openDb } from "../store/db.js";
 import { resume as resumeRun, updateRunStatus } from "../store/pending-writes.js";
 import { writeCheckpoint } from "../store/checkpoints.js";
-import { appendEvent } from "../store/trace.js";
+import { appendEvent, listEvents } from "../store/trace.js";
 import { ClaudeCodeExecutor } from "../executor/claude-code.js";
 import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 import { createWorkspace, finalizeWorkspace, reattachToRunBranch, reuseWorkspace } from "../workspace/lifecycle.js";
 import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
 import { commitAttempt, committedAttemptCounts, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
+import {
+  assertWorkspaceIntegrity,
+  captureWorkspaceIntegrityManifest,
+  findRecordedManifest,
+  WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE,
+  type WorkspaceIntegrityManifest,
+} from "../workspace/integrity.js";
 import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
@@ -142,6 +149,14 @@ interface WorkspaceHeadState {
  * always agree without the runtime reading the loop's internal state —
  * KTD-10 forbids `src/engine` from importing the workspace module, so this
  * lives entirely on the runtime side of that seam.
+ *
+ * R8/KTD-8: `assertWorkspaceIntegrity` runs first, before `commitAttempt` —
+ * naming `nodeId` (the node about to be invoked, the same node whose
+ * previous activation is the only thing that could have tampered since the
+ * last check) on divergence. Checking before the fold is load-bearing: this
+ * is the one seam that would otherwise commit a planted `.claude` file (or a
+ * rewritten gitlink) into real run history before anything ever inspected it
+ * — after which the failure would name a commit, not a node.
  */
 function withAttemptCommit(
   consumerRepoPath: string,
@@ -152,9 +167,11 @@ function withAttemptCommit(
   attemptState: AttemptState,
   db: ReturnType<typeof openDb>,
   runId: string,
+  integrityManifest: WorkspaceIntegrityManifest,
   fn: NodeFn,
 ): NodeFn {
   return async (state) => {
+    assertWorkspaceIntegrity(workspacePath, integrityManifest, nodeId);
     const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
     attemptCounts.set(nodeId, attemptNumber);
     attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
@@ -307,9 +324,19 @@ async function main(): Promise<void> {
   // worktree — never the consumer's own checkout, which `process.cwd()`
   // would otherwise be (the engine inherits the CLI's cwd on spawn).
   const consumerRepoPath = process.cwd();
+  // R8/KTD-8: the integrity backstop's reference point, resolved here
+  // alongside workspace creation/reuse rather than lazily — `start` captures
+  // it fresh and records it as a trace event (the run's durable record,
+  // KTD-8); `resume` reads that same recorded event back rather than
+  // recapturing it fresh against a workspace `reuseWorkspace` merely
+  // reopens (never re-created), which could already be compromised and would
+  // otherwise baseline the tamper as the new "normal" forever after.
+  let integrityManifest: WorkspaceIntegrityManifest;
   try {
     if (mode === "start") {
       createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
+      integrityManifest = captureWorkspaceIntegrityManifest(workspacePath);
+      appendEvent(db, { runId, payload: { type: WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE, manifest: integrityManifest } });
     } else {
       reuseWorkspace(workspacePath);
       // U8/KTD-9: a retained workspace's HEAD is left detached so its branch
@@ -320,6 +347,11 @@ async function main(): Promise<void> {
       // the last actually committed attempt before re-entering.
       reattachToRunBranch(consumerRepoPath, workspacePath, runBranch);
       preserveInterruptedAttempt(consumerRepoPath, workspacePath, runId, baseRefSha);
+      const recorded = findRecordedManifest(listEvents(db, runId));
+      if (!recorded) {
+        throw new Error(`no workspace integrity manifest recorded for run '${runId}' — cannot resume safely`);
+      }
+      integrityManifest = recorded;
     }
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
@@ -441,7 +473,7 @@ async function main(): Promise<void> {
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
     let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
     if (attemptBounds[nodeId] !== undefined) {
-      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
+      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, integrityManifest, wrapped);
     }
     nodeFns[nodeId] = withTracing(db, runId, nodeId, attemptState, wrapped);
   }
@@ -526,6 +558,24 @@ async function main(): Promise<void> {
       if (result.status === "completed") {
         writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
       }
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      status = "failed";
+    }
+
+    // R8/KTD-8: the terminal-path half of the integrity backstop — the
+    // boundary hook above only fires on the bounded node's re-entry, so a run
+    // that converges, fails, or hits `not_converged` without ever
+    // re-activating it (or a topology with no bounded node at all) would
+    // otherwise never have its workspace checked at all. Runs before
+    // `commitFinalAttempt` for the same reason the hook checks before its own
+    // commit: a violation must name a node, not the teardown commit that
+    // would otherwise fold it into history first. A violation here overrides
+    // whatever status the loop decided — unlike the isolated failures below,
+    // this is a genuine tamper, not a teardown mechanic, so R8 wins over
+    // "never downgrade" here.
+    try {
+      assertWorkspaceIntegrity(workspacePath, integrityManifest, "run-teardown");
     } catch (err) {
       appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
       status = "failed";
