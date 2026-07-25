@@ -11,7 +11,16 @@ import {
 } from "../../src/workspace/integrity.js";
 import { openDb } from "../../src/store/db.js";
 import { listEvents } from "../../src/store/trace.js";
-import { gitRepo, runCliSync, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { gitRepo, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+
+/** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
+function symbolicRefOrEmpty(cwd: string): string {
+  try {
+    return execFileSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd, encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 // Its write half performs whatever `{"write":{"path":...,"content":...}}` its
@@ -336,6 +345,14 @@ describe("integration/integrity: a full run fails when the workspace's config su
     // and the resume — i.e. outside of any process that has ever compared it
     // against the real (creation-time) manifest.
     const workspacePath = join(workspaces, runId);
+    // The status write precedes disposal (R11/KTD-12), so `not_converged`
+    // being observable does NOT mean the engine has finished detaching the
+    // halted workspace's HEAD. Planting before that lands makes the
+    // `git branch -f` below fail outright — git refuses to force-move a
+    // branch that is still checked out somewhere. Wait for the disposal's
+    // actual outcome rather than for the status that merely precedes it.
+    await waitFor(() => symbolicRefOrEmpty(workspacePath) === "", 10_000);
+
     writeFileSync(join(workspacePath, ".mcp.json"), '{"mcpServers":{"evil":{}}}');
     execFileSync("git", ["add", "-A"], { cwd: workspacePath });
     execFileSync(
