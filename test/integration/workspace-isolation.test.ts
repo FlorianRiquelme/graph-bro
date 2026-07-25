@@ -24,14 +24,6 @@ function writeTopology(cwd: string, topology: unknown): string {
   return path;
 }
 
-/** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
-function symbolicRefOrEmpty(cwd: string): string {
-  try {
-    return execFileSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd, encoding: "utf8" }).trim();
-  } catch {
-    return "";
-  }
-}
 
 function singleNodeTopology(overrides: Record<string, unknown> = {}) {
   return {
@@ -541,15 +533,20 @@ describe("integration/terminal-status: the terminal write is decided by the loop
     // commit attempt (and a second trace event) on top of the first.
     expect(commitErrors).toHaveLength(1);
 
+    // A failed run's workspace is retained (KTD-9).
+    expect(existsSync(workspacePath)).toBe(true);
+
     rmSync(join(adminDir, "index.lock"), { force: true }); // let afterEach's rmSync succeed
 
-    // Disposal still ran, isolated from the commit failure above: a failed
-    // run's workspace is retained (KTD-9), HEAD left detached so its branch
-    // stays checkable out elsewhere — not abandoned mid-teardown. The status
-    // write above precedes disposal (R11/KTD-12), so this is only eventually
-    // true, not atomic with `waitForRunStatus` resolving.
-    expect(existsSync(workspacePath)).toBe(true);
-    await waitFor(() => symbolicRefOrEmpty(workspacePath) === "", 5000); // detached, per KTD-9's halted-run branch
+    // Deliberately NOT asserting the detach here. The lock that breaks the
+    // teardown commit is still in place when disposal runs, so `checkout
+    // --detach` fails too — correctly, and by design: U7 isolates disposal so
+    // it can only trace `workspace_finalize_error`. Whether this test's
+    // cleanup above wins the race against the engine's disposal decides which
+    // way it lands, which is exactly the spawned-process race R5 forbids in
+    // the gate (it passed locally and failed every CI run). Detach-on-halt is
+    // covered without fault injection in `workspace/lifecycle.test.ts`, which
+    // proves it the stronger way — by checking the branch out elsewhere.
   }, 15_000);
 
   it("Covers R12: a run failing the prompt-token gate on resume (after workspace reuse) leaves no worktree on disk or in git's admin data, and its branch is checkable out elsewhere", async () => {
