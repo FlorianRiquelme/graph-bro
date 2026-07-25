@@ -85,3 +85,77 @@ export function commitAttempt(options: CommitAttemptOptions): CommitAttemptResul
 
   return { committed: true, head, quiescenceWarning };
 }
+
+/** The side ref a killed run's interrupted attempt is preserved to — never the run branch, since it was never a completed attempt (R20's one-commit-per-attempt count must not include it). */
+export function partialAttemptRef(runId: string): string {
+  return `refs/graph-bro/partial-attempt/${runId}`;
+}
+
+export interface PreserveInterruptedAttemptResult {
+  preserved: boolean;
+  sha?: string;
+}
+
+/**
+ * Walks back from HEAD, within this branch's own history (never past
+ * `baseRefSha`, which is shared consumer history, not this run's), for the
+ * nearest commit `commitAttempt`/the teardown commit made — both use the
+ * `graph-bro: attempt N (...)` message. Falls back to `baseRefSha` itself
+ * when no attempt has ever been committed yet (a crash during the very
+ * first attempt). This — not HEAD — is "the last actually committed
+ * attempt": HEAD may sit on top of it if the agent made its own commits
+ * that a crash prevented `commitAttempt` from ever folding.
+ */
+function findLastCommittedAttempt(workspacePath: string, baseRefSha: string): string {
+  const log = git(workspacePath, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
+  for (const line of log.trim().split("\n")) {
+    if (!line) continue;
+    const spaceIndex = line.indexOf(" ");
+    if (line.slice(spaceIndex + 1).startsWith("graph-bro: attempt ")) return line.slice(0, spaceIndex);
+  }
+  return baseRefSha;
+}
+
+/**
+ * F3/AE9/U8: a killed run's mid-attempt state is preserved as a reachable,
+ * inspectable commit under `partialAttemptRef` — *not* folded into the run
+ * branch, since it was never a completed attempt — then the workspace is
+ * hard-reset to the last actually committed attempt, so resume re-enters
+ * from a clean, known-good tree. A no-op if the workspace is already at
+ * that state (a graceful stop, or a resume of an already-clean retained
+ * workspace).
+ *
+ * Uses plumbing (`write-tree`/`commit-tree`) rather than `git stash create`:
+ * the latter only captures tracked changes, missing any file a killed write
+ * node had just created. `reset --hard` alone would leave those same
+ * untracked files behind, so `clean -fd` follows it. Compares against
+ * `findLastCommittedAttempt`, not `priorHead`-style equality with HEAD: an
+ * agent's own commit made mid-attempt (never folded by `commitAttempt`
+ * before the kill) leaves the tree clean but HEAD already past the last
+ * real attempt commit, which a bare porcelain check would miss entirely.
+ */
+export function preserveInterruptedAttempt(workspacePath: string, runId: string, baseRefSha: string): PreserveInterruptedAttemptResult {
+  const lastGood = findLastCommittedAttempt(workspacePath, baseRefSha);
+  const head = currentHead(workspacePath);
+  const dirty = porcelain(workspacePath);
+  if (head === lastGood && dirty.trim() === "") {
+    return { preserved: false };
+  }
+
+  git(workspacePath, ["add", "-A"]);
+  const treeSha = git(workspacePath, ["write-tree"]).trim();
+  const sha = git(workspacePath, [
+    "commit-tree",
+    treeSha,
+    "-p",
+    head,
+    "-m",
+    `graph-bro: interrupted attempt for run ${runId}`,
+  ]).trim();
+  git(workspacePath, ["update-ref", partialAttemptRef(runId), sha]);
+
+  git(workspacePath, ["reset", "--hard", lastGood]);
+  git(workspacePath, ["clean", "-fd"]);
+
+  return { preserved: true, sha };
+}

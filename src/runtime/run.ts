@@ -23,9 +23,9 @@ import { appendEvent } from "../store/trace.js";
 import { ClaudeCodeExecutor } from "../executor/claude-code.js";
 import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
-import { createWorkspace, finalizeWorkspace, reuseWorkspace } from "../workspace/lifecycle.js";
+import { createWorkspace, finalizeWorkspace, reattachToRunBranch, reuseWorkspace } from "../workspace/lifecycle.js";
 import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
-import { commitAttempt, readHead } from "../workspace/commit.js";
+import { commitAttempt, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
 import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
@@ -276,6 +276,14 @@ async function main(): Promise<void> {
       createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
     } else {
       reuseWorkspace(workspacePath);
+      // U8/KTD-9: a retained workspace's HEAD is left detached so its branch
+      // can be checked out elsewhere while it exists — resume must re-attach
+      // before committing anything, or every post-resume attempt commits
+      // onto the detached HEAD instead of the run branch. Then preserve
+      // whatever a kill left dirty mid-attempt (F3/AE9) and hard-reset to
+      // the last actually committed attempt before re-entering.
+      reattachToRunBranch(workspacePath, runBranch);
+      preserveInterruptedAttempt(workspacePath, runId, baseRefSha);
     }
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });

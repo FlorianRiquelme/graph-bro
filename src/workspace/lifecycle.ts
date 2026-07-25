@@ -125,6 +125,24 @@ export function reuseWorkspace(workspacePath: string): void {
 }
 
 /**
+ * U8: KTD-9 leaves a retained (halted) workspace's HEAD detached precisely so
+ * its branch can be checked out elsewhere while the directory exists — but
+ * that means resume must re-attach *before* committing anything, or every
+ * post-resume attempt commits onto the detached HEAD instead of the run
+ * branch, silently losing them from the handback. Throws — naming the
+ * holding worktree's path, since git's own error already does — if the
+ * branch is checked out elsewhere in the meantime, rather than proceeding
+ * detached.
+ */
+export function reattachToRunBranch(workspacePath: string, runBranch: string): void {
+  try {
+    execFileSync("git", ["checkout", runBranch], { cwd: workspacePath, encoding: "utf8", stdio: GIT_STDIO });
+  } catch (err) {
+    throw new Error(`could not reattach workspace to run branch '${runBranch}': ${gitErrorMessage(err)}`);
+  }
+}
+
+/**
  * KTD-9: a converged run needs no directory (the branch is the handback), so
  * its worktree is removed; a halted run keeps its workspace for `resume` and
  * for inspection, but with HEAD detached — while a worktree holds a branch,

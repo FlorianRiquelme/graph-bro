@@ -1,0 +1,234 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { openDb } from "../../src/store/db.js";
+import { partialAttemptRef } from "../../src/workspace/commit.js";
+import { gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+const FAKE_CLAUDE_WRITE_THEN_HANG = join(FIXTURES_DIR, "fake-claude-write-then-hang.mjs");
+const FAKE_CLAUDE_FIX_REVIEW = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
+
+function writeTopology(cwd: string, topology: unknown): string {
+  const path = join(cwd, "topology.json");
+  writeFileSync(path, JSON.stringify(topology));
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-q", "-m", "add topology"], { cwd });
+  return path;
+}
+
+/** A fix/review loop: `review` is bounded and re-enters `writer` until its verdict flips to "pass". */
+function fixReviewLoopTopology(maxAttempts: number) {
+  return {
+    nodes: [
+      {
+        id: "writer",
+        kind: "agent",
+        read_only: false,
+        model: "claude-haiku-4-5",
+        prompt: JSON.stringify({ write: { path: "work.txt", content: "attempt" } }),
+        output_key: "written",
+      },
+      {
+        id: "review",
+        kind: "agent",
+        read_only: true,
+        model: "claude-haiku-4-5",
+        prompt: "review the work",
+        output_key: "verdict",
+        output_schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+        max_attempts: maxAttempts,
+      },
+    ],
+    edges: [
+      { from: "START", to: "writer" },
+      { from: "writer", to: "review" },
+      { from: "review", to: "writer", when: { key: "verdict.verdict", equals: "fail" } },
+      { from: "review", to: "END", when: { key: "verdict.verdict", equals: "pass" } },
+    ],
+    max_steps: 20,
+  };
+}
+
+describe("integration/write-crash-resume: a killed write run resumes from its last committed attempt (U8, R23/AE9)", () => {
+  let home: string;
+  let workspaces: string;
+  let cwd: string;
+  let counterDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "graph-bro-write-crash-home-"));
+    workspaces = join(home, "workspaces");
+    cwd = gitRepo();
+    counterDir = mkdtempSync(join(tmpdir(), "graph-bro-write-crash-counter-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(counterDir, { recursive: true, force: true });
+  });
+
+  function baseEnv(binary: string): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: workspaces,
+      GRAPH_BRO_CLAUDE_BINARY: binary,
+      FAKE_CLAUDE_COUNTER_DIR: counterDir,
+    };
+  }
+
+  it("Covers AE9/R19: a run killed mid-first-attempt preserves the partial write as a side ref, leaves the consumer untouched, and resume converges from a clean workspace", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+    const consumerPorcelainBefore = execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" });
+
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_WRITE_THEN_HANG), FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" },
+    });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    // Wait for the writer's in-flight file to actually land on disk (the
+    // node itself then hangs, standing in for "still working") before
+    // killing — otherwise this races the write against the kill.
+    const workspacePath = join(workspaces, runId);
+    await waitFor(() => {
+      try {
+        return readFileSync(join(workspacePath, "work.txt"), "utf8").length > 0;
+      } catch {
+        return false;
+      }
+    }, 5000);
+
+    const statusJson = JSON.parse(runCliSync(["status", runId], { cwd, env: baseEnv(FAKE_CLAUDE_WRITE_THEN_HANG) }).stdout);
+    const ownerPid: number = statusJson.ownerPid;
+    process.kill(ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(ownerPid), 3000);
+
+    // Nothing committed yet (review's before-invocation hook never fired for
+    // this, the very first, attempt) — the crash left the write only on disk.
+    expect(
+      execFileSync("git", ["log", "--format=%s", `${baseRef}..graph-bro/run-${runId}`], { cwd, encoding: "utf8" }).trim(),
+    ).toBe("");
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" },
+    });
+    expect(resume.status).toBe(0);
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    // The interrupted attempt is preserved and reachable, not silently discarded.
+    const partialSha = execFileSync("git", ["rev-parse", "--verify", partialAttemptRef(runId)], { cwd, encoding: "utf8" }).trim();
+    expect(partialSha).toBeTruthy();
+    expect(execFileSync("git", ["show", `${partialSha}:work.txt`], { cwd, encoding: "utf8" })).toBe("attempt-1");
+
+    // The resumed run re-entered cleanly and converged on its (fresh) first attempt.
+    const runBranch = `graph-bro/run-${runId}`;
+    expect(execFileSync("git", ["show", `${runBranch}:work.txt`], { cwd, encoding: "utf8" })).toBe("attempt-1");
+    expect(
+      execFileSync("git", ["log", "--format=%s", `${baseRef}..${runBranch}`], { cwd, encoding: "utf8" }).trim().split("\n"),
+    ).toHaveLength(1); // exactly one attempt commit — the killed attempt was discarded, not folded in twice
+
+    // R19: the consumer's own tree/index never moved, across the kill and the resume.
+    expect(execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8" })).toBe(consumerPorcelainBefore);
+  }, 20_000);
+
+  it("a run resumed after exhausting its attempts halts immediately in not_converged, spending no fresh attempts", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "not_converged", 10_000);
+
+    const runBranch = `graph-bro/run-${runId}`;
+    const commitsBefore = execFileSync("git", ["rev-list", "--count", runBranch], { cwd, encoding: "utf8" }).trim();
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    expect(resume.status).toBe(0);
+    await waitForRunStatus(home, runId, "not_converged", 5000);
+
+    // Immediate: the bound check refuses the over-the-bound activation before
+    // dispatching anything, so no new commit and no new node work occur.
+    const commitsAfter = execFileSync("git", ["rev-list", "--count", runBranch], { cwd, encoding: "utf8" }).trim();
+    expect(commitsAfter).toBe(commitsBefore);
+  }, 15_000);
+
+  it("Covers KTD-5: raising the attempt bound and resuming a bound-halted run lets it continue and converge", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "4" },
+    });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "not_converged", 10_000);
+
+    // The sanctioned operator action for `not_converged`: raise the bound in
+    // the topology on disk, then resume — `resume` re-reads the topology
+    // path fresh rather than the compiled snapshot `start` validated against.
+    writeFileSync(topologyPath, JSON.stringify(fixReviewLoopTopology(6)));
+    execFileSync("git", ["add", "-A"], { cwd });
+    execFileSync("git", ["commit", "-q", "-m", "raise the attempt bound"], { cwd });
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "4" },
+    });
+    expect(resume.status).toBe(0);
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+  }, 15_000);
+
+  it("resuming a run whose workspace was removed by hand fails with a clear message, rather than re-running from scratch", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_WRITE_THEN_HANG), FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" },
+    });
+    const runId = start.stdout.trim();
+    const workspacePath = join(workspaces, runId);
+
+    await waitFor(() => {
+      try {
+        return readFileSync(join(workspacePath, "work.txt"), "utf8").length > 0;
+      } catch {
+        return false;
+      }
+    }, 5000);
+
+    const statusJson = JSON.parse(runCliSync(["status", runId], { cwd, env: baseEnv(FAKE_CLAUDE_WRITE_THEN_HANG) }).stdout);
+    process.kill(statusJson.ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(statusJson.ownerPid), 3000);
+
+    rmSync(workspacePath, { recursive: true, force: true }); // simulate the operator removing it by hand
+
+    const resume = runCliSync(["resume", runId], { cwd, env: baseEnv(FAKE_CLAUDE_FIX_REVIEW) });
+    expect(resume.status).toBe(0); // `resume` itself only spawns the engine — the failure is inside it
+
+    await waitForRunStatus(home, runId, "failed", 5000);
+
+    const db = openDb({ baseDir: home });
+    try {
+      const row = db.prepare("select payload from events where run_id = ? order by id desc limit 1").get(runId) as
+        | { payload: string }
+        | undefined;
+      expect(row).toBeDefined();
+      const payload = JSON.parse(row!.payload);
+      expect(payload.error).toMatch(/removed by hand/);
+    } finally {
+      db.close();
+    }
+  }, 15_000);
+});

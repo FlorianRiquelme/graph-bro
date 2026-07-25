@@ -3,7 +3,17 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { commitAttempt } from "../../src/workspace/commit.js";
+import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt } from "../../src/workspace/commit.js";
+import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
+
+/** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
+function symbolicRefOrEmpty(cwd: string): string {
+  try {
+    return git(cwd, ["symbolic-ref", "-q", "HEAD"]).trim();
+  } catch {
+    return "";
+  }
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -217,5 +227,116 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     expect(result.committed).toBe(true);
     expect(result.quiescenceWarning).toContain("reviewer");
     expect(result.quiescenceWarning).toContain("not quiescent");
+  });
+});
+
+describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", () => {
+  let workspace: string;
+
+  beforeEach(() => {
+    workspace = workspaceRepo();
+  });
+
+  afterEach(() => {
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("is a no-op when the workspace is already clean", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+
+    const result = preserveInterruptedAttempt(workspace, "run-x", headBefore);
+
+    expect(result.preserved).toBe(false);
+    expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore);
+    expect(() => git(workspace, ["rev-parse", "--verify", partialAttemptRef("run-x")])).toThrow();
+  });
+
+  it("Covers AE9: preserves a killed run's dirty tree — tracked and untracked — as a reachable side-ref commit, then hard-resets the workspace", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "README.md"), "mid-edit\n"); // tracked file, modified
+    writeFileSync(join(workspace, "new-file.txt"), "untracked\n"); // never committed anywhere
+
+    const result = preserveInterruptedAttempt(workspace, "run-x", headBefore);
+
+    expect(result.preserved).toBe(true);
+    expect(result.sha).toBeTruthy();
+
+    // The side ref is reachable and holds the interrupted state...
+    const shownTracked = git(workspace, ["show", `${result.sha}:README.md`]);
+    expect(shownTracked).toBe("mid-edit\n");
+    const shownUntracked = git(workspace, ["show", `${result.sha}:new-file.txt`]);
+    expect(shownUntracked).toBe("untracked\n");
+    expect(git(workspace, ["rev-parse", "--verify", partialAttemptRef("run-x")]).trim()).toBe(result.sha);
+
+    // ...but the run branch itself is untouched by it (never folded into an attempt commit)...
+    expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore);
+
+    // ...and the workspace's working tree is back to exactly the last committed attempt.
+    expect(git(workspace, ["status", "--porcelain"]).trim()).toBe("");
+    expect(readFileSync(join(workspace, "README.md"), "utf8")).toBe("hello\n");
+    expect(existsSync(join(workspace, "new-file.txt"))).toBe(false);
+  });
+
+  it("preserves the agent's own commits too, not just the working tree, before resetting", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "agent-commit.txt"), "committed mid-attempt\n");
+    git(workspace, ["add", "-A"]);
+    git(workspace, ["commit", "-q", "-m", "agent's own commit before the kill"]);
+
+    const result = preserveInterruptedAttempt(workspace, "run-y", headBefore);
+
+    expect(result.preserved).toBe(true);
+    expect(git(workspace, ["show", `${result.sha}:agent-commit.txt`])).toBe("committed mid-attempt\n");
+    expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore); // the agent's commit is gone from the branch
+    expect(existsSync(join(workspace, "agent-commit.txt"))).toBe(false); // and from the working tree
+  });
+});
+
+describe("workspace/lifecycle: reattachToRunBranch (U8, KTD-9, real git)", () => {
+  let consumer: string;
+  let workspace: string;
+  const runBranch = "graph-bro/run-reattach-test";
+
+  beforeEach(() => {
+    consumer = mkdtempSync(join(tmpdir(), "graph-bro-reattach-consumer-"));
+    git(consumer, ["init", "-q"]);
+    git(consumer, ["config", "user.email", "test@example.com"]);
+    git(consumer, ["config", "user.name", "test"]);
+    git(consumer, ["config", "commit.gpgsign", "false"]);
+    writeFileSync(join(consumer, "README.md"), "hello\n");
+    git(consumer, ["add", "-A"]);
+    git(consumer, ["commit", "-q", "-m", "init"]);
+
+    workspace = join(mkdtempSync(join(tmpdir(), "graph-bro-reattach-ws-root-")), "ws");
+    execFileSync("git", ["worktree", "add", "-b", runBranch, workspace], { cwd: consumer, encoding: "utf8" });
+  });
+
+  afterEach(() => {
+    rmSync(consumer, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it("re-attaches a retained workspace's detached HEAD back onto the run branch", () => {
+    git(workspace, ["checkout", "--detach", "HEAD"]); // mirrors finalizeWorkspace's KTD-9 detach
+
+    expect(symbolicRefOrEmpty(workspace)).toBe(""); // detached: no symbolic ref
+
+    reattachToRunBranch(workspace, runBranch);
+
+    expect(symbolicRefOrEmpty(workspace)).toBe(`refs/heads/${runBranch}`);
+  });
+
+  it("Covers: the run branch checked out in another worktree — reattach aborts naming the holding worktree, rather than proceeding detached", () => {
+    git(workspace, ["checkout", "--detach", "HEAD"]);
+
+    const elsewhere = join(mkdtempSync(join(tmpdir(), "graph-bro-reattach-elsewhere-")), "checkout");
+    execFileSync("git", ["worktree", "add", elsewhere, runBranch], { cwd: consumer, encoding: "utf8" });
+    try {
+      expect(() => reattachToRunBranch(workspace, runBranch)).toThrow(new RegExp(runBranch.replace(/\//g, "\\/")));
+      // Still detached — never left in a half-attached state.
+      expect(symbolicRefOrEmpty(workspace)).toBe("");
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
   });
 });
