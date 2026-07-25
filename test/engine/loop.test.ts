@@ -6,6 +6,7 @@ import { END, START } from "../../src/topology/schema.js";
 import {
   runLoop,
   makeAgentNodeFn,
+  ConcurrentWriteViolationError,
   MaxStepsExceededError,
   UnmatchedRouterError,
   type EngineGraph,
@@ -790,5 +791,123 @@ describe("engine/loop: attempt bound and not_converged (U4, R5/R6/R7, KTD-5)", (
 
     expect(result.status).toBe("failed");
     expect(result.error).toBeInstanceOf(MaxStepsExceededError);
+  });
+});
+
+describe("engine/loop: single-track frontier assertion (U11, R19, KTD-10)", () => {
+  // Two independent chains off one unconditional fork — the compile-time
+  // guard only groups out-edges by source and only rejects an unresolved
+  // group with a write-capable target; this diamond has no such group (each
+  // fork branch has exactly one out-edge), so it is exactly the shape the
+  // compiler admits and only the frontier assertion can catch.
+  function divergingChainsGraph(capability: Record<string, "read_only" | "write">): EngineGraph {
+    return {
+      plainEdges: [
+        { from: START, to: "setup" },
+        { from: "setup", to: "branch_a" },
+        { from: "setup", to: "branch_b" },
+        { from: "branch_a", to: "node_a" },
+        { from: "branch_b", to: "node_b" },
+        { from: "node_a", to: END },
+        { from: "node_b", to: END },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 10,
+      agentNodeCapability: capability,
+    };
+  }
+
+  function chainNodeFns(ran: string[]): Record<string, NodeFn> {
+    return {
+      setup: () => ({}),
+      branch_a: () => ({}),
+      branch_b: () => ({}),
+      node_a: () => {
+        ran.push("node_a");
+        return {};
+      },
+      node_b: () => {
+        ran.push("node_b");
+        return {};
+      },
+    };
+  }
+
+  it("Covers R19: a write-capable node and a read-only node reaching the same frontier fails, naming both nodes — not the read-only node's own cleanliness check", async () => {
+    const ran: string[] = [];
+    const graph = divergingChainsGraph({ node_a: "write", node_b: "read_only" });
+
+    const result = await runLoop({ graph, nodeFns: chainNodeFns(ran) });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(ConcurrentWriteViolationError);
+    const error = result.error as ConcurrentWriteViolationError;
+    expect(error.nodeIds).toContain("node_a");
+    expect(error.nodeIds).toContain("node_b");
+    // The violation is caught before dispatch — neither node actually ran.
+    expect(ran).toEqual([]);
+  });
+
+  it("two write-capable nodes reaching the same frontier also fails — the original fan-out-write hazard restated as a diamond", async () => {
+    const ran: string[] = [];
+    const graph = divergingChainsGraph({ node_a: "write", node_b: "write" });
+
+    const result = await runLoop({ graph, nodeFns: chainNodeFns(ran) });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBeInstanceOf(ConcurrentWriteViolationError);
+  });
+
+  it("two read-only nodes reaching the same frontier are unaffected — the slice-1 fan-out shape still runs", async () => {
+    const ran: string[] = [];
+    const graph = divergingChainsGraph({ node_a: "read_only", node_b: "read_only" });
+
+    const result = await runLoop({ graph, nodeFns: chainNodeFns(ran) });
+
+    expect(result.status).toBe("completed");
+    expect(ran.sort()).toEqual(["node_a", "node_b"]);
+  });
+
+  it("a write-capable node running alone in its frontier is unaffected", async () => {
+    const graph: EngineGraph = {
+      plainEdges: [
+        { from: START, to: "writer" },
+        { from: "writer", to: END },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 10,
+      agentNodeCapability: { writer: "write" },
+    };
+    const nodeFns: Record<string, NodeFn> = { writer: () => ({}) };
+
+    const result = await runLoop({ graph, nodeFns });
+
+    expect(result.status).toBe("completed");
+  });
+
+  it("no agentNodeCapability declared at all leaves the assertion a no-op — a caller that hasn't wired it gets slice-1 behavior", async () => {
+    const ran: string[] = [];
+    const graph: EngineGraph = {
+      plainEdges: [
+        { from: START, to: "setup" },
+        { from: "setup", to: "branch_a" },
+        { from: "setup", to: "branch_b" },
+        { from: "branch_a", to: "node_a" },
+        { from: "branch_b", to: "node_b" },
+        { from: "node_a", to: END },
+        { from: "node_b", to: END },
+      ],
+      fanOutEdges: [],
+      joinBarriers: [],
+      maxSteps: 10,
+      // no agentNodeCapability declared at all
+    };
+
+    const result = await runLoop({ graph, nodeFns: chainNodeFns(ran) });
+
+    expect(result.status).toBe("completed");
+    expect(ran.sort()).toEqual(["node_a", "node_b"]);
   });
 });

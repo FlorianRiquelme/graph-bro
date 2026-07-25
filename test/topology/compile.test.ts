@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   compile,
@@ -240,6 +241,121 @@ describe("compile: U2 authoring surface (output_schema, max_attempts, network_do
     const result = compile({ ...validTopology(), base_ref: "origin/main" });
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.compiled.baseRef).toBe("origin/main");
+  });
+});
+
+describe("compile: single-track guard on simultaneous write dispatch (U11, R19, KTD-10)", () => {
+  function twoWriters(routerEdges: Array<Record<string, unknown>>) {
+    return {
+      nodes: [
+        { id: "router", kind: "set" as const, update: {} },
+        { id: "writer_a", kind: "agent" as const, read_only: false, model: "m", prompt: "p", output_key: "a" },
+        { id: "writer_b", kind: "agent" as const, read_only: false, model: "m", prompt: "p", output_key: "b" },
+      ],
+      edges: [{ from: START, to: "router" }, ...routerEdges, { from: "writer_a", to: END }, { from: "writer_b", to: END }],
+      max_steps: 10,
+    };
+  }
+
+  it("Covers R19: a source with two unguarded plain edges into two write-capable nodes is rejected, naming the deferral", () => {
+    const result = compile(
+      twoWriters([
+        { from: "router", to: "writer_a" },
+        { from: "router", to: "writer_b" },
+      ]),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.some((error) => error.message.includes("KTD-10"))).toBe(true);
+    expect(result.errors.some((error) => error.message.includes("writer_a"))).toBe(true);
+    expect(result.errors.some((error) => error.message.includes("writer_b"))).toBe(true);
+  });
+
+  it("Covers R19: examples/review-fix-loop still compiles — out-edges mutually exclusive on one guard key are accepted", () => {
+    const reviewFixLoop = JSON.parse(
+      readFileSync(new URL("../../examples/review-fix-loop/topology.json", import.meta.url), "utf8"),
+    );
+    const result = compile(reviewFixLoop);
+    expect(result.ok).toBe(true);
+  });
+
+  it("a source with one unguarded and one guarded edge into a write-capable target is rejected — the unguarded edge always fires", () => {
+    const result = compile(
+      twoWriters([
+        { from: "router", to: "writer_a", when: { key: "choice", equals: "a" } },
+        { from: "router", to: "writer_b" },
+      ]),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("accepts out-edges into two write-capable targets guarded mutually exclusive on one shared key", () => {
+    const result = compile(
+      twoWriters([
+        { from: "router", to: "writer_a", when: { key: "choice", equals: "a" } },
+        { from: "router", to: "writer_b", when: { key: "choice", equals: "b" } },
+      ]),
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects guards sharing a key but with the same literal — not actually mutually exclusive", () => {
+    const result = compile(
+      twoWriters([
+        { from: "router", to: "writer_a", when: { key: "choice", equals: "a" } },
+        { from: "router", to: "writer_b", when: { key: "choice", equals: "a" } },
+      ]),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects guards on two different keys — no single key partitions the routing", () => {
+    const result = compile(
+      twoWriters([
+        { from: "router", to: "writer_a", when: { key: "choice", equals: "a" } },
+        { from: "router", to: "writer_b", when: { key: "other", equals: "b" } },
+      ]),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("the existing fan-out write-lane rejection is unchanged", () => {
+    const topology = {
+      nodes: [
+        { id: "dispatch", kind: "set" as const, update: { "batch.items": ["a", "b"] } },
+        { id: "writer", kind: "agent" as const, read_only: false, model: "claude-cheap", prompt: "edit ${item}", output_key: "diff" },
+      ],
+      edges: [
+        { from: START, to: "dispatch" },
+        { from: "dispatch", for_each: "batch.items", as: "item", to: "writer" },
+        { from: "writer", to: END },
+      ],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.some((error) => error.message.includes("slice 2b"))).toBe(true);
+  });
+
+  it("two read-only nodes fanning out from one source is unaffected — no write-capable target involved", () => {
+    const topology = {
+      nodes: [
+        { id: "router", kind: "set" as const, update: {} },
+        { id: "reader_a", kind: "agent" as const, read_only: true as const, model: "m", prompt: "p", output_key: "a" },
+        { id: "reader_b", kind: "agent" as const, read_only: true as const, model: "m", prompt: "p", output_key: "b" },
+      ],
+      edges: [
+        { from: START, to: "router" },
+        { from: "router", to: "reader_a" },
+        { from: "router", to: "reader_b" },
+        { from: "reader_a", to: END },
+        { from: "reader_b", to: END },
+      ],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(true);
   });
 });
 

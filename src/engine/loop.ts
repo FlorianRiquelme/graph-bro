@@ -60,6 +60,17 @@ export interface EngineGraph {
   maxConcurrency?: number;
   /** R6: nodeId -> declared `max_attempts`, for the nodes a loop re-enters. Absent entirely means no node in this topology declared a bound. */
   attemptBounds?: Record<string, number>;
+  /**
+   * KTD-10: nodeId -> capability, for every `agent`-kind node (a `set` node
+   * is absent — it never runs a CLI subprocess, so it is never party to the
+   * single-track hazard). Drives the frontier assertion in `runLoop`: a
+   * frontier holding a `"write"` activation must hold no other agent
+   * activation. Optional so a caller that hasn't wired it (or a test
+   * exercising unrelated behavior) gets no enforcement rather than a crash —
+   * the compile-time guard in `topology/compile.ts` is the courtesy for that
+   * gap, not a substitute for wiring this in production.
+   */
+  agentNodeCapability?: Record<string, "read_only" | "write">;
 }
 
 /** Durable wiring (U3): when provided, branches commit pending writes as they drain and the loop checkpoints each step's incoming frontier before dispatch, so a crash mid-drain resumes cleanly. */
@@ -181,6 +192,26 @@ export class MaxStepsExceededError extends Error {
   constructor(public readonly maxSteps: number) {
     super(`run exceeded max_steps (${maxSteps}) without reaching END`);
     this.name = "MaxStepsExceededError";
+  }
+}
+
+/**
+ * KTD-10: the runtime backstop for the single-track guard — the frontier is
+ * known exactly here, unlike at compile time, where only shapes provably
+ * concurrent from the static graph (one source's unguarded-or-not-mutually-
+ * exclusive out-edges) can be caught. This also catches what the compiler
+ * structurally cannot: a diamond where a write-capable node and a read-only
+ * node converge into the same frontier from independent sources. Left
+ * unchecked, the write node's edits land mid-step and the read-only node's
+ * *own* cleanliness assertion fails and names itself — the innocent party —
+ * so this fires first, naming every agent node sharing the frontier.
+ */
+export class ConcurrentWriteViolationError extends Error {
+  constructor(public readonly nodeIds: string[]) {
+    super(
+      `single-track violation (KTD-10): '${nodeIds.join("', '")}' would dispatch in the same super-step and at least one is write-capable — two agent processes cannot run concurrently against one worktree`,
+    );
+    this.name = "ConcurrentWriteViolationError";
   }
 }
 
@@ -376,6 +407,26 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     steps += 1;
     if (steps > graph.maxSteps) {
       return { status: "failed", state, steps, error: new MaxStepsExceededError(graph.maxSteps), attempts: attemptsSnapshot() };
+    }
+
+    // KTD-10: the single-track frontier assertion, checked on the actual
+    // dispatch frontier before anything runs — the real enforcement, with
+    // the compile-time guard as its authoring-time courtesy. Fails before
+    // spending an attempt or writing a checkpoint for a frontier that must
+    // never dispatch.
+    if (graph.agentNodeCapability) {
+      const agentActivations = frontier.filter((activation) => graph.agentNodeCapability![activation.nodeId] !== undefined);
+      const hasWrite = agentActivations.some((activation) => graph.agentNodeCapability![activation.nodeId] === "write");
+      if (hasWrite && agentActivations.length > 1) {
+        const nodeIds = [...new Set(agentActivations.map((activation) => activation.nodeId))];
+        return {
+          status: "failed",
+          state,
+          steps,
+          error: new ConcurrentWriteViolationError(nodeIds),
+          attempts: attemptsSnapshot(),
+        };
+      }
     }
 
     // R6/R7: count this step's activations of any bounded node BEFORE

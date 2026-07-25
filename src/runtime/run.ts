@@ -350,8 +350,15 @@ async function main(): Promise<void> {
 
   // R6: nodeId -> declared max_attempts, for every agent node bounding a loop it's re-entered by.
   const attemptBounds: Record<string, number> = {};
+  // R19/KTD-10: nodeId -> capability, for every agent node — the key the
+  // loop's single-track frontier assertion reads. Without it that assertion
+  // is inert, and the compile-time guard alone cannot see a diamond that
+  // converges a write node and a read-only node from independent sources.
+  const agentNodeCapability: Record<string, "read_only" | "write"> = {};
   for (const node of compiled.nodes) {
-    if (node.kind === "agent" && node.max_attempts !== undefined) attemptBounds[node.id] = node.max_attempts;
+    if (node.kind !== "agent") continue;
+    if (node.max_attempts !== undefined) attemptBounds[node.id] = node.max_attempts;
+    agentNodeCapability[node.id] = node.read_only ? "read_only" : "write";
   }
 
   const graph: EngineGraph = {
@@ -361,6 +368,7 @@ async function main(): Promise<void> {
     maxSteps: compiled.maxSteps,
     maxConcurrency: compiled.maxConcurrency,
     attemptBounds,
+    agentNodeCapability,
   };
 
   // Resolved before node fns are built: U7's attempt-commit hook seeds its

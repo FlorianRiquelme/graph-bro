@@ -139,6 +139,34 @@ export function compile(input: unknown): CompileResult {
     }
   });
 
+  // KTD-10 compile-time courtesy for the single-track guard: the real
+  // enforcement is the runtime frontier assertion in `engine/loop.ts`, which
+  // sees the actual dispatch frontier; this check only catches the shape
+  // provably concurrent from the static graph, before a run id is minted.
+  // Guards are evaluated independently per edge (not "one of N" routing), so
+  // two out-edges out of one source both dispatch in the same super-step
+  // *unless* they are guarded mutually exclusive — do NOT reject merely for
+  // having more than one out-edge into a write-capable target (that rejects
+  // `examples/review-fix-loop`'s pass/fail router, which is exactly the
+  // mutually-exclusive shape this deliberately admits).
+  const plainEdgesBySourceForGuard = new Map<string, PlainEdge[]>();
+  for (const edge of topology.edges.filter(isPlainEdge)) {
+    const list = plainEdgesBySourceForGuard.get(edge.from) ?? [];
+    list.push(edge);
+    plainEdgesBySourceForGuard.set(edge.from, list);
+  }
+  for (const [source, edges] of plainEdgesBySourceForGuard) {
+    if (edges.length < 2) continue;
+    const writeTargets = edges.filter((edge) => writeCapableIds.has(edge.to));
+    if (writeTargets.length === 0) continue;
+    if (!isMutuallyExclusiveGroup(edges)) {
+      errors.push({
+        message: `node '${source}' has out-edges into write-capable node(s) '${[...new Set(writeTargets.map((edge) => edge.to))].join("', '")}' that are not provably mutually exclusive — two could dispatch in the same super-step and interleave edits against one worktree (KTD-10 deferral); guard all of '${source}''s out-edges on one shared state key with distinct 'equals' literals`,
+        path: "edges",
+      });
+    }
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -166,6 +194,28 @@ export function compile(input: unknown): CompileResult {
   };
 
   return { ok: true, compiled, warnings: [...lintJoinDesync(topology), ...lintNonExhaustiveRouter(topology)] };
+}
+
+/**
+ * KTD-10: a group of out-edges from one source is provably mutually
+ * exclusive only when every edge is guarded, all guards read the same state
+ * key via the `equals` operator (the only leaf shape carrying a distinct
+ * literal to compare — `truthy`/`falsy`/`exists`/`contains` don't partition
+ * a domain into disjoint literals), and every edge's literal is distinct
+ * from every other's. One unguarded edge in the group always fires
+ * alongside whatever else fires, so it fails this check by construction.
+ */
+function isMutuallyExclusiveGroup(edges: PlainEdge[]): boolean {
+  if (edges.some((edge) => edge.when === undefined)) return false;
+  const keys = new Set<string>();
+  const literals = new Set<string>();
+  for (const edge of edges) {
+    const when = edge.when as { key?: string; equals?: unknown };
+    if (when.key === undefined || !("equals" in when) || when.equals === undefined) return false;
+    keys.add(when.key);
+    literals.add(JSON.stringify(when.equals));
+  }
+  return keys.size === 1 && literals.size === edges.length;
 }
 
 /**
