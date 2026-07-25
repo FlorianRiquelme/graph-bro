@@ -1,4 +1,43 @@
 import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+
+/**
+ * Mirrors `lifecycle.ts`'s `defaultWorkspacesRoot` — graph-bro's own state
+ * directory, never inside any workspace, so its content is outside anything
+ * the sandbox can write. `resolveExcludesFilePath` needs this same root
+ * for a file that is not per-workspace.
+ */
+function defaultWorkspacesRoot(): string {
+  return process.env.GRAPH_BRO_WORKSPACES || join(homedir(), ".graph-bro-workspaces");
+}
+
+/**
+ * A single static excludes file graph-bro owns, outside every workspace
+ * (U5/R10 corrected): a per-worktree `info/exclude` is not consulted by git
+ * at all — `info/` is a *common* path shared across a repo's worktrees, so
+ * writing one there either silently does nothing or (the U5 bug this
+ * replaces) ends up appended to the *consumer's* shared file. `-c
+ * core.excludesFile=<path>` on every engine invocation sidesteps all of
+ * that: it needs no location inside the workspace, so the sandboxed node
+ * can never see or touch it, and it makes the engine's own view
+ * deterministic against the operator's global excludes too — an operator's
+ * `~/.gitignore_global` can no longer change what an attempt commit
+ * contains. Content is invariant, so this always overwrites rather than
+ * reading-then-appending; memoized per process since every engine git call
+ * needs it.
+ */
+let excludesFilePath: string | undefined;
+function resolveExcludesFilePath(): string {
+  if (excludesFilePath) return excludesFilePath;
+  const root = defaultWorkspacesRoot();
+  mkdirSync(root, { recursive: true });
+  const path = join(root, ".git-excludes");
+  writeFileSync(path, "/.claude/\n");
+  excludesFilePath = path;
+  return path;
+}
 
 /**
  * KTD-7: the attempt commit boundary. `commitAttempt` folds whatever the
@@ -11,24 +50,111 @@ import { execFileSync } from "node:child_process";
 
 const GIT_STDIO: ["ignore", "pipe", "pipe"] = ["ignore", "pipe", "pipe"];
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: GIT_STDIO });
+export interface WorkspaceGitTarget {
+  gitDir: string;
+  workTree: string;
 }
 
-function currentHead(workspacePath: string): string {
-  return git(workspacePath, ["rev-parse", "HEAD"]).trim();
+/**
+ * KTD-6: the one helper every engine git invocation against a workspace goes
+ * through. `--git-dir`/`--work-tree` are pinned to a target resolved by
+ * `resolveWorkspaceGitTarget` — never left for git to discover by walking up
+ * from a cwd inside the workspace, which is exactly how a rewritten gitlink
+ * would get consulted. The `-c` overrides neutralize every kind of
+ * repo-supplied execution the engine's unsandboxed process would otherwise
+ * inherit on *this* invocation: `core.hooksPath`/`core.fsmonitor` stop hooks
+ * firing on `checkout`/`commit`/etc, and `commit.gpgsign`/`tag.gpgsign` stop
+ * the operator's own signing config (a `gpg.format ssh` signer, say) from
+ * running inside a detached, tty-less process on every engine-owned attempt
+ * commit (#14) — that config lives in the *operator's* gitconfig, which is
+ * not scoped per-repo, so it cannot be avoided by resolving a "clean" git-dir
+ * the way hooks/filters can. `core.excludesFile` pins a graph-bro-owned
+ * excludes file (U5/R10) so the CLI's scratch directory stays out of every
+ * attempt commit without ever writing anything inside the workspace or the
+ * consumer's shared `.git/info/exclude`.
+ */
+export function runWorkspaceGit(target: WorkspaceGitTarget, args: string[]): string {
+  return execFileSync(
+    "git",
+    [
+      "--git-dir",
+      target.gitDir,
+      "--work-tree",
+      target.workTree,
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=",
+      "-c",
+      "commit.gpgsign=false",
+      "-c",
+      "tag.gpgsign=false",
+      "-c",
+      `core.excludesFile=${resolveExcludesFilePath()}`,
+      ...args,
+    ],
+    { encoding: "utf8", stdio: GIT_STDIO },
+  );
 }
 
-function porcelain(workspacePath: string): string {
-  return git(workspacePath, ["status", "--porcelain"]);
+/**
+ * KTD-7: resolves a workspace's administrative directory by asking the
+ * *consumer* repo which of its registered linked worktrees points at this
+ * path — never by reading anything inside the workspace itself, most of all
+ * `<workspace>/.git`, which is precisely the gitlink #6 shows a sandboxed
+ * node can rewrite to redirect the engine's git at a substitute repository
+ * it fully controls (its own hooks, its own filter drivers, its own
+ * config). Each linked worktree's private admin dir records its own target
+ * in `<common-dir>/worktrees/<name>/gitdir` — a file that lives under the
+ * consumer's own `.git`, outside anything the workspace sandbox can write —
+ * so matching on *that* file's content, rather than trusting the workspace's
+ * own gitlink, is what defeats the rewrite. Matches by content rather than by
+ * directory name to tolerate git's own disambiguation suffixes.
+ */
+export function resolveWorkspaceGitTarget(consumerRepoPath: string, workspacePath: string): WorkspaceGitTarget {
+  const commonDir = execFileSync("git", ["rev-parse", "--git-common-dir"], {
+    cwd: consumerRepoPath,
+    encoding: "utf8",
+    stdio: GIT_STDIO,
+  }).trim();
+  const commonDirAbs = isAbsolute(commonDir) ? commonDir : join(consumerRepoPath, commonDir);
+  const worktreesDir = join(commonDirAbs, "worktrees");
+  const resolvedWorkspacePath = realpathSync(workspacePath);
+
+  const entries = existsSync(worktreesDir) ? readdirSync(worktreesDir) : [];
+  for (const entry of entries) {
+    const gitdirFile = join(worktreesDir, entry, "gitdir");
+    if (!existsSync(gitdirFile)) continue;
+    const recordedGitlink = readFileSync(gitdirFile, "utf8").trim();
+    try {
+      if (realpathSync(dirname(recordedGitlink)) === resolvedWorkspacePath) {
+        return { gitDir: join(worktreesDir, entry), workTree: resolvedWorkspacePath };
+      }
+    } catch {
+      continue; // a stale/pruned worktree entry — not this workspace
+    }
+  }
+  throw new Error(
+    `could not resolve administrative directory for workspace '${workspacePath}' from consumer repo '${consumerRepoPath}' — is it a linked worktree of that repo?`,
+  );
+}
+
+function currentHead(target: WorkspaceGitTarget): string {
+  return runWorkspaceGit(target, ["rev-parse", "HEAD"]).trim();
+}
+
+function porcelain(target: WorkspaceGitTarget): string {
+  return runWorkspaceGit(target, ["status", "--porcelain"]);
 }
 
 /** The workspace's HEAD right now — the runtime's starting `priorHead` for the very first attempt, on both `start` (the creation commit) and `resume` (wherever the workspace was left). */
-export function readHead(workspacePath: string): string {
-  return currentHead(workspacePath);
+export function readHead(consumerRepoPath: string, workspacePath: string): string {
+  return currentHead(resolveWorkspaceGitTarget(consumerRepoPath, workspacePath));
 }
 
 export interface CommitAttemptOptions {
+  /** KTD-7: resolves the workspace's real admin dir; never read from inside the workspace. */
+  consumerRepoPath: string;
   workspacePath: string;
   /** The workspace's HEAD as of the last commit action (or its creation commit, for the first attempt). */
   priorHead: string;
@@ -55,29 +181,32 @@ export interface CommitAttemptResult {
  * commit (R20/AE8). Returns `committed: false` without creating an empty
  * commit when nothing changed since `priorHead` (R21's counterpart: an
  * attempt that did nothing produces no commit, only a *failing* attempt
- * still gets one). Runs with hooks disabled (`-c core.hooksPath=/dev/null`):
- * a consumer repo whose committed content supplies a hooks path must not
- * execute inside the unsandboxed engine process on every attempt.
+ * still gets one). Every git call here runs through `runWorkspaceGit`
+ * (KTD-6): a consumer repo whose committed content supplies a hooks path or
+ * a `filter.*.clean` driver must not execute inside the unsandboxed engine
+ * process on every attempt, and the operator's own signing config must not
+ * turn every attempt commit into a signature attempt from a tty-less process.
  */
 export function commitAttempt(options: CommitAttemptOptions): CommitAttemptResult {
-  const { workspacePath, priorHead, attemptNumber, nodeId } = options;
+  const { consumerRepoPath, workspacePath, priorHead, attemptNumber, nodeId } = options;
+  const target = resolveWorkspaceGitTarget(consumerRepoPath, workspacePath);
 
-  const headBefore = currentHead(workspacePath);
-  const dirtyBefore = porcelain(workspacePath);
+  const headBefore = currentHead(target);
+  const dirtyBefore = porcelain(target);
   if (headBefore === priorHead && dirtyBefore.trim() === "") {
     return { committed: false, head: priorHead };
   }
 
-  git(workspacePath, ["add", "-A"]);
+  runWorkspaceGit(target, ["add", "-A"]);
   // `--soft` moves the branch ref back to `priorHead` without touching the
   // index or working tree, so the diff between `priorHead` and whatever was
   // just staged now includes both the agent's own commits (already reflected
   // in the index) and the leftover dirty/untracked state just staged above.
-  git(workspacePath, ["reset", "--soft", priorHead]);
-  git(workspacePath, ["-c", "core.hooksPath=/dev/null", "commit", "-m", `graph-bro: attempt ${attemptNumber} (${nodeId})`]);
-  const head = currentHead(workspacePath);
+  runWorkspaceGit(target, ["reset", "--soft", priorHead]);
+  runWorkspaceGit(target, ["commit", "-m", `graph-bro: attempt ${attemptNumber} (${nodeId})`]);
+  const head = currentHead(target);
 
-  const dirtyAfter = porcelain(workspacePath);
+  const dirtyAfter = porcelain(target);
   const quiescenceWarning =
     dirtyAfter.trim().length > 0
       ? `workspace not quiescent after committing attempt ${attemptNumber} for node '${nodeId}' — a detached process may still be writing:\n${dirtyAfter}`
@@ -101,9 +230,9 @@ export function partialAttemptRef(runId: string): string {
 }
 
 /** The next unused ref under `partialAttemptRef`'s namespace for this run — one per preserved cycle, so a second kill-and-resume never displaces the first's commit (KTD-13). `refs/graph-bro/partial-attempt/*` sits outside `refs/heads/`, so git keeps no reflog and a displaced commit would be immediately gc-eligible. */
-function nextPartialAttemptRefName(workspacePath: string, runId: string): string {
+function nextPartialAttemptRefName(target: WorkspaceGitTarget, runId: string): string {
   const namespace = partialAttemptRef(runId);
-  const existing = git(workspacePath, ["for-each-ref", "--format=%(refname)", `${namespace}/*`]).trim();
+  const existing = runWorkspaceGit(target, ["for-each-ref", "--format=%(refname)", `${namespace}/*`]).trim();
   // Highest existing suffix + 1, not a count: counting reuses a suffix as soon
   // as any earlier ref in the namespace is gone, which would overwrite a
   // preserved commit — the exact silent displacement KTD-13 exists to stop.
@@ -129,8 +258,8 @@ export interface PreserveInterruptedAttemptResult {
  * attempt": HEAD may sit on top of it if the agent made its own commits
  * that a crash prevented `commitAttempt` from ever folding.
  */
-function findLastCommittedAttempt(workspacePath: string, baseRefSha: string): string {
-  const log = git(workspacePath, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
+function findLastCommittedAttempt(target: WorkspaceGitTarget, baseRefSha: string): string {
+  const log = runWorkspaceGit(target, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
   for (const line of log.trim().split("\n")) {
     if (!line) continue;
     const spaceIndex = line.indexOf(" ");
@@ -157,17 +286,23 @@ function findLastCommittedAttempt(workspacePath: string, baseRefSha: string): st
  * before the kill) leaves the tree clean but HEAD already past the last
  * real attempt commit, which a bare porcelain check would miss entirely.
  */
-export function preserveInterruptedAttempt(workspacePath: string, runId: string, baseRefSha: string): PreserveInterruptedAttemptResult {
-  const lastGood = findLastCommittedAttempt(workspacePath, baseRefSha);
-  const head = currentHead(workspacePath);
-  const dirty = porcelain(workspacePath);
+export function preserveInterruptedAttempt(
+  consumerRepoPath: string,
+  workspacePath: string,
+  runId: string,
+  baseRefSha: string,
+): PreserveInterruptedAttemptResult {
+  const target = resolveWorkspaceGitTarget(consumerRepoPath, workspacePath);
+  const lastGood = findLastCommittedAttempt(target, baseRefSha);
+  const head = currentHead(target);
+  const dirty = porcelain(target);
   if (head === lastGood && dirty.trim() === "") {
     return { preserved: false };
   }
 
-  git(workspacePath, ["add", "-A"]);
-  const treeSha = git(workspacePath, ["write-tree"]).trim();
-  const sha = git(workspacePath, [
+  runWorkspaceGit(target, ["add", "-A"]);
+  const treeSha = runWorkspaceGit(target, ["write-tree"]).trim();
+  const sha = runWorkspaceGit(target, [
     "commit-tree",
     treeSha,
     "-p",
@@ -175,10 +310,10 @@ export function preserveInterruptedAttempt(workspacePath: string, runId: string,
     "-m",
     `graph-bro: interrupted attempt for run ${runId}`,
   ]).trim();
-  git(workspacePath, ["update-ref", nextPartialAttemptRefName(workspacePath, runId), sha]);
+  runWorkspaceGit(target, ["update-ref", nextPartialAttemptRefName(target, runId), sha]);
 
-  git(workspacePath, ["reset", "--hard", lastGood]);
-  git(workspacePath, ["clean", "-fd"]);
+  runWorkspaceGit(target, ["reset", "--hard", lastGood]);
+  runWorkspaceGit(target, ["clean", "-fd"]);
 
   return { preserved: true, sha };
 }

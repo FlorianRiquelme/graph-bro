@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
+import { resolveWorkspaceGitTarget, runWorkspaceGit } from "./commit.js";
 
 /**
  * KTD-1: the workspace is a `git worktree` under graph-bro's own home, one
@@ -63,41 +64,6 @@ export function resolveBaseRef(consumerRepoPath: string, declaredRef?: string): 
   }
 }
 
-/**
- * The CLI's own scratch directory (Claude Code's project-local `.claude/`)
- * excluded from the worktree at creation — keeps attempt commits clean and
- * keeps the CLI's own files out of every node's tree comparison.
- *
- * `git rev-parse --git-path info/exclude` resolves to the *common* git dir —
- * `info/` is shared across all worktrees of a repo (only
- * `info/sparse-checkout` is per-worktree) — so writing there would append to
- * the consumer's own `.git/info/exclude`, permanently, on every run. That
- * would leave the consumer's `git status`/`git add -A` silently ignoring an
- * untracked `.claude/` in their main working tree from then on, with no
- * mention of it in the run's output. `git rev-parse --git-dir`, by contrast,
- * resolves to the worktree's own private admin directory
- * (`<common-dir>/worktrees/<name>`), which git also honours for this
- * worktree's own exclude file — so writing `info/exclude` under it keeps the
- * workspace's scratch directory ignored without ever touching the consumer's
- * copy. That per-worktree `info/` directory does not exist by default and
- * must be created.
- */
-function excludeScratchDirectory(workspacePath: string): void {
-  const gitDir = execFileSync("git", ["rev-parse", "--git-dir"], {
-    cwd: workspacePath,
-    encoding: "utf8",
-    stdio: GIT_STDIO,
-  }).trim();
-  const worktreeGitDir = isAbsolute(gitDir) ? gitDir : join(workspacePath, gitDir);
-  const infoDir = join(worktreeGitDir, "info");
-  mkdirSync(infoDir, { recursive: true });
-  const excludePath = join(infoDir, "exclude");
-  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
-  const line = "/.claude/";
-  if (existing.split("\n").some((l) => l.trim() === line)) return;
-  appendFileSync(excludePath, `${existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""}${line}\n`);
-}
-
 export interface CreateWorkspaceOptions {
   consumerRepoPath: string;
   baseRefSha: string;
@@ -123,7 +89,6 @@ export function createWorkspace(options: CreateWorkspaceOptions): void {
   } catch (err) {
     throw new Error(`could not create workspace worktree at '${options.workspacePath}': ${gitErrorMessage(err)}`);
   }
-  excludeScratchDirectory(options.workspacePath);
 }
 
 /**
@@ -147,10 +112,17 @@ export function reuseWorkspace(workspacePath: string): void {
  * holding worktree's path, since git's own error already does — if the
  * branch is checked out elsewhere in the meantime, rather than proceeding
  * detached.
+ *
+ * KTD-6/KTD-7: routed through the shared pinned helper — a `post-checkout`
+ * hook the workspace's tracked content supplies must not fire on this
+ * checkout from the unsandboxed engine process, and the admin dir it runs
+ * against is resolved from the consumer repo, never from the workspace's own
+ * (agent-writable) gitlink.
  */
-export function reattachToRunBranch(workspacePath: string, runBranch: string): void {
+export function reattachToRunBranch(consumerRepoPath: string, workspacePath: string, runBranch: string): void {
   try {
-    execFileSync("git", ["checkout", runBranch], { cwd: workspacePath, encoding: "utf8", stdio: GIT_STDIO });
+    const target = resolveWorkspaceGitTarget(consumerRepoPath, workspacePath);
+    runWorkspaceGit(target, ["checkout", runBranch]);
   } catch (err) {
     throw new Error(`could not reattach workspace to run branch '${runBranch}': ${gitErrorMessage(err)}`);
   }
@@ -162,6 +134,12 @@ export function reattachToRunBranch(workspacePath: string, runBranch: string): v
  * for inspection, but with HEAD detached — while a worktree holds a branch,
  * git refuses to check that branch out or delete it elsewhere, which would
  * otherwise pin the very branch the operator most wants to pick up.
+ *
+ * The detach checkout (the non-converged path) runs through the shared
+ * pinned helper (KTD-6) for the same reason `reattachToRunBranch` does — a
+ * `post-checkout` hook must not fire from this process. `worktree remove` is
+ * run from the consumer repo's own checkout against its own trusted admin
+ * state, not against the workspace, so it stays a plain call.
  */
 export function finalizeWorkspace(options: { consumerRepoPath: string; workspacePath: string; converged: boolean }): void {
   if (options.converged) {
@@ -172,5 +150,6 @@ export function finalizeWorkspace(options: { consumerRepoPath: string; workspace
     });
     return;
   }
-  execFileSync("git", ["checkout", "--detach", "HEAD"], { cwd: options.workspacePath, encoding: "utf8", stdio: GIT_STDIO });
+  const target = resolveWorkspaceGitTarget(options.consumerRepoPath, options.workspacePath);
+  runWorkspaceGit(target, ["checkout", "--detach", "HEAD"]);
 }

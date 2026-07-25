@@ -502,21 +502,30 @@ describe("integration/terminal-status: the terminal write is decided by the loop
     execFileSync("git", ["worktree", "unlock", workspacePath], { cwd }); // let afterEach's rmSync succeed
   }, 15_000);
 
-  it("Covers R11: a run whose teardown commit throws (a real git signing failure) still records failed, with the git error in its trace, and mints no second teardown commit", async () => {
+  it("Covers R11: a run whose teardown commit throws (a real git failure) still records failed, with the git error in its trace, and mints no second teardown commit", async () => {
     const topologyPath = writeTopology(cwd, singleWriteTopology());
-
-    // The consumer repo's config is shared by every linked worktree
-    // (workspaces included) unless `extensions.worktreeConfig` is set — so
-    // this forces every `git commit` inside the run's workspace to fail
-    // signing for real, with no mock of git itself. Set only after
-    // `writeTopology` above has made its own (unsigned) commit.
-    execFileSync("git", ["config", "commit.gpgsign", "true"], { cwd });
-    execFileSync("git", ["config", "gpg.format", "openpgp"], { cwd });
-    execFileSync("git", ["config", "gpg.program", "/no/such/gpg-binary-graph-bro-test"], { cwd });
 
     const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv(FAKE_CLAUDE_WRITE_ERROR) });
     const runId = start.stdout.trim();
     expect(runId).not.toBe("");
+
+    // U3/KTD-6 pins `commit.gpgsign=false` on every engine git call, which is
+    // exactly the class of failure this test used to force (a real signing
+    // failure) — that gap is now closed, so it can no longer stand in for "a
+    // real git failure" here. A stale `index.lock` in the workspace's real
+    // admin dir is a failure U3's helper does *not* neutralize (nothing
+    // about a lock file is repo-supplied execution or signing config), and
+    // it depends on no operator identity/global config the way an unset
+    // user.name would. `singleWriteTopology` has no bounded node, so the
+    // teardown commit is the only commit this run ever attempts — planting
+    // the lock right after workspace creation guarantees it's still there
+    // when that one commit runs.
+    const workspacePath = workspacePathForRun(runId, workspaces);
+    await waitFor(() => existsSync(workspacePath), 5000);
+    const gitCommonDir = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
+    const gitCommonDirAbs = gitCommonDir.startsWith("/") ? gitCommonDir : join(cwd, gitCommonDir);
+    const adminDir = join(gitCommonDirAbs, "worktrees", runId);
+    writeFileSync(join(adminDir, "index.lock"), "");
 
     await waitForRunStatus(home, runId, "failed", 10_000);
 
@@ -526,18 +535,19 @@ describe("integration/terminal-status: the terminal write is decided by the loop
     const commitErrors = events.filter(
       (e) =>
         (e.payload as { type?: string } | undefined)?.type === "run_error" &&
-        /gpg|sign/i.test(String((e.payload as { error?: string } | undefined)?.error)),
+        /index\.lock/i.test(String((e.payload as { error?: string } | undefined)?.error)),
     );
     // Exactly one — the old bug's catch path minted a *second* teardown
     // commit attempt (and a second trace event) on top of the first.
     expect(commitErrors).toHaveLength(1);
+
+    rmSync(join(adminDir, "index.lock"), { force: true }); // let afterEach's rmSync succeed
 
     // Disposal still ran, isolated from the commit failure above: a failed
     // run's workspace is retained (KTD-9), HEAD left detached so its branch
     // stays checkable out elsewhere — not abandoned mid-teardown. The status
     // write above precedes disposal (R11/KTD-12), so this is only eventually
     // true, not atomic with `waitForRunStatus` resolving.
-    const workspacePath = workspacePathForRun(runId, workspaces);
     expect(existsSync(workspacePath)).toBe(true);
     await waitFor(() => symbolicRefOrEmpty(workspacePath) === "", 5000); // detached, per KTD-9's halted-run branch
   }, 15_000);

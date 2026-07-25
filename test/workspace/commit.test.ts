@@ -34,27 +34,37 @@ function partialAttemptRefs(cwd: string, runId: string): { refname: string; sha:
   });
 }
 
-/** A throwaway workspace-shaped repo — mirrors what `createWorkspace` hands the runtime. */
-function workspaceRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "graph-bro-commit-workspace-"));
-  git(dir, ["init", "-q"]);
-  git(dir, ["config", "user.email", "test@example.com"]);
-  git(dir, ["config", "user.name", "test"]);
-  git(dir, ["config", "commit.gpgsign", "false"]);
-  writeFileSync(join(dir, "README.md"), "hello\n");
-  git(dir, ["add", "-A"]);
-  git(dir, ["commit", "-q", "-m", "init"]);
-  return dir;
+/**
+ * A throwaway consumer + linked-worktree pair — mirrors what `createWorkspace`
+ * hands the runtime. KTD-7's resolution reads the consumer's own worktree
+ * registry, so (unlike the pre-U3 suite) every test needs a *real* linked
+ * worktree, not a standalone repo standing in for one.
+ */
+function workspacePair(): { consumer: string; workspace: string } {
+  const consumer = mkdtempSync(join(tmpdir(), "graph-bro-commit-consumer-"));
+  git(consumer, ["init", "-q"]);
+  git(consumer, ["config", "user.email", "test@example.com"]);
+  git(consumer, ["config", "user.name", "test"]);
+  git(consumer, ["config", "commit.gpgsign", "false"]);
+  writeFileSync(join(consumer, "README.md"), "hello\n");
+  git(consumer, ["add", "-A"]);
+  git(consumer, ["commit", "-q", "-m", "init"]);
+
+  const workspace = join(mkdtempSync(join(tmpdir(), "graph-bro-commit-workspace-root-")), "ws");
+  git(consumer, ["worktree", "add", "-q", "-b", "graph-bro/run-commit-test", workspace]);
+  return { consumer, workspace };
 }
 
 describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
+  let consumer: string;
   let workspace: string;
 
   beforeEach(() => {
-    workspace = workspaceRepo();
+    ({ consumer, workspace } = workspacePair());
   });
 
   afterEach(() => {
+    rmSync(consumer, { recursive: true, force: true });
     rmSync(workspace, { recursive: true, force: true });
   });
 
@@ -62,7 +72,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     const before = commitCount(workspace);
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(false);
     expect(result.head).toBe(priorHead);
@@ -79,7 +89,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
       git(workspace, ["commit", "-q", "-m", `agent's own commit ${i}`]);
     }
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     expect(commitCount(workspace)).toBe(before + 1); // three folded into one
@@ -92,7 +102,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     const before = commitCount(workspace);
     writeFileSync(join(workspace, "dirty.txt"), "left uncommitted\n");
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     expect(commitCount(workspace)).toBe(before + 1);
@@ -108,7 +118,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     git(workspace, ["commit", "-q", "-m", "agent's own commit"]);
     writeFileSync(join(workspace, "leftover.txt"), "left dirty\n");
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     expect(commitCount(workspace)).toBe(before + 1);
@@ -120,7 +130,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "partial-work.txt"), "the node failed mid-write\n");
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     // Reachable from the current branch — a failing attempt is not discarded.
@@ -131,7 +141,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "x.txt"), "x\n");
 
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 7, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 7, nodeId: "reviewer" });
 
     const message = git(workspace, ["log", "-1", "--format=%s", result.head]);
     expect(message).toContain("attempt 7");
@@ -143,12 +153,12 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     const before = commitCount(workspace);
 
     writeFileSync(join(workspace, "attempt-1.txt"), "1\n");
-    const first = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const first = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
     expect(first.committed).toBe(true);
     priorHead = first.head;
 
     writeFileSync(join(workspace, "attempt-2.txt"), "2\n");
-    const second = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 2, nodeId: "reviewer" });
+    const second = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 2, nodeId: "reviewer" });
     expect(second.committed).toBe(true);
 
     expect(commitCount(workspace)).toBe(before + 2);
@@ -157,38 +167,35 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     expect(messages[1]).toContain("attempt 1");
   });
 
-  it("Covers R17: a separate consumer repo's own branches and history are untouched — commitAttempt only ever operates on the workspace path it's given", () => {
-    const consumer = mkdtempSync(join(tmpdir(), "graph-bro-commit-consumer-"));
+  it("Covers R17: a separate, unrelated consumer repo's own branches and history are untouched — commitAttempt only ever operates on the workspace it's given", () => {
+    const unrelatedConsumer = mkdtempSync(join(tmpdir(), "graph-bro-commit-unrelated-consumer-"));
     try {
-      git(consumer, ["init", "-q"]);
-      git(consumer, ["config", "user.email", "test@example.com"]);
-      git(consumer, ["config", "user.name", "test"]);
-      git(consumer, ["config", "commit.gpgsign", "false"]);
-      writeFileSync(join(consumer, "README.md"), "consumer\n");
-      git(consumer, ["add", "-A"]);
-      git(consumer, ["commit", "-q", "-m", "init"]);
-      const consumerHeadBefore = git(consumer, ["rev-parse", "HEAD"]).trim();
+      git(unrelatedConsumer, ["init", "-q"]);
+      git(unrelatedConsumer, ["config", "user.email", "test@example.com"]);
+      git(unrelatedConsumer, ["config", "user.name", "test"]);
+      git(unrelatedConsumer, ["config", "commit.gpgsign", "false"]);
+      writeFileSync(join(unrelatedConsumer, "README.md"), "consumer\n");
+      git(unrelatedConsumer, ["add", "-A"]);
+      git(unrelatedConsumer, ["commit", "-q", "-m", "init"]);
+      const unrelatedHeadBefore = git(unrelatedConsumer, ["rev-parse", "HEAD"]).trim();
 
       const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
       writeFileSync(join(workspace, "x.txt"), "x\n");
-      commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+      commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
-      expect(git(consumer, ["rev-parse", "HEAD"]).trim()).toBe(consumerHeadBefore);
+      expect(git(unrelatedConsumer, ["rev-parse", "HEAD"]).trim()).toBe(unrelatedHeadBefore);
     } finally {
-      rmSync(consumer, { recursive: true, force: true });
+      rmSync(unrelatedConsumer, { recursive: true, force: true });
     }
   });
 
-  it("the CLI's scratch directory is not present in any attempt commit", () => {
-    // Mirrors createWorkspace's own exclude (U5) — .claude/ is untracked-ignored.
-    const excludePath = git(workspace, ["rev-parse", "--git-path", "info/exclude"]).trim();
-    writeFileSync(join(workspace, excludePath), "/.claude/\n");
+  it("the CLI's scratch directory is not present in any attempt commit (KTD-6: core.excludesFile is pinned by the helper, not by anything written in the workspace)", () => {
     mkdirSync(join(workspace, ".claude"), { recursive: true });
     writeFileSync(join(workspace, ".claude", "settings.local.json"), "{}\n");
 
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "x.txt"), "x\n");
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     const files = git(workspace, ["show", "--stat", "--format=", result.head]);
@@ -205,10 +212,60 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
 
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "x.txt"), "x\n");
-    const result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("Covers R7: an operator's signing config (commit.gpgsign true, a gpg program that would fail) does not stop the attempt commit, and the commit carries no signature", () => {
+    // Every OTHER scratch repo in this suite sets commit.gpgsign false —
+    // deliberately not done here, so this is the one test that can actually
+    // observe the gap the rest of the suite structurally hides.
+    git(workspace, ["config", "commit.gpgsign", "true"]);
+    git(workspace, ["config", "gpg.format", "ssh"]);
+    git(workspace, ["config", "gpg.ssh.program", "/nonexistent/ssh-keygen-that-does-not-exist"]);
+
+    const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "x.txt"), "x\n");
+
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+
+    expect(result.committed).toBe(true);
+    // %G? is empty for an unsigned commit, "N" for a signed-but-unverifiable
+    // one — either is fine here, but a signature attempt with this program
+    // would have thrown well before this line, per the RED evidence above.
+    const signatureStatus = git(workspace, ["log", "-1", "--format=%G?", result.head]).trim();
+    expect(signatureStatus === "" || signatureStatus === "N").toBe(true);
+    const rawSignature = git(workspace, ["cat-file", "commit", result.head]);
+    expect(rawSignature).not.toContain("gpgsig");
+  });
+
+  it("Covers R6: a filter.evil.clean driver planted via a rewritten gitlink does not run — commitAttempt resolves the real admin dir from the consumer, never the workspace's own (agent-writable) .git", () => {
+    // The agent plants ordinary tracked content directly in the workspace
+    // (fully within its write scope): a .gitattributes routing *.txt through
+    // "evil", and the file it's meant to apply to.
+    writeFileSync(join(workspace, ".gitattributes"), "*.txt filter=evil\n");
+    writeFileSync(join(workspace, "data.txt"), "secret\n");
+
+    // The agent also rewrites the workspace's own gitlink (#6) to point at a
+    // substitute repo it fully controls, and defines the filter driver
+    // there — the only place within the sandbox's write scope where a
+    // filter.*.clean driver could ever be registered.
+    const substituteAdminDir = join(workspace, ".fake-git");
+    mkdirSync(substituteAdminDir, { recursive: true });
+    const filterMarker = join(workspace, "filter-marker.txt");
+    git(substituteAdminDir, ["init", "-q", "--bare"]);
+    execFileSync("git", ["--git-dir", substituteAdminDir, "config", "filter.evil.clean", `sh -c 'echo FILTER_FIRED > ${filterMarker}; cat'`]);
+    writeFileSync(join(workspace, ".git"), "gitdir: .fake-git\n");
+
+    const priorHead = git(consumer, ["rev-parse", "graph-bro/run-commit-test"]).trim();
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+
+    expect(result.committed).toBe(true);
+    expect(existsSync(filterMarker)).toBe(false);
+    // The commit landed on the real run branch, not inside the substitute repo.
+    expect(git(consumer, ["log", "--format=%s", result.head])).toContain("attempt 1");
   });
 
   it("a detached background writer left behind is reported via a quiescence warning rather than silently absorbed", async () => {
@@ -237,7 +294,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
 
     let result: ReturnType<typeof commitAttempt>;
     try {
-      result = commitAttempt({ workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
+      result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
     } finally {
       straggler.kill("SIGKILL");
     }
@@ -249,20 +306,22 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
 });
 
 describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", () => {
+  let consumer: string;
   let workspace: string;
 
   beforeEach(() => {
-    workspace = workspaceRepo();
+    ({ consumer, workspace } = workspacePair());
   });
 
   afterEach(() => {
+    rmSync(consumer, { recursive: true, force: true });
     rmSync(workspace, { recursive: true, force: true });
   });
 
   it("is a no-op when the workspace is already clean", () => {
     const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
 
-    const result = preserveInterruptedAttempt(workspace, "run-x", headBefore);
+    const result = preserveInterruptedAttempt(consumer, workspace, "run-x", headBefore);
 
     expect(result.preserved).toBe(false);
     expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore);
@@ -274,7 +333,7 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     writeFileSync(join(workspace, "README.md"), "mid-edit\n"); // tracked file, modified
     writeFileSync(join(workspace, "new-file.txt"), "untracked\n"); // never committed anywhere
 
-    const result = preserveInterruptedAttempt(workspace, "run-x", headBefore);
+    const result = preserveInterruptedAttempt(consumer, workspace, "run-x", headBefore);
 
     expect(result.preserved).toBe(true);
     expect(result.sha).toBeTruthy();
@@ -303,7 +362,7 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     git(workspace, ["add", "-A"]);
     git(workspace, ["commit", "-q", "-m", "agent's own commit before the kill"]);
 
-    const result = preserveInterruptedAttempt(workspace, "run-y", headBefore);
+    const result = preserveInterruptedAttempt(consumer, workspace, "run-y", headBefore);
 
     expect(result.preserved).toBe(true);
     expect(git(workspace, ["show", `${result.sha}:agent-commit.txt`])).toBe("committed mid-attempt\n");
@@ -314,7 +373,7 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
   it("Covers R16/KTD-13: two kill-and-resume cycles of one run leave two independently reachable preserved commits, both enumerable under the namespace", () => {
     const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "cycle-one.txt"), "first interrupted attempt\n");
-    const first = preserveInterruptedAttempt(workspace, "run-z", headBefore);
+    const first = preserveInterruptedAttempt(consumer, workspace, "run-z", headBefore);
     expect(first.preserved).toBe(true);
 
     // Second kill-and-resume cycle of the *same* run — a run-id-keyed ref
@@ -322,7 +381,7 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     // outside refs/heads/, git keeps no reflog and the displaced commit
     // would be immediately gc-eligible.
     writeFileSync(join(workspace, "cycle-two.txt"), "second interrupted attempt\n");
-    const second = preserveInterruptedAttempt(workspace, "run-z", headBefore);
+    const second = preserveInterruptedAttempt(consumer, workspace, "run-z", headBefore);
     expect(second.preserved).toBe(true);
 
     const refs = partialAttemptRefs(workspace, "run-z");
@@ -365,7 +424,7 @@ describe("workspace/lifecycle: reattachToRunBranch (U8, KTD-9, real git)", () =>
 
     expect(symbolicRefOrEmpty(workspace)).toBe(""); // detached: no symbolic ref
 
-    reattachToRunBranch(workspace, runBranch);
+    reattachToRunBranch(consumer, workspace, runBranch);
 
     expect(symbolicRefOrEmpty(workspace)).toBe(`refs/heads/${runBranch}`);
   });
@@ -376,11 +435,30 @@ describe("workspace/lifecycle: reattachToRunBranch (U8, KTD-9, real git)", () =>
     const elsewhere = join(mkdtempSync(join(tmpdir(), "graph-bro-reattach-elsewhere-")), "checkout");
     execFileSync("git", ["worktree", "add", elsewhere, runBranch], { cwd: consumer, encoding: "utf8" });
     try {
-      expect(() => reattachToRunBranch(workspace, runBranch)).toThrow(new RegExp(runBranch.replace(/\//g, "\\/")));
+      expect(() => reattachToRunBranch(consumer, workspace, runBranch)).toThrow(new RegExp(runBranch.replace(/\//g, "\\/")));
       // Still detached — never left in a half-attached state.
       expect(symbolicRefOrEmpty(workspace)).toBe("");
     } finally {
       rmSync(elsewhere, { recursive: true, force: true });
     }
+  });
+
+  it("Covers KTD-7: a workspace whose .git gitlink has been replaced still resolves the real admin dir via the consumer, so reattach lands on the true worktree rather than erroring against a substitute repo", () => {
+    const substituteAdminDir = join(workspace, ".fake-git");
+    mkdirSync(substituteAdminDir, { recursive: true });
+    execFileSync("git", ["init", "-q", "--bare", substituteAdminDir]);
+    git(workspace, ["checkout", "--detach", "HEAD"]);
+    writeFileSync(join(workspace, ".git"), "gitdir: .fake-git\n");
+
+    reattachToRunBranch(consumer, workspace, runBranch);
+
+    // Resolved and re-attached against the REAL admin dir — --git-dir/--work-tree
+    // pinned there directly, so this must be read the same way, not through
+    // the now-rewritten (and thus untrustworthy) workspace .git file.
+    const gitCommonDir = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd: consumer, encoding: "utf8" }).trim();
+    const gitCommonDirAbs = gitCommonDir.startsWith("/") ? gitCommonDir : join(consumer, gitCommonDir);
+    const adminDir = join(gitCommonDirAbs, "worktrees", "ws");
+    const head = execFileSync("git", ["--git-dir", adminDir, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).trim();
+    expect(head).toBe(`refs/heads/${runBranch}`);
   });
 });

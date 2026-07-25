@@ -144,6 +144,7 @@ interface WorkspaceHeadState {
  * lives entirely on the runtime side of that seam.
  */
 function withAttemptCommit(
+  consumerRepoPath: string,
   workspacePath: string,
   nodeId: string,
   attemptCounts: Map<string, number>,
@@ -157,7 +158,7 @@ function withAttemptCommit(
     const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
     attemptCounts.set(nodeId, attemptNumber);
     attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
-    const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId });
+    const result = commitAttempt({ consumerRepoPath, workspacePath, priorHead: headState.current, attemptNumber, nodeId });
     headState.current = result.head;
     if (result.quiescenceWarning) {
       appendEvent(db, { runId, node: nodeId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
@@ -176,6 +177,7 @@ function withAttemptCommit(
  * already clean (a read-only-only run, or a hook that already just fired).
  */
 function commitFinalAttempt(
+  consumerRepoPath: string,
   workspacePath: string,
   attemptCounts: Map<string, number>,
   headState: WorkspaceHeadState,
@@ -183,7 +185,7 @@ function commitFinalAttempt(
   runId: string,
 ): void {
   const attemptNumber = attemptCounts.size > 0 ? Math.max(...attemptCounts.values()) : 1;
-  const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId: "run-teardown" });
+  const result = commitAttempt({ consumerRepoPath, workspacePath, priorHead: headState.current, attemptNumber, nodeId: "run-teardown" });
   headState.current = result.head;
   if (result.quiescenceWarning) {
     appendEvent(db, { runId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
@@ -310,8 +312,8 @@ async function main(): Promise<void> {
       // onto the detached HEAD instead of the run branch. Then preserve
       // whatever a kill left dirty mid-attempt (F3/AE9) and hard-reset to
       // the last actually committed attempt before re-entering.
-      reattachToRunBranch(workspacePath, runBranch);
-      preserveInterruptedAttempt(workspacePath, runId, baseRefSha);
+      reattachToRunBranch(consumerRepoPath, workspacePath, runBranch);
+      preserveInterruptedAttempt(consumerRepoPath, workspacePath, runId, baseRefSha);
     }
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
@@ -384,7 +386,7 @@ async function main(): Promise<void> {
   // commits — starting at wherever the workspace already is, whether that's
   // the creation commit (`start`) or wherever a crashed prior process left
   // it (`resume`, no special-casing needed since git already reflects it).
-  const headState = { current: readHead(workspacePath) };
+  const headState = { current: readHead(consumerRepoPath, workspacePath) };
   const commitAttemptCounts = new Map<string, number>(Object.entries(resumed?.attempts ?? {}));
   // U9: seeded from the same continued counts on resume, so the trace's
   // attempt attribution picks up where a crashed run's left off rather than
@@ -405,7 +407,7 @@ async function main(): Promise<void> {
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
     let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
     if (attemptBounds[nodeId] !== undefined) {
-      wrapped = withAttemptCommit(workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
+      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
     }
     nodeFns[nodeId] = withTracing(db, runId, nodeId, attemptState, wrapped);
   }
@@ -504,7 +506,7 @@ async function main(): Promise<void> {
     // catch branch, and a second throw there left the run's status unwritten
     // forever.
     try {
-      commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
+      commitFinalAttempt(consumerRepoPath, workspacePath, commitAttemptCounts, headState, db, runId);
     } catch (err) {
       appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
     }

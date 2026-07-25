@@ -10,6 +10,7 @@ import {
   runBranchForRun,
   workspacePathForRun,
 } from "../../src/workspace/lifecycle.js";
+import { resolveWorkspaceGitTarget, runWorkspaceGit } from "../../src/workspace/commit.js";
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -142,7 +143,13 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     expect(worktreeList).toContain(workspacePath);
   });
 
-  it("the CLI's own scratch directory (.claude/) does not appear in the workspace's git status", () => {
+  it("the CLI's own scratch directory (.claude/) does not appear in the workspace's git status, as seen through the engine's own pinned git view", () => {
+    // KTD-6/U5 (corrected): the exclusion is `-c core.excludesFile=<a
+    // graph-bro-owned file>` on every engine invocation, not anything written
+    // in the workspace or the consumer — so this is checked through
+    // `runWorkspaceGit`, the same path `commitAttempt` uses, not a raw `git`
+    // call (which would consult neither the workspace's real config nor this
+    // override, and correctly show `.claude/` as untracked).
     const runId = "run-scratch-exclude";
     const baseRefSha = resolveBaseRef(consumer);
     const workspacePath = workspacePathForRun(runId, workspacesRoot);
@@ -151,7 +158,8 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     mkdirSync(join(workspacePath, ".claude"), { recursive: true });
     writeFileSync(join(workspacePath, ".claude", "settings.local.json"), "{}\n");
 
-    expect(git(workspacePath, ["status", "--porcelain"])).toBe("");
+    const target = resolveWorkspaceGitTarget(consumer, workspacePath);
+    expect(runWorkspaceGit(target, ["status", "--porcelain"])).toBe("");
   });
 
   it("Covers R10: creating a workspace never touches the consumer's own '.git/info/exclude', even when that file did not exist beforehand", () => {
@@ -166,7 +174,7 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     expect(existsSync(consumerExcludePath)).toBe(false); // must not be created either
   });
 
-  it("Covers R10: a second run against the same consumer repo does not accumulate duplicate lines in the workspace's own exclude file", () => {
+  it("Covers R10: a second run against the same consumer repo also has its .claude/ hidden — the excludes override is shared and static, not per-workspace, so there is nothing to accumulate", () => {
     const runIdA = "run-exclude-dupe-a";
     const runIdB = "run-exclude-dupe-b";
     const baseRefSha = resolveBaseRef(consumer);
@@ -175,10 +183,15 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath: workspaceA, runBranch: runBranchForRun(runIdA) });
     createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath: workspaceB, runBranch: runBranchForRun(runIdB) });
 
-    const gitDirA = git(workspaceA, ["rev-parse", "--git-dir"]).trim();
-    const resolvedA = join(gitDirA.startsWith("/") ? gitDirA : join(workspaceA, gitDirA), "info", "exclude");
-    const lines = readFileSync(resolvedA, "utf8").split("\n").filter((l) => l.trim() === "/.claude/");
-    expect(lines).toHaveLength(1);
+    mkdirSync(join(workspaceA, ".claude"), { recursive: true });
+    writeFileSync(join(workspaceA, ".claude", "settings.local.json"), "{}\n");
+    mkdirSync(join(workspaceB, ".claude"), { recursive: true });
+    writeFileSync(join(workspaceB, ".claude", "settings.local.json"), "{}\n");
+
+    const targetA = resolveWorkspaceGitTarget(consumer, workspaceA);
+    const targetB = resolveWorkspaceGitTarget(consumer, workspaceB);
+    expect(runWorkspaceGit(targetA, ["status", "--porcelain"])).toBe("");
+    expect(runWorkspaceGit(targetB, ["status", "--porcelain"])).toBe("");
   });
 
   it("a converged run's worktree is removed and its branch survives, readable from the consumer", () => {
@@ -208,5 +221,33 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     // check out elsewhere — proven by actually doing so from a second worktree.
     const secondWorktree = join(workspacesRoot, "elsewhere");
     expect(() => git(consumer, ["worktree", "add", secondWorktree, runBranch])).not.toThrow();
+  });
+
+  it("Covers R6: a post-checkout hook planted via a rewritten gitlink does not fire when finalizeWorkspace detaches — the real admin dir is resolved from the consumer, never from the workspace's own (agent-writable) .git", () => {
+    const runId = "run-hostile-detach";
+    const baseRefSha = resolveBaseRef(consumer);
+    const workspacePath = workspacePathForRun(runId, workspacesRoot);
+    const runBranch = runBranchForRun(runId);
+    createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath, runBranch });
+
+    // The agent rewrites the gitlink (#6) to a substitute admin dir it fully
+    // controls, and plants a hook there — the only place within the sandbox's
+    // write scope a hook could ever be registered against the workspace.
+    const substituteAdminDir = join(workspacePath, ".fake-git");
+    mkdirSync(join(substituteAdminDir, "hooks"), { recursive: true });
+    const hookMarker = join(workspacePath, "hook-fired.txt");
+    writeFileSync(join(substituteAdminDir, "hooks", "post-checkout"), `#!/bin/sh\necho fired > "${hookMarker}"\n`);
+    execFileSync("chmod", ["+x", join(substituteAdminDir, "hooks", "post-checkout")]);
+    writeFileSync(join(workspacePath, ".git"), "gitdir: .fake-git\n");
+
+    finalizeWorkspace({ consumerRepoPath: consumer, workspacePath, converged: false });
+
+    expect(existsSync(hookMarker)).toBe(false);
+    // The detach landed on the real admin dir, not the substitute — proven by
+    // reading HEAD's symbolic-ness back from the real worktree registration.
+    const gitCommonDir = git(consumer, ["rev-parse", "--git-common-dir"]).trim();
+    const gitCommonDirAbs = gitCommonDir.startsWith("/") ? gitCommonDir : join(consumer, gitCommonDir);
+    const adminDir = join(gitCommonDirAbs, "worktrees", runId);
+    expect(() => execFileSync("git", ["--git-dir", adminDir, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" })).toThrow(); // detached: no symbolic ref
   });
 });
