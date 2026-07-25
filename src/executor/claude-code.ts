@@ -1,8 +1,10 @@
 import readline from "node:readline";
+import { realpathSync } from "node:fs";
 import type { Executor, NodeRegistry, RunOptions, RunResult, TokenUsage } from "./executor.js";
 import { spawnDetached, killProcessGroup } from "./subprocess.js";
 import { parseEnvelope, type ResultEnvelope } from "./envelope.js";
-import { assertRepoClean, buildReadOnlyArgs } from "./read-only-policy.js";
+import { assertRepoClean, buildReadOnlyArgs, capturePorcelain } from "./read-only-policy.js";
+import { buildWritePolicy } from "./write-policy.js";
 
 /** The literal token a command template substitutes the prompt into, when present. */
 export const PROMPT_TOKEN = "{prompt}";
@@ -63,6 +65,18 @@ export class ClaudeCodeExecutor implements Executor {
     const heartbeatSoftMs = this.opts.heartbeatSoftMs ?? 15_000;
     const pollMs = this.opts.heartbeatPollMs ?? 250;
 
+    // U6/KTD-3: a write node's cwd is canonicalised before it feeds any
+    // scope or deny rule — a symlinked ancestor would otherwise make the
+    // sandbox's cwd-scoped write access silently diverge from what the
+    // synthesized settings declare.
+    const cwd = options.capability === "write" ? realpathSync(options.cwd) : options.cwd;
+    const writePolicy = options.capability === "write" ? buildWritePolicy(cwd, options.networkDomains ?? []) : undefined;
+    // U6/KTD-7: the rescoped read-only backstop compares against a baseline
+    // captured before this node ran, not against emptiness — every node now
+    // shares one workspace, so a prior write node's uncommitted work must
+    // not false-fail a read-only node that touched nothing.
+    const baselinePorcelain = options.capability === "read_only" ? capturePorcelain(cwd) : undefined;
+
     // KTD-9/SDK #60: `--print --verbose --output-format stream-json` first, unconditionally.
     const template = [
       "--print",
@@ -72,6 +86,7 @@ export class ClaudeCodeExecutor implements Executor {
       "--model",
       options.model,
       ...(options.capability === "read_only" ? buildReadOnlyArgs() : []),
+      ...(writePolicy?.argv ?? []),
       // KTD-8: forwards the topology-declared output schema as the backend's
       // structured-output contract; the response's parsed value comes back
       // on the envelope's `structured_output` field (see envelope.ts).
@@ -82,8 +97,9 @@ export class ClaudeCodeExecutor implements Executor {
     const { argv, stdin } = resolvePromptDelivery(template, prompt);
 
     const spawned = spawnDetached(binary, argv, {
-      cwd: options.cwd,
+      cwd,
       stdinMode: stdin === null ? "closed" : "piped",
+      env: writePolicy?.env,
     });
     this.opts.registry?.register({ pid: spawned.pid, pgid: spawned.pgid });
 
@@ -153,7 +169,7 @@ export class ClaudeCodeExecutor implements Executor {
     // KTD-10 backstop: per read-only node completion (not once after a whole fan-out
     // drains), so a permission-policy gap is attributed to the offending node. Folded
     // into the shared `run()` path rather than left for callers to remember.
-    if (options.capability === "read_only") assertRepoClean(options.cwd, options.nodeId);
+    if (options.capability === "read_only") assertRepoClean(cwd, options.nodeId, baselinePorcelain!);
 
     if (terminalEnvelope) {
       return {

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ReadOnlyViolationError, assertRepoClean, buildReadOnlyArgs } from "../../src/executor/read-only-policy.js";
+import { ReadOnlyViolationError, assertRepoClean, buildReadOnlyArgs, capturePorcelain } from "../../src/executor/read-only-policy.js";
 
 describe("executor: read-only-policy", () => {
   it("builds the mutation-denying allowlist with no --dangerously-skip-permissions", () => {
@@ -39,16 +39,25 @@ describe("executor: read-only-policy", () => {
       rmSync(repoDir, { recursive: true, force: true });
     });
 
-    it("passes silently when the cwd is clean", () => {
-      expect(() => assertRepoClean(repoDir, "reader")).not.toThrow();
+    it("passes silently when the cwd is unchanged since the baseline", () => {
+      const baseline = capturePorcelain(repoDir);
+      expect(() => assertRepoClean(repoDir, "reader", baseline)).not.toThrow();
     });
 
-    it("raises a loud, node-attributed failure when the cwd is left dirty", () => {
+    it("passes when the baseline was already dirty and nothing changed since (U6's per-node rescoping)", () => {
+      writeFileSync(join(repoDir, "already-dirty.txt"), "pre-existing\n");
+      const baseline = capturePorcelain(repoDir);
+
+      expect(() => assertRepoClean(repoDir, "reader", baseline)).not.toThrow();
+    });
+
+    it("raises a loud, node-attributed failure when the cwd changes after the baseline", () => {
+      const baseline = capturePorcelain(repoDir);
       writeFileSync(join(repoDir, "mutated.txt"), "oops\n");
 
-      expect(() => assertRepoClean(repoDir, "reader")).toThrow(ReadOnlyViolationError);
+      expect(() => assertRepoClean(repoDir, "reader", baseline)).toThrow(ReadOnlyViolationError);
       try {
-        assertRepoClean(repoDir, "reader");
+        assertRepoClean(repoDir, "reader", baseline);
         expect.unreachable();
       } catch (err) {
         expect(err).toBeInstanceOf(ReadOnlyViolationError);

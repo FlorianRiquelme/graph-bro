@@ -24,6 +24,8 @@ import { ClaudeCodeExecutor } from "../executor/claude-code.js";
 import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 import { createWorkspace, finalizeWorkspace, reuseWorkspace } from "../workspace/lifecycle.js";
+import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
+import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -93,6 +95,15 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
   };
 }
 
+/** Wraps a node fn with the R12/R16/R17 consumer-checkout backstop (KTD-11): compares against the run-start baseline after every node, naming the offending node on divergence. */
+function withConsumerBaseline(consumerRepoPath: string, baseline: ConsumerBaseline, nodeId: string, fn: NodeFn): NodeFn {
+  return async (state) => {
+    const update = await fn(state);
+    assertConsumerBaseline(consumerRepoPath, baseline, nodeId);
+    return update;
+  };
+}
+
 /**
  * Builds one untraced `NodeFn` per compiled node: `agent` via
  * `makeAgentNodeFn` (against the narrow `Executor` seam — a stub in tests,
@@ -113,6 +124,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor, cwd
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,
             prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
+            networkDomains: node.network_domains,
           })
         : (): EngineUpdate => ({ ...node.update });
   }
@@ -158,34 +170,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // R13/KTD-1: every node in the run executes inside this one isolated
-  // worktree — never the consumer's own checkout, which `process.cwd()`
-  // would otherwise be (the engine inherits the CLI's cwd on spawn).
-  const consumerRepoPath = process.cwd();
-  try {
-    if (mode === "start") {
-      createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
-    } else {
-      reuseWorkspace(workspacePath);
-    }
-  } catch (err) {
-    const db = openDb();
-    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
-    updateRunStatus(db, runId, "failed");
-    db.close();
-    process.exitCode = 1;
-    return;
-  }
-
   const db = openDb();
-  const registry = new InMemoryNodeRegistry();
-  installKillCascade(registry);
-  // GRAPH_BRO_CLAUDE_BINARY: test-only override so integration tests can point at a
-  // scripted fake CLI instead of a real `claude` binary; unset in production.
-  const executor = new ClaudeCodeExecutor({
-    registry,
-    binary: process.env.GRAPH_BRO_CLAUDE_BINARY || undefined,
-  });
 
   let compiled: CompiledTopology;
   try {
@@ -205,6 +190,53 @@ async function main(): Promise<void> {
     return;
   }
 
+  // U6/KTD-3: refuse to start a write run where the OS boundary is
+  // unavailable rather than running unconfined — checked before a workspace
+  // ever gets created. A read-only-only topology needs no sandbox.
+  const hasWriteNode = compiled.nodes.some((node) => node.kind === "agent" && !node.read_only);
+  if (hasWriteNode) {
+    const boundary = checkOsBoundary(process.env.GRAPH_BRO_TEST_PLATFORM as NodeJS.Platform | undefined);
+    if (!boundary.available) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: boundary.reason } });
+      updateRunStatus(db, runId, "failed");
+      db.close();
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  // R13/KTD-1: every node in the run executes inside this one isolated
+  // worktree — never the consumer's own checkout, which `process.cwd()`
+  // would otherwise be (the engine inherits the CLI's cwd on spawn).
+  const consumerRepoPath = process.cwd();
+  try {
+    if (mode === "start") {
+      createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
+    } else {
+      reuseWorkspace(workspacePath);
+    }
+  } catch (err) {
+    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    updateRunStatus(db, runId, "failed");
+    db.close();
+    process.exitCode = 1;
+    return;
+  }
+
+  // U6/KTD-11: the R12/R16/R17 backstop's baseline, captured once at run
+  // start — a fresh `reuseWorkspace` on `resume` re-baselines too, which is
+  // correct: only divergence introduced *this process's* nodes should trip it.
+  const consumerBaseline = captureConsumerBaseline(consumerRepoPath);
+
+  const registry = new InMemoryNodeRegistry();
+  installKillCascade(registry);
+  // GRAPH_BRO_CLAUDE_BINARY: test-only override so integration tests can point at a
+  // scripted fake CLI instead of a real `claude` binary; unset in production.
+  const executor = new ClaudeCodeExecutor({
+    registry,
+    binary: process.env.GRAPH_BRO_CLAUDE_BINARY || undefined,
+  });
+
   // R6: nodeId -> declared max_attempts, for every agent node bounding a loop it's re-entered by.
   const attemptBounds: Record<string, number> = {};
   for (const node of compiled.nodes) {
@@ -221,7 +253,9 @@ async function main(): Promise<void> {
   };
   const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
   const nodeFns: Record<string, NodeFn> = {};
-  for (const [nodeId, fn] of Object.entries(rawNodeFns)) nodeFns[nodeId] = withTracing(db, runId, nodeId, fn);
+  for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
+    nodeFns[nodeId] = withTracing(db, runId, nodeId, withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn));
+  }
 
   let runLoopOptions: RunLoopOptions;
   if (mode === "start") {

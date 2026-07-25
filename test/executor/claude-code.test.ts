@@ -190,16 +190,32 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
   });
 
   it("Covers R7 backstop (KTD-10): run() raises a loud, node-attributed failure when a read-only node's completion leaves the cwd dirty", async () => {
+    // "mutate-cwd": simulates an allowlist gap where something slips through
+    // and mutates cwd *during* the node's run — the baseline is captured
+    // before this process even spawns, so a pre-existing dirty cwd (U6's
+    // rescoped per-node baseline) would not itself trip this.
+    process.env.FAKE_CLAUDE_MODE = "mutate-cwd";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+
+    await expect(
+      executor.run("ping", { cwd, nodeId: "reader-node", capability: "read_only", model: "claude-haiku-4-5", timeout: 5000 }),
+    ).rejects.toThrowError(/reader-node/);
+  });
+
+  it("U6: a read-only node activating over a prior write node's uncommitted changes passes its backstop", async () => {
     const { writeFileSync } = await import("node:fs");
-    // Simulate an allowlist gap: something slipped through and mutated the cwd anyway.
-    writeFileSync(join(cwd, "mutated-by-slipped-bash.txt"), "oops\n");
+    const { join: joinPath } = await import("node:path");
+    // Stands in for an earlier write node's uncommitted work already sitting
+    // in the shared workspace — the per-node baseline is captured *after*
+    // this, so it must not fail a read-only node that changed nothing.
+    writeFileSync(joinPath(cwd, "left-by-a-write-node.txt"), "uncommitted work\n");
 
     process.env.FAKE_CLAUDE_MODE = "success";
     const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
 
     await expect(
       executor.run("ping", { cwd, nodeId: "reader-node", capability: "read_only", model: "claude-haiku-4-5", timeout: 5000 }),
-    ).rejects.toThrowError(/reader-node/);
+    ).resolves.toMatchObject({ isError: false });
   });
 
   it("Covers AE2/KTD-2: forwards --json-schema on the invocation and surfaces the parsed structured_output, nested object intact", async () => {

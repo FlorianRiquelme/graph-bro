@@ -117,6 +117,8 @@ export interface AgentNodeConfig {
   prompt: string | ((state: EngineState) => string);
   /** KTD-8: when declared, the response is validated against it and the *parsed* value — not raw text — lands at `outputKey` (R2). */
   outputSchema?: JsonSchema;
+  /** KTD-3 layer 4: topology-declared domains this node's Bash-tool network egress may reach (R11). Ignored for a read-only node. */
+  networkDomains?: string[];
 }
 
 export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): NodeFn {
@@ -129,6 +131,7 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
       model: config.model,
       timeout: config.timeout,
       outputSchema: config.outputSchema,
+      networkDomains: config.networkDomains,
     });
     if (result.isError) {
       throw new Error(`agent node '${config.nodeId}' failed: ${result.text}`);

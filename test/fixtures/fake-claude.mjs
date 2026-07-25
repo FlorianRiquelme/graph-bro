@@ -4,6 +4,8 @@
 // Behavior is selected via FAKE_CLAUDE_MODE, not argv, so it tolerates
 // whatever flags ClaudeCodeExecutor builds around it.
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const mode = process.env.FAKE_CLAUDE_MODE ?? "success";
 
@@ -67,6 +69,26 @@ async function main() {
         duration_ms: 30,
         total_cost_usd: 0.002,
         usage: { input_tokens: 12, output_tokens: 6 },
+      });
+      process.exit(0);
+      break;
+    }
+    case "mutate-cwd": {
+      // Simulates an allowlist gap: something slips through and mutates cwd
+      // during the node's run (U6's rescoped read-only backstop must catch
+      // this even though the baseline is captured before this process spawns).
+      emit({ type: "system", subtype: "init" });
+      writeFileSync(join(process.cwd(), "mutated-by-slipped-bash.txt"), "oops\n");
+      await sleep(15);
+      emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "pong",
+        num_turns: 1,
+        duration_ms: 30,
+        total_cost_usd: 0.001,
+        usage: { input_tokens: 10, output_tokens: 5 },
       });
       process.exit(0);
       break;

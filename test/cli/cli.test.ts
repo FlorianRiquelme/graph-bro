@@ -371,6 +371,23 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       expect(refusal.status).not.toBe(0);
       expect(refusal.stderr).toMatch(/still owned by live process/);
 
+      // Wait for the node to actually be in flight (its pre-dispatch checkpoint
+      // written) before killing — otherwise this races the engine's own
+      // start-up work (workspace creation, U6's consumer-baseline capture)
+      // against the kill, and a crash landing before the *first* checkpoint
+      // ever exists resumes with an empty frontier instead of a genuine
+      // mid-attempt crash (the scenario this test simulates). Mirrors
+      // kill-reaping.test.ts's precedent of synchronizing on the node being
+      // in flight rather than firing the kill on a fixed timing assumption.
+      await waitFor(() => {
+        const db = openDb({ baseDir: home });
+        try {
+          return db.prepare("select 1 from checkpoints where run_id = ?").get(runId) !== undefined;
+        } finally {
+          db.close();
+        }
+      }, 3000);
+
       // Simulate a hard crash (bypasses graceful shutdown/kill cascade entirely).
       process.kill(ownerPid, "SIGKILL");
       await waitFor(() => !isAlive(ownerPid), 3000);

@@ -28,6 +28,8 @@ export interface RunOptions {
   onEvent?: (event: unknown) => void;
   /** KTD-8: a JSON Schema an agent node declares for its response, forwarded to the backend as a structured-output contract. */
   outputSchema?: Record<string, unknown>;
+  /** KTD-3 layer 4/KTD-12: topology-declared domains a write node's Bash-tool network egress may reach; empty or undefined means none (R11). Ignored for a read-only node. */
+  networkDomains?: string[];
 }
 
 export interface RunResult {
