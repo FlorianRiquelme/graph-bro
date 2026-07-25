@@ -46,9 +46,23 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
   language; there are no conditionals, loops, or computation, only value interpolation with dotted-path
   access.
 - **Interpolation token** — a placeholder in a prompt template addressing a value in the input snapshot
-  by dotted path (same `getPath` semantics as `for_each`). Resolves **single-pass** (a substituted value
-  is never re-scanned) against **trusted** consumer-authored data. A token addressing an absent path
-  **fails loud** (R5); a present `null`/empty value is serialized, not a failure.
+  by dotted path (same `getPath` semantics as `for_each`). The snapshot's values may be
+  consumer-authored, caller-supplied via `--input`, or model-authored (an earlier node's
+  `output_key`); resolution is **single-pass** — a substituted value is never re-scanned for
+  tokens — which guards against re-interpretation, not against the value's content. A token
+  addressing an absent path **fails loud** (R5); a present `null`/empty value is serialized, not
+  a failure. Escapable as `\{{ path }}` (runtime string; authored in a topology JSON file as
+  `\\{{ path }}`) when a prompt needs to emit the literal delimiters as text.
+- **Prompt-token root check** — the check that every interpolation token's **root** state key
+  is one the run can actually produce (a `set` update key, an `output_key`, a fan-out `as`, or
+  an `--input` top-level key). Fatal at `start` before a run id is minted, so a typo'd root surfaces
+  before any node executes rather than mid-run; re-run as the engine boots, since the engine re-reads
+  the topology itself — which closes the `start`-to-spawn edit window and is the only gate `resume` gets
+  (an engine-side miss fails the run with a `run_error` instead of dispatching a node). Roots only:
+  anything deeper is a runtime fact, since per-branch item shape varies branch to branch. _Not:_ a
+  reachability analysis — a key produced anywhere counts everywhere. So a pass means the root is
+  *produced somewhere*, not that it is in scope at the node reading it: a key written only by a later
+  node, by the reading node itself, or on a branch that never fires still fails at activation time.
 - **Resolved prompt** — the concrete instruction a branch actually ran with, after its template's tokens
   were substituted. This — not the template — is what the trace records (R6), so per-branch
   differentiation is observable after the fact.

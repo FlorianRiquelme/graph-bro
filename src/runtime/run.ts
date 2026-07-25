@@ -2,6 +2,7 @@
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { compile, type CompiledTopology } from "../topology/compile.js";
+import { checkPromptTokens } from "../topology/lint.js";
 import {
   runLoop,
   makeAgentNodeFn,
@@ -204,6 +205,23 @@ async function main(): Promise<void> {
       initialBarrierState,
       persistence: { db, runId },
     };
+  }
+
+  // graph-bro#12: the `start`-time gate binds the topology *as the CLI read it*,
+  // and this process re-reads the file itself — so a topology edited in that
+  // window would otherwise execute ungated. Re-checking here also gives `resume`
+  // its only prompt-token gate, since `resume` respawns straight from the
+  // recorded topology path without reading it. Known roots come from the state
+  // the run actually boots with (the `--input` snapshot on `start`, the resumed
+  // checkpoint on `resume`), which is never narrower than what `start` checked
+  // against, so an unedited topology that cleared `start` cannot fail here.
+  const tokenErrors = checkPromptTokens(compiled, Object.keys(runLoopOptions.initialState ?? {}));
+  if (tokenErrors.length > 0) {
+    appendEvent(db, { runId, payload: { type: "run_error", error: tokenErrors.map((error) => error.message).join("; ") } });
+    updateRunStatus(db, runId, "failed");
+    db.close();
+    process.exitCode = 1;
+    return;
   }
 
   try {

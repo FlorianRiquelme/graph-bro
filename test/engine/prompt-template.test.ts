@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderPromptTemplate, UnresolvedPromptTokenError } from "../../src/engine/prompt-template.js";
+import { extractTokenPaths } from "../../src/topology/prompt-tokens.js";
 
 describe("engine: prompt-template (R1/R3/R4/R5)", () => {
   it("resolves a single token against the input snapshot", () => {
@@ -85,5 +86,77 @@ describe("engine: prompt-template (R1/R3/R4/R5)", () => {
 
   it("trims whitespace inside braces before path resolution", () => {
     expect(renderPromptTemplate("{{  item.id  }}", { item: { id: 42 } }, "reader")).toBe("42");
+  });
+
+  describe("escape grammar (graph-bro#8)", () => {
+    it("a backslash-escaped token emits the literal delimiters instead of substituting", () => {
+      expect(renderPromptTemplate("\\{{ item }}", { item: "one" }, "reader")).toBe("{{ item }}");
+    });
+
+    it("an escaped token whose path is absent does not throw — it is text, not a token", () => {
+      expect(renderPromptTemplate("\\{{ missing }}", {}, "reader")).toBe("{{ missing }}");
+    });
+
+    it("preserves inner spacing verbatim when unescaping", () => {
+      expect(renderPromptTemplate("\\{{  spaced.path  }}", {}, "reader")).toBe("{{  spaced.path  }}");
+    });
+
+    it("resolves a real token and unescapes a literal one in the same single pass", () => {
+      const result = renderPromptTemplate("\\{{ item }} is literal, {{ item }} is not", { item: "one" }, "reader");
+      expect(result).toBe("{{ item }} is literal, one is not");
+    });
+
+    it("a bare closing delimiter needs no escape — only the opening one is significant", () => {
+      expect(renderPromptTemplate("closes }} alone", {}, "reader")).toBe("closes }} alone");
+    });
+
+    it("(KTD-6) single-pass: unescaped output is not re-scanned, so it stays literal", () => {
+      expect(renderPromptTemplate("\\{{ a }}", { a: "x" }, "reader")).toBe("{{ a }}");
+    });
+
+    it("pins the escape's one limitation: a literal backslash cannot precede a live token", () => {
+      // `\\{{ a }}` unescapes rather than emitting a backslash then substituting.
+      // Documented in renderPromptTemplate's docstring; no consumer needs it today.
+      expect(renderPromptTemplate("\\\\{{ a }}", { a: "x" }, "reader")).toBe("\\{{ a }}");
+    });
+
+    it("is authorable through a topology JSON file — the doubled backslash the docs teach (graph-bro#8)", () => {
+      // `\{` is not a legal JSON string escape, so the single-backslash runtime
+      // form the docs describe cannot be written directly in a topology JSON
+      // file; the JSON source must double the backslash. This is the layer
+      // that made the documented single-backslash form unauthorable, so it's
+      // exercised as a hand-written JSON string literal rather than through
+      // `JSON.stringify`, which every other fixture in this repo goes through.
+      const topologyJson = String.raw`{"prompt": "emit \\{{ not a token }} verbatim"}`;
+      const parsed = JSON.parse(topologyJson) as { prompt: string };
+      expect(parsed.prompt).toBe("emit \\{{ not a token }} verbatim");
+
+      const rendered = renderPromptTemplate(parsed.prompt, {}, "reader");
+      expect(rendered).toContain("{{ not a token }}");
+      expect(extractTokenPaths(parsed.prompt)).toEqual([]);
+    });
+  });
+
+  describe("extractTokenPaths (graph-bro#7's grammar seam)", () => {
+    it("returns the dotted paths of every live token, in order", () => {
+      expect(extractTokenPaths("{{ a }} then {{ b.c }}")).toEqual(["a", "b.c"]);
+    });
+
+    it("trims whitespace, matching what the renderer resolves", () => {
+      expect(extractTokenPaths("{{  a.b  }}")).toEqual(["a.b"]);
+    });
+
+    it("skips escaped tokens — the lint must not flag literal text", () => {
+      expect(extractTokenPaths("\\{{ literal }} {{ live }}")).toEqual(["live"]);
+    });
+
+    it("returns empty for a template with no tokens", () => {
+      expect(extractTokenPaths("no tokens here")).toEqual([]);
+    });
+
+    it("is repeatable — the shared global pattern carries no lastIndex between calls", () => {
+      expect(extractTokenPaths("{{ a }}")).toEqual(["a"]);
+      expect(extractTokenPaths("{{ a }}")).toEqual(["a"]);
+    });
   });
 });

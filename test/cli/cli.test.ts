@@ -98,6 +98,118 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     expect(result.stderr).toMatch(/not a valid topology/);
   });
 
+  it("start on a topology with a typo'd prompt-token root fails loudly with NO run id (graph-bro#7)", () => {
+    const topologyPath = writeTopology(cwdA, {
+      nodes: [
+        { id: "seed", kind: "set", update: { greeting: "hi" } },
+        { id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "say {{ greting }}", output_key: "out" },
+      ],
+      edges: [
+        { from: "START", to: "seed" },
+        { from: "seed", to: "reader" },
+        { from: "reader", to: "END" },
+      ],
+      max_steps: 10,
+    });
+
+    const result = runCliSync(["start", topologyPath], { cwd: cwdA, env: baseEnv("success") });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout.trim()).toBe(""); // no run id printed, nothing spawned
+    expect(result.stderr).toMatch(/unresolvable prompt tokens/);
+    expect(result.stderr).toMatch(/greting/);
+  });
+
+  it("start accepts a prompt-token root supplied only via --input (graph-bro#7)", () => {
+    const topologyPath = writeTopology(cwdA, {
+      nodes: [
+        { id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "say {{ seeded }}", output_key: "out" },
+      ],
+      edges: [
+        { from: "START", to: "reader" },
+        { from: "reader", to: "END" },
+      ],
+      max_steps: 10,
+    });
+    const inputPath = join(cwdA, "input.json");
+    writeFileSync(inputPath, JSON.stringify({ seeded: "hello" }));
+
+    const result = runCliSync(["start", topologyPath, "--input", inputPath], { cwd: cwdA, env: baseEnv("success") });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toMatch(/[0-9a-f-]{36}/);
+  });
+
+  it("start surfaces compile lint warnings on stderr while still starting the run", () => {
+    // A join whose source is only conditionally reached — lintJoinDesync's case.
+    const topologyPath = writeTopology(cwdA, {
+      nodes: [
+        { id: "router", kind: "set", update: { flag: true } },
+        { id: "guarded", kind: "set", update: { a: 1 } },
+        { id: "other", kind: "set", update: { b: 2 } },
+        { id: "collector", kind: "set", update: { collected: true } },
+      ],
+      edges: [
+        { from: "START", to: "router" },
+        { from: "router", to: "guarded", when: { key: "flag", truthy: true } },
+        { from: "router", to: "other" },
+        { from: ["guarded", "other"], mode: "all", reducer: "merge", into: "joined", to: "collector" },
+        { from: "collector", to: "END" },
+      ],
+      max_steps: 10,
+    });
+
+    const result = runCliSync(["start", topologyPath], { cwd: cwdA, env: baseEnv("success") });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toMatch(/[0-9a-f-]{36}/); // warning is advisory, run still starts
+    expect(result.stderr).toMatch(/warning: join 'collector' requires 'guarded'/);
+  });
+
+  it(
+    "resume re-checks prompt tokens in the engine, failing the run on a topology edited since start (graph-bro#12)",
+    async () => {
+      // `resume` respawns straight from the recorded topology path, so the
+      // `start`-time gate never saw this file. The engine's own re-check is the
+      // only thing standing between an edited topology and an ungated run.
+      const runId = "resume-bad-token-run";
+      const topologyPath = writeTopology(cwdA, {
+        nodes: [
+          { id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "say {{ greting }}", output_key: "out" },
+        ],
+        edges: [
+          { from: "START", to: "reader" },
+          { from: "reader", to: "END" },
+        ],
+        max_steps: 10,
+      });
+      const env = baseEnv("success");
+
+      const db = openDb({ baseDir: home });
+      createRun(db, runId, 999_999, topologyPath); // a dead owner pid, so resume self-heals
+      writeCheckpoint(db, runId, {
+        state: {},
+        frontier: [{ nodeId: "reader", instanceId: "reader" }],
+        barrier: {},
+        step: 0,
+      });
+      db.close();
+
+      const resume = runCliSync(["resume", runId], { cwd: cwdA, env });
+      expect(resume.status).toBe(0); // the run id already exists; the gate is the engine's
+
+      await waitForRunStatus(home, runId, "failed", 5000);
+
+      const tail = runCliSync(["tail", runId], { cwd: cwdB, env });
+      const events = tail.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      const runError = events.find((e) => e.payload.type === "run_error");
+      expect(runError.payload.error).toMatch(/greting/);
+      // The gate fires before any node dispatches.
+      expect(events.some((e) => e.payload.type === "node_start")).toBe(false);
+    },
+    10_000,
+  );
+
   it("resume on a run id that was never started fails loudly with a clear error", () => {
     const result = runCliSync(["resume", "never-started-run-id"], { cwd: cwdA, env: baseEnv("success") });
 

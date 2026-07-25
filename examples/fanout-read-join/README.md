@@ -15,7 +15,11 @@ a `dedup` reducer.
   anything."` — whose **interpolation token** `{{ item }}` resolves against
   each branch's own `as` binding. Each fan-out instance therefore runs a
   distinct **resolved prompt** naming its own item, never mutates anything,
-  and reports back what it found.
+  and reports back what it found. A prompt needing the literal delimiters as
+  text escapes them: in the topology JSON you write `\\{{ not a token }}`
+  (JSON has no `\{` escape, so the backslash must be doubled in the file),
+  which the engine sees as `\{{ not a token }}` and renders as the literal
+  `{{ not a token }}`.
 - `reader -> END` (join edge, `mode: "all"`, `reducer: "dedup"`): waits for
   every fan-out branch, then collapses duplicate outputs into one `results`
   list before the run ends. Since each branch's resolved prompt differs,

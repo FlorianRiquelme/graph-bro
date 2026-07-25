@@ -1,7 +1,6 @@
 import { getPath } from "./state.js";
 import type { EngineState } from "./state.js";
-
-const TOKEN_PATTERN = /\{\{\s*([^}]+?)\s*\}\}/g;
+import { TOKEN_PATTERN } from "../topology/prompt-tokens.js";
 
 /**
  * Fail-loud counterpart to `StateConflictError` (R5, ADR-0006's fail-loud
@@ -35,9 +34,17 @@ function serialize(value: unknown, nodeId: string, path: string): string {
  * resolved value is serialized by type (R4); an unresolvable path throws
  * `UnresolvedPromptTokenError` (R5). Substituted text is never re-scanned by
  * this pass (KTD-6).
+ *
+ * A token may be escaped as `\{{ path }}` to emit the literal delimiters as
+ * text (graph-bro#8); the escape is stripped and the inner spacing preserved
+ * verbatim. One limitation, deliberate: because the escape is not itself
+ * escapable, a literal backslash cannot immediately precede a live token
+ * (`\\{{ a }}` unescapes rather than substituting). No prompt needs that
+ * today, and doubling the grammar to support it would buy nothing.
  */
 export function renderPromptTemplate(template: string, input: EngineState, nodeId: string): string {
-  return template.replace(TOKEN_PATTERN, (_match, path: string) => {
+  return template.replace(TOKEN_PATTERN, (match: string, escape: string | undefined, path: string) => {
+    if (escape) return match.slice(1);
     const value = getPath(input, path);
     return serialize(value, nodeId, path);
   });
