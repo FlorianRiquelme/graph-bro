@@ -323,6 +323,22 @@ async function main(): Promise<void> {
   // correct: only divergence introduced *this process's* nodes should trip it.
   const consumerBaseline = captureConsumerBaseline(consumerRepoPath);
 
+  /**
+   * KTD-12: the one place `main()` ever disposes of the workspace — isolated
+   * so a disposal failure (the worktree locked, checked out elsewhere, or
+   * gone) can only add a `workspace_finalize_error` trace event, never
+   * revisit a status this process already wrote. Every path that fails after
+   * workspace creation calls this exactly once, matching the terminal path's
+   * own disposal below.
+   */
+  function disposeWorkspace(converged: boolean): void {
+    try {
+      finalizeWorkspace({ consumerRepoPath, workspacePath, converged });
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "workspace_finalize_error", error: err instanceof Error ? err.message : String(err) } });
+    }
+  }
+
   const registry = new InMemoryNodeRegistry();
   installKillCascade(registry);
   // GRAPH_BRO_CLAUDE_BINARY: test-only override so integration tests can point at a
@@ -404,51 +420,84 @@ async function main(): Promise<void> {
   if (tokenErrors.length > 0) {
     appendEvent(db, { runId, payload: { type: "run_error", error: tokenErrors.map((error) => error.message).join("; ") } });
     updateRunStatus(db, runId, "failed");
-    db.close();
     process.exitCode = 1;
+    // R12: the workspace was already created (or reattached-to, on resume)
+    // above — nothing in this session ever dispatched a node against it, and
+    // `resume`'s own reuse path already preserved/reset any prior interrupted
+    // attempt before this gate ran, so there is nothing left in the
+    // directory this process can lose. Discarded like a converged run's,
+    // rather than retained: this failure is a fixed, re-editable authoring
+    // error (KTD-12), not partial in-session work worth inspecting, and a
+    // retained-but-pinned worktree would otherwise block the very branch a
+    // resume needs to re-approach after the topology is fixed.
+    disposeWorkspace(true);
+    db.close();
     return;
   }
 
   try {
-    const result = await runLoop(runLoopOptions);
-    // R25: the three stop reasons (converged, bound hit, failed — dead_end
-    // folds into "failed" here since both are unrecoverable) are otherwise
-    // only distinguishable by separately reading the `runs` row's `status`
-    // column — this puts the same distinction directly in the trace, next
-    // to the node events it explains.
-    appendEvent(db, {
-      runId,
-      step: attemptState.current,
-      payload: { type: "run_stopped", status: result.status, error: result.status === "failed" ? result.error?.message : undefined },
-    });
-    // `runLoop` only checkpoints a step's INCOMING frontier before dispatch, so a
-    // "completed" run's very last step (the one that reaches END) is never itself
-    // checkpointed. Persist that true final state here so `graph-bro result` reads it
-    // (only on `completed`: a `failed`/`dead_end` run must keep its real resumable
-    // checkpoint — the still-pending frontier from before the failing step — as the
-    // latest row, so `resume` doesn't lose it).
-    if (result.status === "completed") {
-      writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
+    // R11/KTD-12: `status` is decided exactly once, here — by the loop's own
+    // `LoopResult` on the ordinary path, or by "failed" on the rare path
+    // where `runLoop` itself throws (a genuine bug, not a routed outcome —
+    // `dead_end`/`not_converged`/an agent's own failure all come back as a
+    // `LoopResult`, never a throw). Nothing below this point is allowed to
+    // revisit it.
+    let status: LoopStatus;
+    try {
+      const result = await runLoop(runLoopOptions);
+      status = result.status;
+      // R25: the three stop reasons (converged, bound hit, failed — dead_end
+      // folds into "failed" here since both are unrecoverable) are otherwise
+      // only distinguishable by separately reading the `runs` row's `status`
+      // column — this puts the same distinction directly in the trace, next
+      // to the node events it explains.
+      appendEvent(db, {
+        runId,
+        step: attemptState.current,
+        payload: { type: "run_stopped", status: result.status, error: result.status === "failed" ? result.error?.message : undefined },
+      });
+      // `runLoop` only checkpoints a step's INCOMING frontier before dispatch, so a
+      // "completed" run's very last step (the one that reaches END) is never itself
+      // checkpointed. Persist that true final state here so `graph-bro result` reads it
+      // (only on `completed`: a `failed`/`dead_end` run must keep its real resumable
+      // checkpoint — the still-pending frontier from before the failing step — as the
+      // latest row, so `resume` doesn't lose it).
+      if (result.status === "completed") {
+        writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
+      }
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      status = "failed";
     }
+
     // R21/U7: every terminal path commits whatever attempt is left, even one
     // that never re-activated the bounded node — a no-op via commitAttempt's
-    // own check if the boundary hook already committed it. This runs BEFORE
-    // `updateRunStatus` so a "completed" row is never observable — to the
-    // CLI's `status`/`result`, or to a resuming process — before the commit
-    // it implies has actually landed.
-    commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
-    updateRunStatus(db, runId, result.status);
-    process.exitCode = mapStatusToExitCode(result.status);
+    // own check if the boundary hook already committed it. Isolated (KTD-12):
+    // a failure here (e.g. the workspace can't sign) traces a `run_error`
+    // rather than pre-empting the status write below, and is never retried —
+    // the historical bug re-ran this same call from a second, now-removed
+    // catch branch, and a second throw there left the run's status unwritten
+    // forever.
+    try {
+      commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    }
+
+    // R11: the status write is unconditional from here — decided above by
+    // the loop's own result, and observable (to the CLI's `status`/`result`,
+    // or to a resuming process) only after the attempt commit above has
+    // actually landed.
+    updateRunStatus(db, runId, status);
+    process.exitCode = mapStatusToExitCode(status);
+
     // KTD-9: a converged run needs no directory (the branch is the
     // handback); a halted run (failed/dead_end/not_converged) keeps its
-    // workspace for `resume` and for inspection.
-    finalizeWorkspace({ consumerRepoPath, workspacePath, converged: result.status === "completed" });
-  } catch (err) {
-    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
-    commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
-    updateRunStatus(db, runId, "failed");
-    process.exitCode = 1;
-    finalizeWorkspace({ consumerRepoPath, workspacePath, converged: false });
+    // workspace for `resume` and for inspection. Isolated the same way as
+    // the commit above: a disposal failure (the worktree locked, or checked
+    // out elsewhere) only adds a `workspace_finalize_error` trace event —
+    // never downgrades the status this process just wrote.
+    disposeWorkspace(status === "completed");
   } finally {
     db.close();
   }

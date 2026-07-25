@@ -5,11 +5,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
-import { getRun } from "../../src/store/pending-writes.js";
-import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { writeCheckpoint } from "../../src/store/checkpoints.js";
+import { createRun, getRun } from "../../src/store/pending-writes.js";
+import { listEvents } from "../../src/store/trace.js";
+import { workspacePathForRun } from "../../src/workspace/lifecycle.js";
+import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const FAKE_CLAUDE_WRITE = join(FIXTURES_DIR, "fake-claude-write.mjs");
+const FAKE_CLAUDE_WRITE_ERROR = join(FIXTURES_DIR, "fake-claude-write-error.mjs");
 const FAKE_CLAUDE_FIX_REVIEW = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
 
 function writeTopology(cwd: string, topology: unknown): string {
@@ -18,6 +22,15 @@ function writeTopology(cwd: string, topology: unknown): string {
   execFileSync("git", ["add", "-A"], { cwd });
   execFileSync("git", ["commit", "-q", "-m", "add topology"], { cwd });
   return path;
+}
+
+/** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
+function symbolicRefOrEmpty(cwd: string): string {
+  try {
+    return execFileSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd, encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
 }
 
 function singleNodeTopology(overrides: Record<string, unknown> = {}) {
@@ -380,6 +393,193 @@ describe("integration/attempt-commits: the runtime's before-invocation hook and 
       expect(execFileSync("git", ["for-each-ref", "refs/remotes"], { cwd, encoding: "utf8" }).trim()).toBe("");
     } finally {
       rmSync(remote, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+describe("integration/terminal-status: the terminal write is decided by the loop, never rewritten by teardown (U7/KTD-12)", () => {
+  let home: string;
+  let workspaces: string;
+  let cwd: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "graph-bro-terminal-home-"));
+    workspaces = join(home, "workspaces");
+    cwd = gitRepo();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  function baseEnv(binary: string): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: workspaces,
+      GRAPH_BRO_CLAUDE_BINARY: binary,
+    };
+  }
+
+  function readOnlyPingTopology() {
+    return {
+      nodes: [{ id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "ping", output_key: "greeting" }],
+      edges: [
+        { from: "START", to: "reader" },
+        { from: "reader", to: "END" },
+      ],
+      max_steps: 10,
+    };
+  }
+
+  /** A single write node, no bounded node — the teardown commit is the only commit mechanism (mirrors U7's other single-write fixtures above). */
+  function singleWriteTopology(overrides: Record<string, unknown> = {}) {
+    return {
+      nodes: [
+        {
+          id: "writer",
+          kind: "agent",
+          read_only: false,
+          model: "claude-haiku-4-5",
+          prompt: JSON.stringify({ write: { path: "out.txt", content: "v1" } }),
+          output_key: "out",
+        },
+      ],
+      edges: [
+        { from: "START", to: "writer" },
+        { from: "writer", to: "END" },
+      ],
+      max_steps: 10,
+      ...overrides,
+    };
+  }
+
+  it("Covers R11: a converged run whose workspace disposal throws still records completed, with a workspace_finalize_error trace event", async () => {
+    const topologyPath = writeTopology(cwd, readOnlyPingTopology());
+    // "slow" (silent for FAKE_CLAUDE_SILENT_MS, then converges) rather than
+    // the default "success" mode's ~30ms round trip — read-only env vars
+    // survive KTD-4's write-node stripping untouched, so this widens the
+    // window between workspace creation and convergence to a comfortable
+    // margin, rather than racing a lock command against a fast node under
+    // whatever load the rest of the suite happens to be under (R5's spirit).
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE), FAKE_CLAUDE_MODE: "slow", FAKE_CLAUDE_SILENT_MS: "500" },
+    });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    // Workspace creation is the first thing `main()` does, synchronously,
+    // before any node ever dispatches — so this settles well before the
+    // read-only node's own scripted delay does.
+    const workspacePath = workspacePathForRun(runId, workspaces);
+    await waitFor(() => existsSync(workspacePath), 5000);
+    // A locked worktree refuses `git worktree remove --force` (single
+    // --force only overrides a dirty tree, not a lock) — a real git failure
+    // standing in for "disposal throws", with no mock of git itself.
+    execFileSync("git", ["worktree", "lock", workspacePath], { cwd });
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    // R11 writes the status *before* disposing of the workspace (KTD-12) —
+    // deliberately, so a slow/failing disposal never holds up the status an
+    // operator or a resuming process reads. That means disposal itself is
+    // only eventually observable here, not atomic with the status write.
+    let financeError: ReturnType<typeof listEvents>[number] | undefined;
+    await waitFor(() => {
+      const db = openDb({ baseDir: home });
+      try {
+        financeError = listEvents(db, runId).find((e) => (e.payload as { type?: string } | undefined)?.type === "workspace_finalize_error");
+        return financeError !== undefined;
+      } finally {
+        db.close();
+      }
+    }, 5000);
+    expect(financeError).toBeDefined();
+    expect(String((financeError?.payload as { error?: string } | undefined)?.error)).toMatch(/lock/i);
+
+    execFileSync("git", ["worktree", "unlock", workspacePath], { cwd }); // let afterEach's rmSync succeed
+  }, 15_000);
+
+  it("Covers R11: a run whose teardown commit throws (a real git signing failure) still records failed, with the git error in its trace, and mints no second teardown commit", async () => {
+    const topologyPath = writeTopology(cwd, singleWriteTopology());
+
+    // The consumer repo's config is shared by every linked worktree
+    // (workspaces included) unless `extensions.worktreeConfig` is set — so
+    // this forces every `git commit` inside the run's workspace to fail
+    // signing for real, with no mock of git itself. Set only after
+    // `writeTopology` above has made its own (unsigned) commit.
+    execFileSync("git", ["config", "commit.gpgsign", "true"], { cwd });
+    execFileSync("git", ["config", "gpg.format", "openpgp"], { cwd });
+    execFileSync("git", ["config", "gpg.program", "/no/such/gpg-binary-graph-bro-test"], { cwd });
+
+    const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv(FAKE_CLAUDE_WRITE_ERROR) });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    const db = openDb({ baseDir: home });
+    const events = listEvents(db, runId);
+    db.close();
+    const commitErrors = events.filter(
+      (e) =>
+        (e.payload as { type?: string } | undefined)?.type === "run_error" &&
+        /gpg|sign/i.test(String((e.payload as { error?: string } | undefined)?.error)),
+    );
+    // Exactly one — the old bug's catch path minted a *second* teardown
+    // commit attempt (and a second trace event) on top of the first.
+    expect(commitErrors).toHaveLength(1);
+
+    // Disposal still ran, isolated from the commit failure above: a failed
+    // run's workspace is retained (KTD-9), HEAD left detached so its branch
+    // stays checkable out elsewhere — not abandoned mid-teardown. The status
+    // write above precedes disposal (R11/KTD-12), so this is only eventually
+    // true, not atomic with `waitForRunStatus` resolving.
+    const workspacePath = workspacePathForRun(runId, workspaces);
+    expect(existsSync(workspacePath)).toBe(true);
+    await waitFor(() => symbolicRefOrEmpty(workspacePath) === "", 5000); // detached, per KTD-9's halted-run branch
+  }, 15_000);
+
+  it("Covers R12: a run failing the prompt-token gate on resume (after workspace reuse) leaves no worktree on disk or in git's admin data, and its branch is checkable out elsewhere", async () => {
+    // Hand-seeded rather than started + killed (test/cli/cli.test.ts's
+    // "resume re-checks prompt tokens" does the same): a token whose root no
+    // node writes and no input supplies trips resume's own gate on the very
+    // first resume, deterministically — no race against a real node's timing.
+    const runId = "resume-token-gate-disposal-run";
+    const topologyPath = writeTopology(cwd, {
+      nodes: [{ id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "say {{ missing_root }}", output_key: "out" }],
+      edges: [
+        { from: "START", to: "reader" },
+        { from: "reader", to: "END" },
+      ],
+      max_steps: 10,
+    });
+
+    const workspace = seedWorkspaceForRun(cwd, runId, workspaces);
+    const db = openDb({ baseDir: home });
+    createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
+    writeCheckpoint(db, runId, { state: {}, frontier: [{ nodeId: "reader", instanceId: "reader" }], barrier: {}, step: 0 });
+    db.close();
+
+    const resume = runCliSync(["resume", runId], { cwd, env: baseEnv(FAKE_CLAUDE) });
+    expect(resume.status).toBe(0); // `resume` only spawns the engine — the failure is inside it
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    // R11 writes the status before disposing of the workspace (KTD-12), so
+    // disposal is only eventually observable here, not atomic with the
+    // status write `waitForRunStatus` just resolved on.
+    await waitFor(() => !existsSync(workspace.workspacePath), 5000);
+    expect(execFileSync("git", ["worktree", "list"], { cwd, encoding: "utf8" })).not.toContain(workspace.workspacePath);
+
+    // The branch is reachable and checkable out elsewhere — not pinned by a leftover worktree.
+    const elsewhere = mkdtempSync(join(tmpdir(), "graph-bro-terminal-elsewhere-"));
+    try {
+      execFileSync("git", ["worktree", "add", elsewhere, workspace.runBranch], { cwd });
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
     }
   }, 15_000);
 });
