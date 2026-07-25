@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { resolveWorkspaceGitTarget, runWorkspaceGit } from "../workspace/commit.js";
 
 /**
  * KTD-8: the read-only allowlist — `Read`/`Grep`/`Glob` plus read-only Bash
@@ -86,8 +87,23 @@ export class ReadOnlyViolationError extends Error {
   }
 }
 
-/** `git status --porcelain` in `cwd` — call once before and once after a read-only node runs. */
-export function capturePorcelain(cwd: string): string {
+/**
+ * `git status --porcelain` over the node's workspace — call once before and
+ * once after a read-only node runs.
+ *
+ * R6/KTD-6: routed through the pinned helper whenever the consumer repo is
+ * known. Discovering the repository by walking up from a cwd inside the
+ * agent-writable workspace is the same defect class #6 describes: a rewritten
+ * gitlink would point this check at a substitute repo that always reports
+ * clean, and `git status` honours `core.fsmonitor`, which git *executes* —
+ * from the unsandboxed engine process, with its full inherited environment.
+ * The fallback is for callers with no consumer repo (a unit test running
+ * against a plain directory); it is never the engine's own path.
+ */
+export function capturePorcelain(cwd: string, consumerRepoPath?: string): string {
+  if (consumerRepoPath) {
+    return runWorkspaceGit(resolveWorkspaceGitTarget(consumerRepoPath, cwd), ["status", "--porcelain"]);
+  }
   return execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8", timeout: 10_000 });
 }
 
@@ -100,8 +116,8 @@ export function capturePorcelain(cwd: string): string {
  * assertion means "this node changed nothing", which is what it was always
  * for. Raises `ReadOnlyViolationError` if the two differ.
  */
-export function assertRepoClean(cwd: string, nodeId: string, baselinePorcelain: string): void {
-  const output = capturePorcelain(cwd);
+export function assertRepoClean(cwd: string, nodeId: string, baselinePorcelain: string, consumerRepoPath?: string): void {
+  const output = capturePorcelain(cwd, consumerRepoPath);
   if (output !== baselinePorcelain) {
     throw new ReadOnlyViolationError(nodeId, output);
   }

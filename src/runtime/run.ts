@@ -199,7 +199,12 @@ function commitFinalAttempt(
  * (KTD-11's narrow seam). Exported so integration tests build node fns the
  * same way `main()` does, rather than hand-copying this wiring.
  */
-export function buildNodeFns(compiled: CompiledTopology, executor: Executor, cwd: string = process.cwd()): Record<string, NodeFn> {
+export function buildNodeFns(
+  compiled: CompiledTopology,
+  executor: Executor,
+  cwd: string = process.cwd(),
+  consumerRepoPath?: string,
+): Record<string, NodeFn> {
   const nodeFns: Record<string, NodeFn> = {};
   for (const node of compiled.nodes) {
     nodeFns[node.id] =
@@ -214,6 +219,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor, cwd
             prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
             outputSchema: node.output_schema,
             networkDomains: node.network_domains,
+            consumerRepoPath,
           })
         : (): EngineUpdate => ({ ...node.update });
   }
@@ -402,7 +408,7 @@ async function main(): Promise<void> {
     current: Math.max(Object.keys(attemptBounds).length > 0 ? 1 : 0, ...Object.values(resumed?.attempts ?? {})),
   };
 
-  const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
+  const rawNodeFns = buildNodeFns(compiled, executor, workspacePath, consumerRepoPath);
   const nodeFns: Record<string, NodeFn> = {};
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
     let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);

@@ -130,6 +130,8 @@ export interface AgentNodeConfig {
   outputSchema?: JsonSchema;
   /** KTD-3 layer 4: topology-declared domains this node's Bash-tool network egress may reach (R11). Ignored for a read-only node. */
   networkDomains?: string[];
+  /** R6: forwarded to the executor so the read-only backstop's `git status` resolves its repository from the consumer, not from inside the agent-writable workspace. A path only — the engine still imports nothing from the workspace module. */
+  consumerRepoPath?: string;
 }
 
 export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): NodeFn {
@@ -143,6 +145,7 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
       timeout: config.timeout,
       outputSchema: config.outputSchema,
       networkDomains: config.networkDomains,
+      consumerRepoPath: config.consumerRepoPath,
     });
     if (result.isError) {
       throw new Error(`agent node '${config.nodeId}' failed: ${result.text}`);

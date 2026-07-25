@@ -30,6 +30,17 @@ export interface RunOptions {
   outputSchema?: Record<string, unknown>;
   /** KTD-3 layer 4/KTD-12: topology-declared domains a write node's Bash-tool network egress may reach; empty or undefined means none (R11). Ignored for a read-only node. */
   networkDomains?: string[];
+  /**
+   * R6/KTD-6/KTD-7: the consumer repo the workspace at `cwd` belongs to, so the
+   * read-only backstop's own `git status` can be pinned the same way every
+   * other engine git call is. Without it that call discovers its repository by
+   * walking up from `cwd` — inside the agent-writable workspace — which both
+   * honours a rewritten gitlink (pointing the cleanliness check at a
+   * substitute repo that always looks clean) and honours `core.fsmonitor`,
+   * which git *executes*. Optional so a unit test can construct a run against
+   * a plain directory that is not a linked worktree of anything.
+   */
+  consumerRepoPath?: string;
 }
 
 export interface RunResult {

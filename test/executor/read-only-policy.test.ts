@@ -49,6 +49,65 @@ describe("executor: read-only-policy", () => {
     });
   });
 
+  describe("capturePorcelain pinning (R6/KTD-6: the backstop's own git is not the agent's)", () => {
+    let consumer: string;
+    let workspace: string;
+
+    beforeEach(() => {
+      consumer = mkdtempSync(join(tmpdir(), "graph-bro-ro-consumer-"));
+      execFileSync("git", ["init", "-q"], { cwd: consumer });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: consumer });
+      execFileSync("git", ["config", "user.name", "test"], { cwd: consumer });
+      writeFileSync(join(consumer, "README.md"), "hello\n");
+      execFileSync("git", ["add", "-A"], { cwd: consumer });
+      execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: consumer });
+      workspace = join(mkdtempSync(join(tmpdir(), "graph-bro-ro-ws-")), "wt");
+      execFileSync("git", ["worktree", "add", "-q", workspace, "-b", "ro-probe"], { cwd: consumer });
+    });
+
+    afterEach(() => {
+      rmSync(consumer, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    });
+
+    it("a rewritten .git gitlink cannot make a dirty workspace read as clean", () => {
+      // #6's escape, aimed at the read-only backstop rather than the attempt
+      // commit: the agent points `<workspace>/.git` at a repository it fully
+      // controls, so an unpinned `git status` run from inside the workspace
+      // reports that substitute's cleanliness instead of the real one. With
+      // the consumer repo supplied, the admin dir is resolved from the
+      // consumer's own worktree registry and the rewrite is inert.
+      writeFileSync(join(workspace, "evidence.txt"), "a read-only node wrote this\n");
+
+      // Build the substitute so it *already contains* the write, then point
+      // the gitlink at it. Simply redirecting at an empty repo would make the
+      // write show up as untracked and prove nothing — the escape only works
+      // when the substitute's HEAD already matches the tampered tree, so its
+      // `status` reports clean while the real repository still sees the file.
+      const substitute = mkdtempSync(join(tmpdir(), "graph-bro-ro-substitute-"));
+      const substituteGitDir = join(substitute, ".git");
+      const asSubstitute = (args: string[]): void => {
+        execFileSync("git", ["--git-dir", substituteGitDir, "--work-tree", workspace, ...args], { stdio: "ignore" });
+      };
+      execFileSync("git", ["init", "-q", substitute], { stdio: "ignore" });
+      execFileSync("git", ["-C", substitute, "config", "user.email", "agent@example.com"], { stdio: "ignore" });
+      execFileSync("git", ["-C", substitute, "config", "user.name", "agent"], { stdio: "ignore" });
+      asSubstitute(["add", "-A"]);
+      asSubstitute(["commit", "-q", "-m", "agent's own baseline"]);
+      writeFileSync(join(workspace, ".git"), `gitdir: ${substituteGitDir}\n`);
+
+      try {
+        // The escape, demonstrated: discovering the repo from inside the
+        // workspace consults the rewritten gitlink and reports clean.
+        expect(capturePorcelain(workspace).trim()).toBe("");
+        // Pinned from the consumer's worktree registry, the rewrite is inert.
+        expect(capturePorcelain(workspace, consumer)).toContain("evidence.txt");
+      } finally {
+        rmSync(substitute, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("assertRepoClean (KTD-10 backstop)", () => {
     let repoDir: string;
 

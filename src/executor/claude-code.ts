@@ -83,7 +83,7 @@ export class ClaudeCodeExecutor implements Executor {
     // captured before this node ran, not against emptiness — every node now
     // shares one workspace, so a prior write node's uncommitted work must
     // not false-fail a read-only node that touched nothing.
-    const baselinePorcelain = options.capability === "read_only" ? capturePorcelain(cwd) : undefined;
+    const baselinePorcelain = options.capability === "read_only" ? capturePorcelain(cwd, options.consumerRepoPath) : undefined;
 
     // KTD-9/SDK #60: `--print --verbose --output-format stream-json` first, unconditionally.
     const template = [
@@ -223,7 +223,7 @@ export class ClaudeCodeExecutor implements Executor {
     // KTD-10 backstop: per read-only node completion (not once after a whole fan-out
     // drains), so a permission-policy gap is attributed to the offending node. Folded
     // into the shared `run()` path rather than left for callers to remember.
-    if (options.capability === "read_only") assertRepoClean(cwd, options.nodeId, baselinePorcelain!);
+    if (options.capability === "read_only") assertRepoClean(cwd, options.nodeId, baselinePorcelain!, options.consumerRepoPath);
 
     if (terminalEnvelope) {
       return {
