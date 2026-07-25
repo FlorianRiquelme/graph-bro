@@ -1,7 +1,15 @@
 import { getPath } from "./state.js";
 import type { EngineState } from "./state.js";
 
-const TOKEN_PATTERN = /\{\{\s*([^}]+?)\s*\}\}/g;
+/**
+ * Capture 1 is the optional escape backslash, capture 2 the dotted path. Only
+ * the *opening* delimiter is significant, so a bare `}}` needs no escape.
+ * Shared with `extractTokenPaths` deliberately: the lint (graph-bro#7) and the
+ * renderer must agree on what counts as a token, or the lint reports on text
+ * the renderer never touches. Safe to share despite the `g` flag — `replace`
+ * and `matchAll` both leave `lastIndex` untouched.
+ */
+const TOKEN_PATTERN = /(\\)?\{\{\s*([^}]+?)\s*\}\}/g;
 
 /**
  * Fail-loud counterpart to `StateConflictError` (R5, ADR-0006's fail-loud
@@ -35,10 +43,28 @@ function serialize(value: unknown, nodeId: string, path: string): string {
  * resolved value is serialized by type (R4); an unresolvable path throws
  * `UnresolvedPromptTokenError` (R5). Substituted text is never re-scanned by
  * this pass (KTD-6).
+ *
+ * A token may be escaped as `\{{ path }}` to emit the literal delimiters as
+ * text (graph-bro#8); the escape is stripped and the inner spacing preserved
+ * verbatim. One limitation, deliberate: because the escape is not itself
+ * escapable, a literal backslash cannot immediately precede a live token
+ * (`\\{{ a }}` unescapes rather than substituting). No prompt needs that
+ * today, and doubling the grammar to support it would buy nothing.
  */
 export function renderPromptTemplate(template: string, input: EngineState, nodeId: string): string {
-  return template.replace(TOKEN_PATTERN, (_match, path: string) => {
+  return template.replace(TOKEN_PATTERN, (match: string, escape: string | undefined, path: string) => {
+    if (escape) return match.slice(1);
     const value = getPath(input, path);
     return serialize(value, nodeId, path);
   });
+}
+
+/**
+ * The dotted paths of every live token in `template`, in source order —
+ * escaped tokens excluded, since those are literal text the renderer never
+ * resolves. The static seam graph-bro#7's root-key check reads, so that the
+ * lint and the renderer share one definition of the token grammar.
+ */
+export function extractTokenPaths(template: string): string[] {
+  return [...template.matchAll(TOKEN_PATTERN)].filter((match) => !match[1]).map((match) => match[2]);
 }

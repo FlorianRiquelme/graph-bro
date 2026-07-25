@@ -15,7 +15,8 @@ a `dedup` reducer.
   anything."` — whose **interpolation token** `{{ item }}` resolves against
   each branch's own `as` binding. Each fan-out instance therefore runs a
   distinct **resolved prompt** naming its own item, never mutates anything,
-  and reports back what it found.
+  and reports back what it found. A prompt needing the literal delimiters as
+  text escapes them: `\{{ not a token }}`.
 - `reader -> END` (join edge, `mode: "all"`, `reducer: "dedup"`): waits for
   every fan-out branch, then collapses duplicate outputs into one `results`
   list before the run ends. Since each branch's resolved prompt differs,
