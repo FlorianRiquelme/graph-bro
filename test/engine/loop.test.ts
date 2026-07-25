@@ -764,6 +764,26 @@ describe("engine/loop: attempt bound and not_converged (U4, R5/R6/R7, KTD-5)", (
     db.close();
   });
 
+  it("Covers U8/R13/KTD-11: the bound-halt checkpoints the refused frontier itself, not the previous step's predecessor frontier", async () => {
+    const db = openDb({ baseDir });
+    const runId = "run-bound-halt-checkpoint";
+    createRun(db, runId, process.pid);
+    const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: false }), fix: () => ({}) };
+
+    const result = await runLoop({ graph: reviewLoopGraph(2), nodeFns, persistence: { db, runId } });
+
+    expect(result.status).toBe("not_converged");
+    // Without the fix, the durable resume point stays the checkpoint written
+    // for the previous step ("fix"'s incoming frontier) — a resume would
+    // re-dispatch "fix" for real before ever re-hitting the bound. The
+    // checkpoint must instead hold the very frontier that tripped the bound
+    // ("review"), so a resume re-enters straight at the bound check.
+    const latest = readLatestCheckpoint(db, runId);
+    expect(latest?.frontier.map((activation) => activation.nodeId)).toEqual(["review"]);
+    expect(latest?.attempts?.review).toBe(2); // not incremented for the refused attempt
+    db.close();
+  });
+
   it("a bounded node reached exactly once, with no loop, does not trip the bound", async () => {
     const nodeFns: Record<string, NodeFn> = { review: () => ({ ok: true }), pass: () => ({}) };
 

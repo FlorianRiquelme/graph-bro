@@ -143,6 +143,7 @@ function currentHead(target: WorkspaceGitTarget): string {
   return runWorkspaceGit(target, ["rev-parse", "HEAD"]).trim();
 }
 
+
 function porcelain(target: WorkspaceGitTarget): string {
   return runWorkspaceGit(target, ["status", "--porcelain"]);
 }
@@ -248,6 +249,35 @@ export interface PreserveInterruptedAttemptResult {
   sha?: string;
 }
 
+/** One `commitAttempt`/teardown commit, as parsed off its `graph-bro: attempt N (nodeId)` message. */
+interface AttemptCommitInfo {
+  sha: string;
+  attemptNumber: number;
+  nodeId: string;
+}
+
+const ATTEMPT_COMMIT_PATTERN = /^graph-bro: attempt (\d+) \((.+)\)$/;
+
+/**
+ * Walks the run's own history (never past `baseRefSha`, which is shared
+ * consumer history, not this run's) and parses every `commitAttempt`/teardown
+ * commit's `graph-bro: attempt N (nodeId)` message. Newest first (git log's
+ * own order) — both `findLastCommittedAttempt` and `committedAttemptCounts`
+ * read off this one walk rather than each parsing commit messages themselves.
+ */
+function parseAttemptCommits(target: WorkspaceGitTarget, baseRefSha: string): AttemptCommitInfo[] {
+  const log = runWorkspaceGit(target, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
+  const commits: AttemptCommitInfo[] = [];
+  for (const line of log.trim().split("\n")) {
+    if (!line) continue;
+    const spaceIndex = line.indexOf(" ");
+    const sha = line.slice(0, spaceIndex);
+    const match = ATTEMPT_COMMIT_PATTERN.exec(line.slice(spaceIndex + 1));
+    if (match) commits.push({ sha, attemptNumber: Number.parseInt(match[1], 10), nodeId: match[2] });
+  }
+  return commits;
+}
+
 /**
  * Walks back from HEAD, within this branch's own history (never past
  * `baseRefSha`, which is shared consumer history, not this run's), for the
@@ -259,13 +289,33 @@ export interface PreserveInterruptedAttemptResult {
  * that a crash prevented `commitAttempt` from ever folding.
  */
 function findLastCommittedAttempt(target: WorkspaceGitTarget, baseRefSha: string): string {
-  const log = runWorkspaceGit(target, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
-  for (const line of log.trim().split("\n")) {
-    if (!line) continue;
-    const spaceIndex = line.indexOf(" ");
-    if (line.slice(spaceIndex + 1).startsWith("graph-bro: attempt ")) return line.slice(0, spaceIndex);
+  const [nearest] = parseAttemptCommits(target, baseRefSha);
+  return nearest ? nearest.sha : baseRefSha;
+}
+
+/**
+ * R15/KTD-11: nodeId -> the highest attempt number actually committed to the
+ * workspace's history, for reconciling against a resumed checkpoint's own
+ * per-node attempt counts. A resumed checkpoint can *promise* more attempts
+ * than git actually holds — a kill between the checkpoint write and the
+ * attempt commit that was about to fold the prior round's edits, discarded by
+ * `preserveInterruptedAttempt`'s hard reset — and that gap is exactly what
+ * `resume` must refuse loudly on rather than silently re-enter the bounded
+ * node against a workspace that no longer reflects what the checkpoint
+ * claims. Extends `parseAttemptCommits` rather than a second parser of the
+ * commit message shape.
+ */
+export function committedAttemptCounts(
+  consumerRepoPath: string,
+  workspacePath: string,
+  baseRefSha: string,
+): Record<string, number> {
+  const target = resolveWorkspaceGitTarget(consumerRepoPath, workspacePath);
+  const counts: Record<string, number> = {};
+  for (const commit of parseAttemptCommits(target, baseRefSha)) {
+    if ((counts[commit.nodeId] ?? 0) < commit.attemptNumber) counts[commit.nodeId] = commit.attemptNumber;
   }
-  return baseRefSha;
+  return counts;
 }
 
 /**

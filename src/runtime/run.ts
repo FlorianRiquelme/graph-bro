@@ -25,7 +25,7 @@ import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 import { createWorkspace, finalizeWorkspace, reattachToRunBranch, reuseWorkspace } from "../workspace/lifecycle.js";
 import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
-import { commitAttempt, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
+import { commitAttempt, committedAttemptCounts, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
 import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
@@ -387,6 +387,34 @@ async function main(): Promise<void> {
   // the loop, so the two stay numerically identical across a resume.
   const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
   const resumed = mode === "resume" ? resumeRun(db, runId, { reducerForKey }) : undefined;
+
+  // R15/KTD-11: reconcile the resumed checkpoint's per-node attempt counts
+  // against the attempt commits actually present, now that
+  // `preserveInterruptedAttempt` above has already hard-reset the workspace
+  // to its last actually committed attempt. A checkpoint can promise more
+  // attempts than git holds committed — a kill between the checkpoint write
+  // and the attempt commit that was about to fold the prior round's edits,
+  // which the hard reset just discarded — and re-entering the bounded node
+  // on that mismatch would run it against a workspace that no longer
+  // reflects what the checkpoint claims (KTD-11 explicitly rejects rolling
+  // the frontier back to re-run the predecessor instead: surface, don't
+  // guess). The workspace is left in place, not disposed, for inspection —
+  // the same convention every other halted-run status keeps.
+  if (mode === "resume" && resumed) {
+    const committed = committedAttemptCounts(consumerRepoPath, workspacePath, baseRefSha);
+    const mismatches = Object.entries(resumed.attempts).filter(([nodeId, count]) => count > (committed[nodeId] ?? 0));
+    if (mismatches.length > 0) {
+      const detail = mismatches
+        .map(([nodeId, count]) => `'${nodeId}': checkpoint records ${count} attempt(s), ${committed[nodeId] ?? 0} committed`)
+        .join("; ");
+      const error = `resume attempt-count mismatch (R15/KTD-11): ${detail} — refusing to resume rather than re-enter the bounded node against a workspace that no longer reflects what the checkpoint claims`;
+      appendEvent(db, { runId, payload: { type: "run_error", error } });
+      updateRunStatus(db, runId, "failed");
+      process.exitCode = 1;
+      db.close();
+      return;
+    }
+  }
 
   // U7/KTD-7: `headState` tracks the workspace's HEAD across attempt
   // commits — starting at wherever the workspace already is, whether that's

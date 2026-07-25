@@ -446,6 +446,23 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
       if (bound === undefined) continue;
       const nextCount = (attemptCounts.get(activation.nodeId) ?? 0) + 1;
       if (nextCount > bound) {
+        // U8/KTD-11: checkpoint the refused frontier itself before halting.
+        // Without this, the durable resume point stays the *previous* step's
+        // checkpoint — whose frontier is the unbounded predecessor that fed
+        // this one — so a resume re-runs that predecessor for real (a genuine
+        // agent invocation, a genuine workspace mutation) before hitting this
+        // same bound a second time, orphaning that work under an attempt
+        // number already spent. Checkpointing this frontier means a resume
+        // re-enters exactly at the bound check and halts with no work.
+        if (persistence) {
+          writeCheckpoint(persistence.db, persistence.runId, {
+            state,
+            frontier,
+            barrier: {},
+            step: steps - 1,
+            attempts: attemptsSnapshot(),
+          });
+        }
         return { status: "not_converged", state, steps, attempts: attemptsSnapshot() };
       }
     }

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
+import { readLatestCheckpoint, writeCheckpoint } from "../../src/store/checkpoints.js";
 import { partialAttemptRef } from "../../src/workspace/commit.js";
 import { gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
@@ -199,6 +200,47 @@ describe("integration/write-crash-resume: a killed write run resumes from its la
     expect(resume.status).toBe(0);
 
     await waitForRunStatus(home, runId, "completed", 10_000);
+  }, 15_000);
+
+  it("Covers R15/KTD-11: a checkpoint claiming more attempts than are actually committed refuses the resume, naming the mismatch", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "not_converged", 10_000);
+
+    // Simulate the #17 crash window: the checkpoint claims one more attempt
+    // than the workspace's git history actually holds committed for
+    // "review" — exactly what a kill between the checkpoint write and the
+    // attempt commit, followed by `preserveInterruptedAttempt`'s hard reset,
+    // would leave behind.
+    const db = openDb({ baseDir: home });
+    const latest = readLatestCheckpoint(db, runId)!;
+    writeCheckpoint(db, runId, { ...latest, attempts: { ...latest.attempts, review: (latest.attempts?.review ?? 0) + 1 } });
+    db.close();
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    expect(resume.status).toBe(0); // `resume` itself only spawns the engine — the refusal is inside it
+
+    await waitForRunStatus(home, runId, "failed", 5000);
+
+    const verifyDb = openDb({ baseDir: home });
+    try {
+      const row = verifyDb.prepare("select payload from events where run_id = ? order by id desc limit 1").get(runId) as
+        | { payload: string }
+        | undefined;
+      expect(row).toBeDefined();
+      const payload = JSON.parse(row!.payload);
+      expect(payload.error).toMatch(/attempt-count mismatch/);
+      expect(payload.error).toMatch(/'review'/);
+    } finally {
+      verifyDb.close();
+    }
   }, 15_000);
 
   it("resuming a run whose workspace was removed by hand fails with a clear message, rather than re-running from scratch", async () => {

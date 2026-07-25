@@ -631,6 +631,15 @@ describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)
       // hook committed attempt 2), with the frontier back at the write node
       // for what would be attempt 3.
       const workspace = seedWorkspaceForRun(cwd, runId, join(home, "workspaces"));
+      // R15/KTD-11: resume reconciles the seeded checkpoint's `attempts.review:
+      // 2` against attempt commits actually present in the workspace — seed
+      // two real ones so that reconciliation (a concern orthogonal to what
+      // this test targets) sees a consistent history rather than refusing.
+      for (const n of [1, 2]) {
+        writeFileSync(join(workspace.workspacePath, "seed.txt"), String(n));
+        execFileSync("git", ["-C", workspace.workspacePath, "add", "-A"]);
+        execFileSync("git", ["-C", workspace.workspacePath, "commit", "-q", "-m", `graph-bro: attempt ${n} (review)`]);
+      }
       const db = openDb({ baseDir: home });
       createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
       writeCheckpoint(db, runId, {

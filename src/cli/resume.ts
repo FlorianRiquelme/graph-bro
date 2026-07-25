@@ -66,6 +66,14 @@ export async function resumeCommand(args: string[]): Promise<void> {
     return;
   }
 
+  // R14: mark the run pre-terminal the moment ownership is claimed — before
+  // the detached engine is even spawned. Without this, the run row still
+  // holds whatever terminal status the prior (now-dead) process left it in
+  // (e.g. `not_converged`), so a caller waiting on that same terminal value
+  // is satisfied by the *stale* row on its very first poll, indistinguishable
+  // from a resumed run that genuinely reached it again.
+  updateRunStatus(db, runId, "running");
+
   // U5: the workspace lives at a path computed once at `start` and recorded
   // on the run row — resume reads it back rather than recomputing, since a
   // recompute would silently assume this invocation's environment
