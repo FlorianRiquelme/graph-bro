@@ -123,19 +123,44 @@ export function listPendingWrites(db: Database.Database, runId: string, opts: { 
   return (rows as RawPendingWriteRow[]).map(toPendingWriteRow);
 }
 
+/** U5: the workspace facts `start` computes once (pure functions of the run id — no race with the engine's own boot) and records alongside the run row. */
+export interface RunWorkspaceFields {
+  baseRef?: string;
+  workspacePath?: string;
+  runBranch?: string;
+}
+
 /**
  * Registers/updates the run's owner pid (KTD-14 single-owner guard). `start`
- * sets `topologyPath` on the first insert; `resume` (self-healing ownership
- * of an already-recorded run) omits it and the existing value survives, so
- * `graph-bro resume <run_id>` only needs the run id to know what to recompile.
+ * sets `topologyPath` (and the U5 workspace fields) on the first insert;
+ * `resume` (self-healing ownership of an already-recorded run) omits them and
+ * the existing values survive, so `graph-bro resume <run_id>` only needs the
+ * run id to know what to recompile and where its workspace already lives.
  */
-export function createRun(db: Database.Database, runId: string, ownerPid: number, topologyPath?: string): void {
+export function createRun(
+  db: Database.Database,
+  runId: string,
+  ownerPid: number,
+  topologyPath?: string,
+  workspace?: RunWorkspaceFields,
+): void {
   db.prepare(
-    `INSERT INTO runs (run_id, owner_pid, topology_path) VALUES (?, ?, ?)
+    `INSERT INTO runs (run_id, owner_pid, topology_path, base_ref, workspace_path, run_branch)
+     VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(run_id) DO UPDATE SET
        owner_pid = excluded.owner_pid,
-       topology_path = COALESCE(excluded.topology_path, runs.topology_path)`,
-  ).run(runId, ownerPid, topologyPath ?? null);
+       topology_path = COALESCE(excluded.topology_path, runs.topology_path),
+       base_ref = COALESCE(excluded.base_ref, runs.base_ref),
+       workspace_path = COALESCE(excluded.workspace_path, runs.workspace_path),
+       run_branch = COALESCE(excluded.run_branch, runs.run_branch)`,
+  ).run(
+    runId,
+    ownerPid,
+    topologyPath ?? null,
+    workspace?.baseRef ?? null,
+    workspace?.workspacePath ?? null,
+    workspace?.runBranch ?? null,
+  );
 }
 
 /**
@@ -167,6 +192,9 @@ export interface RunRow {
   status: string;
   topologyPath?: string;
   createdAt: string;
+  baseRef?: string;
+  workspacePath?: string;
+  runBranch?: string;
 }
 
 interface RawRunRow {
@@ -175,6 +203,9 @@ interface RawRunRow {
   status: string;
   topology_path: string | null;
   created_at: string;
+  base_ref: string | null;
+  workspace_path: string | null;
+  run_branch: string | null;
 }
 
 /** Reads a run's row (owner/status/topology path) — the source `status`/`result`/`resume` read from. */
@@ -187,6 +218,9 @@ export function getRun(db: Database.Database, runId: string): RunRow | undefined
     status: row.status,
     topologyPath: row.topology_path ?? undefined,
     createdAt: row.created_at,
+    baseRef: row.base_ref ?? undefined,
+    workspacePath: row.workspace_path ?? undefined,
+    runBranch: row.run_branch ?? undefined,
   };
 }
 

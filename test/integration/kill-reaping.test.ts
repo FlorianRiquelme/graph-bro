@@ -48,6 +48,7 @@ describe("integration/kill-reaping: run-kill cascades through a forked grandchil
       const grandchildEnv: NodeJS.ProcessEnv = {
         ...process.env,
         GRAPH_BRO_HOME: home,
+        GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
         GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
         FAKE_CLAUDE_MODE: "grandchild-resist",
       };
@@ -62,13 +63,16 @@ describe("integration/kill-reaping: run-kill cascades through a forked grandchil
       // Wait for the fake-claude node process to actually spawn, then find
       // its forked grandchild (spawned NOT detached, so it shares
       // fake-claude's own pgid — see test/fixtures/fake-claude.mjs's
-      // "grandchild-resist" mode). Scoped to `pgrep -P ownerPid` (a child of
-      // THIS test's own engine), not a global `-f fake-claude.mjs` name match
-      // that races against other test files' concurrently-running fake-claude
-      // processes (e.g. cli.test.ts's KTD-13 test).
+      // "grandchild-resist" mode). Scoped to `pgrep -P ownerPid -f fake-claude`
+      // (a child of THIS test's own engine, matched by command line) rather
+      // than a bare `-P ownerPid`: U5's workspace creation (git worktree add,
+      // etc.) spawns its own short-lived git subprocesses as children of the
+      // same engine pid before the node ever dispatches, and a bare `-P`
+      // match can transiently catch one of those instead of the node's own
+      // long-lived process.
       let fakeClaudePid = "";
       await waitFor(() => {
-        const pgrep = spawnSync("pgrep", ["-P", String(ownerPid)], { encoding: "utf-8" });
+        const pgrep = spawnSync("pgrep", ["-P", String(ownerPid), "-f", "fake-claude"], { encoding: "utf-8" });
         fakeClaudePid = pgrep.stdout.trim().split("\n")[0] ?? "";
         return fakeClaudePid.length > 0;
       }, 3000);

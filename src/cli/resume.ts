@@ -51,7 +51,21 @@ export async function resumeCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const pid = spawnDetachedEngine(["resume", runId, run.topologyPath]);
+  // U5: the workspace lives at a path computed once at `start` and recorded
+  // on the run row — resume reads it back rather than recomputing, since a
+  // recompute would silently assume this invocation's environment
+  // (GRAPH_BRO_WORKSPACES) matches the one `start` ran under. The unused
+  // inputArg slot carries an empty placeholder; `main()`'s resume branch
+  // never reads it (state comes entirely from the checkpoint).
+  const pid = spawnDetachedEngine([
+    "resume",
+    runId,
+    run.topologyPath,
+    "",
+    run.baseRef ?? "",
+    run.workspacePath ?? "",
+    run.runBranch ?? "",
+  ]);
   if (pid === undefined) {
     // Claimed but failed to spawn: leave ownership at this (now-exiting)
     // process's pid rather than the stale dead one, so a later `resume`

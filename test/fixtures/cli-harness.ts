@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb } from "../../src/store/db.js";
 import { getRun } from "../../src/store/pending-writes.js";
+import { createWorkspace, resolveBaseRef, runBranchForRun, workspacePathForRun } from "../../src/workspace/lifecycle.js";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const CLI_ENTRY = join(REPO_ROOT, "dist", "cli", "index.js");
@@ -81,6 +82,26 @@ export function waitForRunStatus(home: string, runId: string, status: string, ti
       db.close();
     }
   }, timeoutMs);
+}
+
+/**
+ * U5: several resume-flow tests simulate a pre-crash run by hand-seeding the
+ * DB (checkpoint + pending writes) rather than actually crashing a real
+ * engine — that hand-seeded row still needs a real workspace, since every
+ * run now executes inside one (R13). Creates it via the same lifecycle
+ * `createWorkspace` production code uses, so the test's premise matches
+ * what `start` actually produces.
+ */
+export function seedWorkspaceForRun(
+  consumerRepoPath: string,
+  runId: string,
+  workspacesRoot: string,
+): { baseRef: string; workspacePath: string; runBranch: string } {
+  const baseRef = resolveBaseRef(consumerRepoPath);
+  const workspacePath = workspacePathForRun(runId, workspacesRoot);
+  const runBranch = runBranchForRun(runId);
+  createWorkspace({ consumerRepoPath, baseRefSha: baseRef, workspacePath, runBranch });
+  return { baseRef, workspacePath, runBranch };
 }
 
 export function isAlive(pid: number): boolean {

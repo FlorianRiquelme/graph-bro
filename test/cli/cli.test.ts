@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
-import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -83,6 +83,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     return {
       ...process.env,
       GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
       GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
       FAKE_CLAUDE_MODE: mode,
     };
@@ -185,8 +186,9 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       });
       const env = baseEnv("success");
 
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
       const db = openDb({ baseDir: home });
-      createRun(db, runId, 999_999, topologyPath); // a dead owner pid, so resume self-heals
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
       writeCheckpoint(db, runId, {
         state: {},
         frontier: [{ nodeId: "reader", instanceId: "reader" }],
@@ -296,8 +298,9 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
 
       // Simulate a crash: 2 of the 4 fan-out branches already committed their
       // pending write; the checkpoint's frontier still lists all 4.
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
       const db = openDb({ baseDir: home });
-      createRun(db, runId, 999_999, topologyPath); // a dead owner pid
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid
       // items are plain strings (no `id` field), so deriveItemKey derives
       // "idx:${i}" for each — must match here for resume() to line up.
       writeCheckpoint(db, runId, {

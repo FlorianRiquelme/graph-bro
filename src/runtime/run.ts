@@ -23,6 +23,7 @@ import { appendEvent } from "../store/trace.js";
 import { ClaudeCodeExecutor } from "../executor/claude-code.js";
 import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
+import { createWorkspace, finalizeWorkspace, reuseWorkspace } from "../workspace/lifecycle.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -99,7 +100,7 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
  * (KTD-11's narrow seam). Exported so integration tests build node fns the
  * same way `main()` does, rather than hand-copying this wiring.
  */
-export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Record<string, NodeFn> {
+export function buildNodeFns(compiled: CompiledTopology, executor: Executor, cwd: string = process.cwd()): Record<string, NodeFn> {
   const nodeFns: Record<string, NodeFn> = {};
   for (const node of compiled.nodes) {
     nodeFns[node.id] =
@@ -108,7 +109,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Re
             nodeId: node.id,
             model: node.model,
             capability: node.read_only ? "read_only" : "write",
-            cwd: process.cwd(),
+            cwd,
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,
             prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
@@ -150,9 +151,28 @@ export function reconstructBarrierState(
 }
 
 async function main(): Promise<void> {
-  const [mode, runId, topologyPath, inputArg] = process.argv.slice(2);
-  if ((mode !== "start" && mode !== "resume") || !runId || !topologyPath) {
-    console.error("usage: run.js <start|resume> <run_id> <topology_path> [input_json]");
+  const [mode, runId, topologyPath, inputArg, baseRefSha, workspacePath, runBranch] = process.argv.slice(2);
+  if ((mode !== "start" && mode !== "resume") || !runId || !topologyPath || !workspacePath) {
+    console.error("usage: run.js <start|resume> <run_id> <topology_path> <input_json> <base_ref_sha> <workspace_path> <run_branch>");
+    process.exitCode = 1;
+    return;
+  }
+
+  // R13/KTD-1: every node in the run executes inside this one isolated
+  // worktree — never the consumer's own checkout, which `process.cwd()`
+  // would otherwise be (the engine inherits the CLI's cwd on spawn).
+  const consumerRepoPath = process.cwd();
+  try {
+    if (mode === "start") {
+      createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
+    } else {
+      reuseWorkspace(workspacePath);
+    }
+  } catch (err) {
+    const db = openDb();
+    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    updateRunStatus(db, runId, "failed");
+    db.close();
     process.exitCode = 1;
     return;
   }
@@ -199,7 +219,7 @@ async function main(): Promise<void> {
     maxConcurrency: compiled.maxConcurrency,
     attemptBounds,
   };
-  const rawNodeFns = buildNodeFns(compiled, executor);
+  const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
   const nodeFns: Record<string, NodeFn> = {};
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) nodeFns[nodeId] = withTracing(db, runId, nodeId, fn);
 
@@ -253,10 +273,15 @@ async function main(): Promise<void> {
     }
     updateRunStatus(db, runId, result.status);
     process.exitCode = mapStatusToExitCode(result.status);
+    // KTD-9: a converged run needs no directory (the branch is the
+    // handback); a halted run (failed/dead_end/not_converged) keeps its
+    // workspace for `resume` and for inspection.
+    finalizeWorkspace({ consumerRepoPath, workspacePath, converged: result.status === "completed" });
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
     updateRunStatus(db, runId, "failed");
     process.exitCode = 1;
+    finalizeWorkspace({ consumerRepoPath, workspacePath, converged: false });
   } finally {
     db.close();
   }

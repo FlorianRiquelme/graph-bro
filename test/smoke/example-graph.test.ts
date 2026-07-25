@@ -45,6 +45,7 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         GRAPH_BRO_HOME: home,
+        GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
         GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
         FAKE_CLAUDE_MODE: "success",
       };
@@ -79,6 +80,7 @@ describe("smoke: the shipped fanout-read-join example graph", () => {
       const env: NodeJS.ProcessEnv = {
         ...process.env,
         GRAPH_BRO_HOME: home,
+        GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
         GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
         FAKE_CLAUDE_MODE: "success",
       };

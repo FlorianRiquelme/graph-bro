@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Applied in order; each id is tracked independently in `schema_migrations` (§8.8). */
-const MIGRATION_IDS = ["001_init", "002_run_topology_path"];
+const MIGRATION_IDS = ["001_init", "002_run_topology_path", "003_workspace"];
 
 export interface OpenDbOptions {
   /**

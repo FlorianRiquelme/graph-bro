@@ -6,6 +6,7 @@ import { checkPromptTokens } from "../topology/lint.js";
 import { openDb } from "../store/db.js";
 import { createRun } from "../store/pending-writes.js";
 import { spawnDetachedEngine } from "./spawn-engine.js";
+import { resolveBaseRef, runBranchForRun, workspacePathForRun } from "../workspace/lifecycle.js";
 
 /**
  * `graph-bro start <topology-path> [--input <path>]` (ADR-0004/ADR-0002):
@@ -64,8 +65,41 @@ export async function startCommand(args: string[]): Promise<void> {
     return; // AE5 parity: no run id printed, nothing spawned
   }
 
+  // R14: resolved before a run id is minted — a bad ref or a non-git
+  // consumer directory is an authoring error, matching AE5's posture for
+  // every other start-time gate. Resolved to a commit SHA, not the symbolic
+  // ref: a moving branch tip between here and engine boot is the same class
+  // of window graph-bro#12 already cost this project.
+  const consumerRepoPath = process.cwd();
+  let baseRefSha: string;
+  try {
+    baseRefSha = resolveBaseRef(consumerRepoPath, compileResult.compiled.baseRef);
+  } catch (err) {
+    console.error(`graph-bro: ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.error(`graph-bro: base ref resolved to ${baseRefSha}`);
+
   const runId = randomUUID();
-  const pid = spawnDetachedEngine(["start", runId, topologyPath, JSON.stringify(input)]);
+  // Pure functions of the run id — computed here and delivered on the
+  // engine's argv, the way the topology path and input snapshot already are,
+  // rather than having the child re-derive or read them back off the run
+  // row: no row exists yet at the instant the child boots (spawn precedes
+  // createRun below), so a read-back would be an intermittent failure keyed
+  // on Node startup timing.
+  const workspacePath = workspacePathForRun(runId);
+  const runBranch = runBranchForRun(runId);
+
+  const pid = spawnDetachedEngine([
+    "start",
+    runId,
+    topologyPath,
+    JSON.stringify(input),
+    baseRefSha,
+    workspacePath,
+    runBranch,
+  ]);
   if (pid === undefined) {
     console.error("graph-bro: failed to launch the engine process");
     process.exitCode = 1;
@@ -73,7 +107,7 @@ export async function startCommand(args: string[]): Promise<void> {
   }
 
   const db = openDb();
-  createRun(db, runId, pid, topologyPath);
+  createRun(db, runId, pid, topologyPath, { baseRef: baseRefSha, workspacePath, runBranch });
   db.close();
 
   console.log(runId);
