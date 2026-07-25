@@ -12,6 +12,7 @@ import { writeCheckpoint } from "../store/checkpoints.js";
 import { appendEvent } from "../store/trace.js";
 import type { Executor, NodeCapability } from "../executor/executor.js";
 import { MissingStructuredOutputError, validateOutput, type JsonSchema } from "./output-schema.js";
+import { evaluateWhen, type WhenEvaluation } from "./when.js";
 
 /** A plain function node (R4) — no executor/subprocess concept in this unit. */
 export type NodeFn = (state: EngineState) => EngineUpdate | Promise<EngineUpdate>;
@@ -174,6 +175,26 @@ export class MaxStepsExceededError extends Error {
 }
 
 /**
+ * R3/KTD-6: raised when an activation's out-edge set is non-empty, entirely
+ * guarded, and no guard evaluated true — the silent-give-up R3 forbids.
+ * Returned as a failed `LoopResult`, not thrown (KTD-6): this is a routing
+ * outcome the engine reports the same way it reports `dead_end`, not an
+ * invariant violation like a stalled join.
+ */
+export class UnmatchedRouterError extends Error {
+  constructor(
+    public readonly nodeId: string,
+    public readonly evaluations: { edge: PlainEdge; evaluation: WhenEvaluation }[],
+  ) {
+    const detail = evaluations
+      .map((g) => `-> '${g.edge.to}' ${JSON.stringify(g.edge.when)} read ${JSON.stringify(g.evaluation.reads)}`)
+      .join("; ");
+    super(`node '${nodeId}' has only guarded out-edges and none matched (R3): ${detail}`);
+    this.name = "UnmatchedRouterError";
+  }
+}
+
+/**
  * The super-step loop (§13.2 runner loop / §13.3 channel-driven activation):
  * frontier -> snapshot -> run -> merge (reducers) -> transitions -> next
  * frontier, until END, an empty frontier (`dead_end`), or `max_steps`.
@@ -222,10 +243,17 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     }
   }
 
+  // Declared before `transition` (which closes over it) rather than beside
+  // `maxConcurrency` below: the seed transition call happens before that
+  // point, and a `const` read through a closure before its own declaration
+  // executes is a TDZ crash, not a stale-`undefined` read.
+  const persistence = options.persistence;
+
   function transition(
     completed: Activation[],
     currentState: EngineState,
-  ): { next: Activation[]; reachedEnd: boolean } {
+    step: number,
+  ): { next: Activation[]; reachedEnd: boolean; unmatchedRouterError?: UnmatchedRouterError } {
     const next: Activation[] = [];
     const seen = new Set<string>();
     let reachedEnd = false;
@@ -237,7 +265,35 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     };
 
     for (const { nodeId, instanceId } of completed) {
-      for (const edge of plainEdgesBySource.get(nodeId) ?? []) {
+      const plain = plainEdgesBySource.get(nodeId) ?? [];
+      const fanOuts = fanOutEdgesBySource.get(nodeId) ?? [];
+      const joinTargets = barriersBySource.get(nodeId) ?? [];
+      const guardEvaluations: { edge: PlainEdge; evaluation: WhenEvaluation }[] = [];
+
+      for (const edge of plain) {
+        let satisfied = true;
+        if (edge.when !== undefined) {
+          const evaluation = evaluateWhen(edge.when, currentState);
+          satisfied = evaluation.result;
+          guardEvaluations.push({ edge, evaluation });
+          // R24: every routing decision is traced with the rule and the values read,
+          // regardless of which way it went.
+          if (persistence) {
+            appendEvent(persistence.db, {
+              runId: persistence.runId,
+              node: nodeId,
+              step,
+              payload: {
+                type: "routing_decision",
+                to: edge.to,
+                rule: edge.when,
+                reads: evaluation.reads,
+                result: evaluation.result,
+              },
+            });
+          }
+        }
+        if (!satisfied) continue;
         if (edge.to === END) {
           reachedEnd = true;
           continue;
@@ -245,7 +301,22 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         pushUnique({ nodeId: edge.to, instanceId: edge.to });
       }
 
-      for (const edge of fanOutEdgesBySource.get(nodeId) ?? []) {
+      // KTD-6: the unmatched router is its own engine error, detected per
+      // activation on guard evaluation — never in terms of the frontier
+      // (aggregate emptiness hides one activation behind another;
+      // `pushUnique`'s instanceId dedup makes per-activation *contribution*
+      // false-fire on a diamond's second satisfied edge). Two exclusions
+      // stay load-bearing: a join source's own arrival is a contribution
+      // even when its plain routing produced nothing (`joinTargets.length
+      // === 0` below), and an unguarded fan-out edge means the out-edge set
+      // is never "entirely guarded" in the first place (fan-out carries no
+      // `when` — `fanOuts.length === 0` below).
+      const entirelyGuarded = plain.length > 0 && fanOuts.length === 0 && plain.every((edge) => edge.when !== undefined);
+      if (entirelyGuarded && joinTargets.length === 0 && !guardEvaluations.some((g) => g.evaluation.result)) {
+        return { next, reachedEnd, unmatchedRouterError: new UnmatchedRouterError(nodeId, guardEvaluations) };
+      }
+
+      for (const edge of fanOuts) {
         const branches = buildFanOutBranches(edge, currentState);
         for (const branch of branches) pushUnique(branch.activation);
         for (const barrier of barriersBySource.get(edge.to) ?? []) {
@@ -256,7 +327,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         }
       }
 
-      for (const barrier of barriersBySource.get(nodeId) ?? []) {
+      for (const barrier of joinTargets) {
         barrier.arrive(nodeId, instanceId);
         if (barrier.isComplete()) {
           const meta = joinBarrierMetaById.get(barrier.id)!;
@@ -276,14 +347,14 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     frontier = options.initialFrontier;
     steps = options.initialStep ?? 0;
   } else {
-    const seed = transition([{ nodeId: START, instanceId: START }], state);
+    const seed = transition([{ nodeId: START, instanceId: START }], state, 0);
+    if (seed.unmatchedRouterError) return { status: "failed", state, steps: 0, error: seed.unmatchedRouterError };
     if (seed.reachedEnd) return { status: "completed", state, steps: 0 };
     frontier = seed.next;
     steps = 0;
   }
 
   const maxConcurrency = options.maxConcurrency ?? graph.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
-  const persistence = options.persistence;
 
   while (frontier.length > 0) {
     steps += 1;
@@ -384,7 +455,8 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
       return { status: "failed", state, steps, error };
     }
 
-    const { next, reachedEnd } = transition(stepFrontier, state);
+    const { next, reachedEnd, unmatchedRouterError } = transition(stepFrontier, state, steps);
+    if (unmatchedRouterError) return { status: "failed", state, steps, error: unmatchedRouterError };
     if (reachedEnd) return { status: "completed", state, steps };
 
     if (next.length === 0) {

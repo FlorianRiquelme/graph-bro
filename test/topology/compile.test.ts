@@ -411,3 +411,76 @@ describe("compile: join-desync lint (§14.9)", () => {
     expect(result.warnings).toHaveLength(0);
   });
 });
+
+describe("compile: non-exhaustive-router lint (U3, demoted form of R3's compile-time exhaustiveness)", () => {
+  it("warns on a node whose every out-edge is guarded", () => {
+    const topology = {
+      nodes: [
+        { id: "router", kind: "set" as const, update: {} },
+        { id: "branch_a", kind: "set" as const, update: {} },
+      ],
+      edges: [{ from: "router", to: "branch_a", when: { key: "choice", equals: "a" } }],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings).toContainEqual(expect.objectContaining({ code: "non-exhaustive-router", node: "router" }));
+  });
+
+  it("stays silent when an unguarded edge is present alongside a guarded one", () => {
+    const topology = {
+      nodes: [
+        { id: "router", kind: "set" as const, update: {} },
+        { id: "branch_a", kind: "set" as const, update: {} },
+        { id: "fallback", kind: "set" as const, update: {} },
+      ],
+      edges: [
+        { from: "router", to: "branch_a", when: { key: "choice", equals: "a" } },
+        { from: "router", to: "fallback" },
+      ],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings.some((w) => w.code === "non-exhaustive-router")).toBe(false);
+  });
+
+  it("stays silent on a fully-guarded node that is also a fan-out source", () => {
+    const topology = {
+      nodes: [
+        { id: "dispatch", kind: "set" as const, update: { "batch.items": ["a"] } },
+        { id: "reader", kind: "agent" as const, read_only: true as const, model: "m", prompt: "p", output_key: "o" },
+      ],
+      edges: [
+        { from: "dispatch", to: "reader", when: { key: "go", truthy: true } },
+        { from: "dispatch", for_each: "batch.items", as: "item", to: "reader" },
+      ],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings.some((w) => w.code === "non-exhaustive-router")).toBe(false);
+  });
+
+  it("stays silent on a fully-guarded node that is also a join source", () => {
+    const topology = {
+      nodes: [
+        { id: "r", kind: "set" as const, update: {} },
+        { id: "side", kind: "set" as const, update: {} },
+        { id: "collector", kind: "set" as const, update: {} },
+      ],
+      edges: [
+        { from: "r", to: "side", when: { key: "never", truthy: true } },
+        { from: ["r"], mode: "all" as const, reducer: "append" as const, into: "results", to: "collector" },
+      ],
+      max_steps: 10,
+    };
+    const result = compile(topology);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.warnings.some((w) => w.code === "non-exhaustive-router")).toBe(false);
+  });
+});

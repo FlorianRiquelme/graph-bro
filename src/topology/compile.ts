@@ -16,7 +16,7 @@ import {
   type Topology,
   type TopologyNode,
 } from "./schema.js";
-import { lintJoinDesync, type LintWarning } from "./lint.js";
+import { lintJoinDesync, lintNonExhaustiveRouter, type LintWarning } from "./lint.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -165,7 +165,7 @@ export function compile(input: unknown): CompileResult {
     joinBarriers,
   };
 
-  return { ok: true, compiled, warnings: lintJoinDesync(topology) };
+  return { ok: true, compiled, warnings: [...lintJoinDesync(topology), ...lintNonExhaustiveRouter(topology)] };
 }
 
 /**
