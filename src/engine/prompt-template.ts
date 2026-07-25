@@ -1,15 +1,6 @@
 import { getPath } from "./state.js";
 import type { EngineState } from "./state.js";
-
-/**
- * Capture 1 is the optional escape backslash, capture 2 the dotted path. Only
- * the *opening* delimiter is significant, so a bare `}}` needs no escape.
- * Shared with `extractTokenPaths` deliberately: the lint (graph-bro#7) and the
- * renderer must agree on what counts as a token, or the lint reports on text
- * the renderer never touches. Safe to share despite the `g` flag — `replace`
- * and `matchAll` both leave `lastIndex` untouched.
- */
-const TOKEN_PATTERN = /(\\)?\{\{\s*([^}]+?)\s*\}\}/g;
+import { TOKEN_PATTERN } from "../topology/prompt-tokens.js";
 
 /**
  * Fail-loud counterpart to `StateConflictError` (R5, ADR-0006's fail-loud
@@ -57,14 +48,4 @@ export function renderPromptTemplate(template: string, input: EngineState, nodeI
     const value = getPath(input, path);
     return serialize(value, nodeId, path);
   });
-}
-
-/**
- * The dotted paths of every live token in `template`, in source order —
- * escaped tokens excluded, since those are literal text the renderer never
- * resolves. The static seam graph-bro#7's root-key check reads, so that the
- * lint and the renderer share one definition of the token grammar.
- */
-export function extractTokenPaths(template: string): string[] {
-  return [...template.matchAll(TOKEN_PATTERN)].filter((match) => !match[1]).map((match) => match[2]);
 }

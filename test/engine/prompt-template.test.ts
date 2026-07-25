@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  extractTokenPaths,
-  renderPromptTemplate,
-  UnresolvedPromptTokenError,
-} from "../../src/engine/prompt-template.js";
+import { renderPromptTemplate, UnresolvedPromptTokenError } from "../../src/engine/prompt-template.js";
+import { extractTokenPaths } from "../../src/topology/prompt-tokens.js";
 
 describe("engine: prompt-template (R1/R3/R4/R5)", () => {
   it("resolves a single token against the input snapshot", () => {
@@ -121,6 +118,22 @@ describe("engine: prompt-template (R1/R3/R4/R5)", () => {
       // `\\{{ a }}` unescapes rather than emitting a backslash then substituting.
       // Documented in renderPromptTemplate's docstring; no consumer needs it today.
       expect(renderPromptTemplate("\\\\{{ a }}", { a: "x" }, "reader")).toBe("\\{{ a }}");
+    });
+
+    it("is authorable through a topology JSON file — the doubled backslash the docs teach (graph-bro#8)", () => {
+      // `\{` is not a legal JSON string escape, so the single-backslash runtime
+      // form the docs describe cannot be written directly in a topology JSON
+      // file; the JSON source must double the backslash. This is the layer
+      // that made the documented single-backslash form unauthorable, so it's
+      // exercised as a hand-written JSON string literal rather than through
+      // `JSON.stringify`, which every other fixture in this repo goes through.
+      const topologyJson = String.raw`{"prompt": "emit \\{{ not a token }} verbatim"}`;
+      const parsed = JSON.parse(topologyJson) as { prompt: string };
+      expect(parsed.prompt).toBe("emit \\{{ not a token }} verbatim");
+
+      const rendered = renderPromptTemplate(parsed.prompt, {}, "reader");
+      expect(rendered).toContain("{{ not a token }}");
+      expect(extractTokenPaths(parsed.prompt)).toEqual([]);
     });
   });
 

@@ -41,7 +41,7 @@ describe("topology: prompt-token root-key check (graph-bro#7)", () => {
       expect(roots).toContain("beta");
     });
 
-    it("collects a fan-out edge's `as` binding and a join edge's `into`", () => {
+    it("collects a fan-out edge's `as` binding", () => {
       const topology = {
         nodes: [
           { id: "dispatch", kind: "set", update: { batch: { items: ["a"] } } },
@@ -58,7 +58,9 @@ describe("topology: prompt-token root-key check (graph-bro#7)", () => {
       };
       const roots = collectStateRootKeys(compiled(topology), []);
       expect(roots).toContain("item");
-      expect(roots).toContain("joined");
+      // A join's `into` is a reducer-lookup key, not a state write — no node
+      // here writes "joined", so it must not be counted as a producible root.
+      expect(roots).not.toContain("joined");
     });
 
     it("collects the run's initial input root keys", () => {
@@ -157,6 +159,26 @@ describe("topology: prompt-token root-key check (graph-bro#7)", () => {
         max_steps: 10,
       };
       expect(checkPromptTokens(compiled(topology), [])).toEqual([]);
+    });
+
+    it("rejects a token rooted at a join `into` that no node writes (graph-bro#7)", () => {
+      const topology = {
+        nodes: [
+          { id: "dispatch", kind: "set", update: { batch: { items: ["a"] } } },
+          agent("reader", "read {{ item }}", "reader_out"),
+          agent("collector", "collected: {{ collected }}"),
+        ],
+        edges: [
+          { from: "START", to: "dispatch" },
+          { from: "dispatch", for_each: "batch.items", as: "item", to: "reader" },
+          { from: ["reader"], mode: "all", reducer: "dedup", into: "collected", to: "collector" },
+          { from: "collector", to: "END" },
+        ],
+        max_steps: 10,
+      };
+      const errors = checkPromptTokens(compiled(topology), []);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toMatchObject({ root: "collected" });
     });
 
     it("ignores set nodes — only agent prompts are templated", () => {

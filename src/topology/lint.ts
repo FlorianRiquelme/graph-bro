@@ -1,4 +1,4 @@
-import { extractTokenPaths } from "../engine/prompt-template.js";
+import { extractTokenPaths } from "./prompt-tokens.js";
 import type { CompiledTopology } from "./compile.js";
 import type { Edge, JoinEdge, Topology } from "./schema.js";
 import { isJoinEdge, isPlainEdge } from "./schema.js";
@@ -64,8 +64,12 @@ export function lintJoinDesync(topology: Topology): JoinDesyncWarning[] {
 
 /**
  * Every root state key the run can produce: `set` update keys, `agent`
- * `output_key`s, fan-out `as` bindings, join `into` keys, plus the top-level
- * keys of the run's `--input` snapshot.
+ * `output_key`s, fan-out `as` bindings, plus the top-level keys of the run's
+ * `--input` snapshot. A join's `into` is deliberately not counted here — it
+ * is only ever used as a reducer-lookup key, never itself written into state
+ * (`reducerForKey.set(jb.into, jb.reducer)`), so in intended usage it
+ * coincides with some node's `output_key`, which already contributes that
+ * root on its own.
  *
  * Root keys only, and deliberately flat: `mergeWrites` assigns each write key
  * verbatim, so an update key written as `"batch.items"` produces one top-level
@@ -89,7 +93,6 @@ export function collectStateRootKeys(compiled: CompiledTopology, inputRootKeys: 
     }
   }
   for (const edge of compiled.fanOutEdges) roots.add(edge.as);
-  for (const barrier of compiled.joinBarriers) roots.add(barrier.into);
 
   return [...roots];
 }
