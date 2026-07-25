@@ -25,6 +25,7 @@ import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 import { createWorkspace, finalizeWorkspace, reuseWorkspace } from "../workspace/lifecycle.js";
 import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
+import { commitAttempt, readHead } from "../workspace/commit.js";
 import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
@@ -104,6 +105,66 @@ function withConsumerBaseline(consumerRepoPath: string, baseline: ConsumerBaseli
   };
 }
 
+/** Tracks the workspace's HEAD across `commitAttempt` calls — updated by both the before-invocation hook and the terminal-path teardown commit. */
+interface WorkspaceHeadState {
+  current: string;
+}
+
+/**
+ * KTD-7: the attempt commit boundary, expressed as a before-invocation hook
+ * on the bounded node — "commit whatever the workspace holds, then invoke"
+ * is the boundary's own definition. `attemptCounts` mirrors the loop's own
+ * per-node counter (KTD-5) exactly: both increment once per activation, in
+ * the same order (the loop increments then calls this fn), so the numbers
+ * always agree without the runtime reading the loop's internal state —
+ * KTD-10 forbids `src/engine` from importing the workspace module, so this
+ * lives entirely on the runtime side of that seam.
+ */
+function withAttemptCommit(
+  workspacePath: string,
+  nodeId: string,
+  attemptCounts: Map<string, number>,
+  headState: WorkspaceHeadState,
+  db: ReturnType<typeof openDb>,
+  runId: string,
+  fn: NodeFn,
+): NodeFn {
+  return async (state) => {
+    const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
+    attemptCounts.set(nodeId, attemptNumber);
+    const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId });
+    headState.current = result.head;
+    if (result.quiescenceWarning) {
+      appendEvent(db, { runId, node: nodeId, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+    }
+    return fn(state);
+  };
+}
+
+/**
+ * R21: the boundary hook above only fires on the bounded node's re-entry, so
+ * a run that converges, fails, or hits `not_converged` without ever
+ * re-activating it would otherwise leave its last attempt uncommitted — and
+ * a topology with no bounded node at all never fires the hook in the first
+ * place. Called on every terminal path, right before `finalizeWorkspace`;
+ * `commitAttempt`'s own no-op check makes this a no-op when the workspace is
+ * already clean (a read-only-only run, or a hook that already just fired).
+ */
+function commitFinalAttempt(
+  workspacePath: string,
+  attemptCounts: Map<string, number>,
+  headState: WorkspaceHeadState,
+  db: ReturnType<typeof openDb>,
+  runId: string,
+): void {
+  const attemptNumber = attemptCounts.size > 0 ? Math.max(...attemptCounts.values()) : 1;
+  const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId: "run-teardown" });
+  headState.current = result.head;
+  if (result.quiescenceWarning) {
+    appendEvent(db, { runId, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+  }
+}
+
 /**
  * Builds one untraced `NodeFn` per compiled node: `agent` via
  * `makeAgentNodeFn` (against the narrow `Executor` seam — a stub in tests,
@@ -124,6 +185,7 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor, cwd
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,
             prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
+            outputSchema: node.output_schema,
             networkDomains: node.network_domains,
           })
         : (): EngineUpdate => ({ ...node.update });
@@ -251,10 +313,28 @@ async function main(): Promise<void> {
     maxConcurrency: compiled.maxConcurrency,
     attemptBounds,
   };
+
+  // Resolved before node fns are built: U7's attempt-commit hook seeds its
+  // own per-node counter from the same continued count KTD-5 restores for
+  // the loop, so the two stay numerically identical across a resume.
+  const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
+  const resumed = mode === "resume" ? resumeRun(db, runId, { reducerForKey }) : undefined;
+
+  // U7/KTD-7: `headState` tracks the workspace's HEAD across attempt
+  // commits — starting at wherever the workspace already is, whether that's
+  // the creation commit (`start`) or wherever a crashed prior process left
+  // it (`resume`, no special-casing needed since git already reflects it).
+  const headState = { current: readHead(workspacePath) };
+  const commitAttemptCounts = new Map<string, number>(Object.entries(resumed?.attempts ?? {}));
+
   const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
   const nodeFns: Record<string, NodeFn> = {};
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
-    nodeFns[nodeId] = withTracing(db, runId, nodeId, withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn));
+    let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
+    if (attemptBounds[nodeId] !== undefined) {
+      wrapped = withAttemptCommit(workspacePath, nodeId, commitAttemptCounts, headState, db, runId, wrapped);
+    }
+    nodeFns[nodeId] = withTracing(db, runId, nodeId, wrapped);
   }
 
   let runLoopOptions: RunLoopOptions;
@@ -262,17 +342,15 @@ async function main(): Promise<void> {
     const input = (inputArg ? JSON.parse(inputArg) : {}) as EngineState;
     runLoopOptions = { graph, nodeFns, initialState: input, persistence: { db, runId } };
   } else {
-    const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
-    const resumed = resumeRun(db, runId, { reducerForKey });
-    const initialBarrierState = reconstructBarrierState(compiled, resumed.state, resumed.completedInstanceIds);
+    const initialBarrierState = reconstructBarrierState(compiled, resumed!.state, resumed!.completedInstanceIds);
     runLoopOptions = {
       graph,
       nodeFns,
-      initialState: resumed.state,
-      initialFrontier: resumed.frontier,
-      initialStep: resumed.step,
+      initialState: resumed!.state,
+      initialFrontier: resumed!.frontier,
+      initialStep: resumed!.step,
       initialBarrierState,
-      initialAttempts: resumed.attempts,
+      initialAttempts: resumed!.attempts,
       persistence: { db, runId },
     };
   }
@@ -305,6 +383,13 @@ async function main(): Promise<void> {
     if (result.status === "completed") {
       writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
     }
+    // R21/U7: every terminal path commits whatever attempt is left, even one
+    // that never re-activated the bounded node — a no-op via commitAttempt's
+    // own check if the boundary hook already committed it. This runs BEFORE
+    // `updateRunStatus` so a "completed" row is never observable — to the
+    // CLI's `status`/`result`, or to a resuming process — before the commit
+    // it implies has actually landed.
+    commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
     updateRunStatus(db, runId, result.status);
     process.exitCode = mapStatusToExitCode(result.status);
     // KTD-9: a converged run needs no directory (the branch is the
@@ -313,6 +398,7 @@ async function main(): Promise<void> {
     finalizeWorkspace({ consumerRepoPath, workspacePath, converged: result.status === "completed" });
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    commitFinalAttempt(workspacePath, commitAttemptCounts, headState, db, runId);
     updateRunStatus(db, runId, "failed");
     process.exitCode = 1;
     finalizeWorkspace({ consumerRepoPath, workspacePath, converged: false });
