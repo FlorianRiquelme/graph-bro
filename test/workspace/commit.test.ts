@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt } from "../../src/workspace/commit.js";
 import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
+import { waitFor } from "../fixtures/cli-harness.js";
 
 /** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
 function symbolicRefOrEmpty(cwd: string): string {
@@ -200,7 +201,7 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  it("a detached background writer left behind is reported via a quiescence warning rather than silently absorbed", () => {
+  it("a detached background writer left behind is reported via a quiescence warning rather than silently absorbed", async () => {
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "x.txt"), "x\n");
 
@@ -216,6 +217,13 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
       ["-e", `let n = 0; setInterval(() => require('fs').writeFileSync(${JSON.stringify(target)}, String(n++)), 2);`],
       { stdio: "ignore" },
     );
+
+    // `spawn` returns before the child process has actually booted and run
+    // its first write — on a heavily loaded (e.g. 2-fork CI) runner,
+    // `commitAttempt` below can win that race and observe a clean tree.
+    // Block on the straggler's first observable write instead of guessing a
+    // delay, so the assertion no longer depends on which side wins a race.
+    await waitFor(() => existsSync(target), 5000);
 
     let result: ReturnType<typeof commitAttempt>;
     try {

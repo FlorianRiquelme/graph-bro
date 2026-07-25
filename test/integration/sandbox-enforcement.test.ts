@@ -25,6 +25,17 @@ const MODEL = "claude-haiku-4-5";
 const AGENT_TIMEOUT_MS = 45_000;
 const TEST_TIMEOUT_MS = 60_000;
 
+// Opt-in only (U1/R3, KTD-2): this block spends live model quota against a
+// real, authenticated `claude` CLI, which the default gate must run without
+// (no `claude` binary, no login). `npm run test:e2e` sets this.
+const LIVE = process.env.GRAPH_BRO_LIVE_CLI_TESTS === "1";
+if (!LIVE) {
+  console.warn(
+    "[sandbox-enforcement] skipping the live-CLI describe block: set GRAPH_BRO_LIVE_CLI_TESTS=1 " +
+      "(via `npm run test:e2e`) to run it. Requires an authenticated `claude` CLI on PATH and spends live model quota.",
+  );
+}
+
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
 }
@@ -57,7 +68,7 @@ async function runWrite(
   });
 }
 
-describe("integration/sandbox-enforcement: KTD-3's five layers against the real claude CLI", () => {
+describe.runIf(LIVE)("integration/sandbox-enforcement: KTD-3's five layers against the real claude CLI", () => {
   let workspace: string;
 
   beforeEach(() => {
