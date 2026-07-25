@@ -143,6 +143,46 @@ function currentHead(target: WorkspaceGitTarget): string {
   return runWorkspaceGit(target, ["rev-parse", "HEAD"]).trim();
 }
 
+/** How many times `git add -A` is retried when a file is being rewritten underneath it. */
+const STAGE_ATTEMPTS = 5;
+/**
+ * git's own wording when a file changed size while it was being hashed. Matched
+ * rather than retrying every failure, so a genuine error (a bad object, a full
+ * disk, a locked index) still surfaces immediately instead of being retried
+ * five times and reported late.
+ */
+const CONCURRENT_MODIFICATION = /short read while indexing|unable to index file|file changed as we read it/i;
+
+/**
+ * `git add -A`, tolerant of a detached process still writing into the
+ * workspace.
+ *
+ * A node can leave a background writer behind, which is a case this module
+ * already knows about and deliberately reports as a *warning* rather than a
+ * failure (`quiescenceWarning`). But `git add -A` itself dies with `fatal:
+ * adding files failed` when a file it is hashing shrinks mid-read — so the
+ * whole attempt commit, and with it the run, failed before the warning could
+ * ever be produced. The graceful path was unreachable in precisely the
+ * scenario it was written for.
+ *
+ * A retry is the right shape because the condition is transient by
+ * definition: the next pass re-stats and re-reads whatever the writer has
+ * settled on. If every attempt loses the race the throw stands — at that
+ * point the workspace genuinely cannot be snapshotted, and R20's
+ * fold-rather-than-fail does not extend to inventing a commit from a tree
+ * that will not hold still.
+ */
+function stageAll(target: WorkspaceGitTarget): void {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      runWorkspaceGit(target, ["add", "-A"]);
+      return;
+    } catch (err) {
+      const detail = `${(err as { stderr?: unknown }).stderr ?? ""}${(err as Error).message ?? ""}`;
+      if (attempt >= STAGE_ATTEMPTS || !CONCURRENT_MODIFICATION.test(detail)) throw err;
+    }
+  }
+}
 
 function porcelain(target: WorkspaceGitTarget): string {
   return runWorkspaceGit(target, ["status", "--porcelain"]);
@@ -198,7 +238,7 @@ export function commitAttempt(options: CommitAttemptOptions): CommitAttemptResul
     return { committed: false, head: priorHead };
   }
 
-  runWorkspaceGit(target, ["add", "-A"]);
+  stageAll(target);
   // `--soft` moves the branch ref back to `priorHead` without touching the
   // index or working tree, so the diff between `priorHead` and whatever was
   // just staged now includes both the agent's own commits (already reflected

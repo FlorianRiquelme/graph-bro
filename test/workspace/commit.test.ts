@@ -278,10 +278,22 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     // single write inside that narrow window. A writer active throughout is
     // certain to still be dirtying the tree by the time commitAttempt's own
     // post-commit status check runs.
+    //
+    // A tight loop, not a 2ms `setInterval`. `commitAttempt` is synchronous,
+    // so nothing here can synchronise with the moment its post-commit status
+    // check runs — the writer just has to be dirtying the tree throughout.
+    // A timer-driven writer only needs to lose its scheduling slice for the
+    // length of four git subprocesses to leave a clean tree, which is what
+    // made this flake roughly one full-suite run in five. A runnable
+    // tight-loop process would have to be starved of *every* core for that
+    // whole window instead. That is mitigation, not a proof: the honest
+    // deterministic fix is to make the post-commit dirt check injectable, and
+    // that is deliberately not being done here to keep a test concern out of
+    // production code.
     const target = join(workspace, "straggler.txt");
     const straggler = spawn(
       process.execPath,
-      ["-e", `let n = 0; setInterval(() => require('fs').writeFileSync(${JSON.stringify(target)}, String(n++)), 2);`],
+      ["-e", `let n = 0; const fs = require('fs'); for (;;) fs.writeFileSync(${JSON.stringify(target)}, String(n++));`],
       { stdio: "ignore" },
     );
 
