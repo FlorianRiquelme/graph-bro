@@ -153,9 +153,18 @@ export class ClaudeCodeExecutor implements Executor {
       }
     }, pollMs);
 
+    // Captured in the exit handler, not read off the child afterwards: the
+    // `finally` below group-kills unconditionally, which can overwrite
+    // `signalCode` and erase how the process actually ended.
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     try {
       await new Promise<void>((resolve, reject) => {
-        spawned.child.once("exit", () => resolve());
+        spawned.child.once("exit", (code, signal) => {
+          exitCode = code;
+          exitSignal = signal;
+          resolve();
+        });
         spawned.child.once("error", (err) => reject(err));
       });
     } finally {
@@ -183,6 +192,17 @@ export class ClaudeCodeExecutor implements Executor {
     }
     // Process exited with no terminal event before EOF — a real hang (hard-killed) or an
     // unexpected early exit either way; report a synthetic error rather than throw.
-    return { text: "", isError: true, durationMs: Date.now() - startedAt };
+    // The cause has to be spelled out here: this text is all the caller gets
+    // (`runLoop` wraps it as "agent node '<id>' failed: <text>"), and an empty
+    // string leaves an operator — or a CI log — with a failed run and no reason.
+    const stderr = spawned.stderrTail().trim();
+    const cause = timedOut
+      ? `hard heartbeat timeout after ${options.timeout}ms of silence`
+      : `exited without a terminal result envelope (exit code ${exitCode ?? "none"}, signal ${exitSignal ?? "none"})`;
+    return {
+      text: `node process ${cause}${stderr ? `; stderr tail: ${stderr}` : "; no stderr output"}`,
+      isError: true,
+      durationMs: Date.now() - startedAt,
+    };
   }
 }

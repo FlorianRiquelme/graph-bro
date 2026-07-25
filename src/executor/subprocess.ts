@@ -5,7 +5,18 @@ export interface SpawnedProcess {
   pid: number;
   /** The process-group id. Equal to `pid` — `detached: true` makes the child its own group leader (§14.7). */
   pgid: number;
+  /**
+   * The tail of the child's stderr, capped at `STDERR_TAIL_LIMIT`. stderr has
+   * to be drained regardless (an unread pipe backpressures and eventually
+   * stalls the child), so retaining the tail of what is already being read
+   * costs a bounded buffer and turns an otherwise silent death — a child that
+   * exits before emitting a terminal envelope — into a reportable cause.
+   */
+  stderrTail: () => string;
 }
+
+/** Enough for a stack trace or a CLI usage error; small enough to keep in memory per in-flight node. */
+const STDERR_TAIL_LIMIT = 8192;
 
 export interface SpawnOptions {
   cwd: string;
@@ -26,9 +37,14 @@ export function spawnDetached(command: string, args: string[], options: SpawnOpt
   if (child.pid === undefined) {
     throw new Error(`failed to spawn '${command}': no pid assigned`);
   }
-  // Drain stderr so an unread pipe never backpressures the child; this slice doesn't parse it.
-  child.stderr?.resume();
-  return { child, pid: child.pid, pgid: child.pid };
+  // Drain stderr so an unread pipe never backpressures the child, keeping only
+  // the tail — the whole stream is unbounded (a chatty CLI can emit megabytes),
+  // but the last few KB is what names the cause when the child dies early.
+  let stderrTail = "";
+  child.stderr?.on("data", (chunk: Buffer | string) => {
+    stderrTail = (stderrTail + chunk.toString()).slice(-STDERR_TAIL_LIMIT);
+  });
+  return { child, pid: child.pid, pgid: child.pid, stderrTail: () => stderrTail };
 }
 
 /**
