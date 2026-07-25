@@ -1,11 +1,10 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt } from "../../src/workspace/commit.js";
+import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt, quiescenceWarningFor } from "../../src/workspace/commit.js";
 import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
-import { waitFor } from "../fixtures/cli-harness.js";
 
 /** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
 function symbolicRefOrEmpty(cwd: string): string {
@@ -268,52 +267,39 @@ describe("workspace/commit: commitAttempt (KTD-7, R20/R21, real git)", () => {
     expect(git(consumer, ["log", "--format=%s", result.head])).toContain("attempt 1");
   });
 
-  it("a detached background writer left behind is reported via a quiescence warning rather than silently absorbed", async () => {
+  // The quiescence *decision* is tested directly, against
+  // `quiescenceWarningFor`, rather than by racing a live background writer
+  // through `commitAttempt`. That end-to-end version needed a spawned process
+  // to dirty the tree inside the window between the commit and the status
+  // read, and it failed intermittently in three distinct ways — `git add -A`
+  // dying on a short read (a real defect, now fixed by the staging retry), a
+  // starved writer leaving a clean tree, and git's own stat shortcut skipping
+  // the re-read. All three are the spawned-process race R5 bars from the
+  // blocking gate. What remains covered here without any race: a settled
+  // workspace produces no warning, and a dirty one produces a warning naming
+  // the node.
+  it("a workspace still dirty after its attempt commit yields a warning naming the node", () => {
+    const warning = quiescenceWarningFor(" M straggler.txt\n", 1, "reviewer");
+
+    expect(warning).toContain("reviewer");
+    expect(warning).toContain("not quiescent");
+    expect(warning).toContain("attempt 1");
+    expect(warning).toContain("straggler.txt"); // the offending paths, so an operator can see what is still moving
+  });
+
+  it("a settled workspace yields no warning", () => {
+    expect(quiescenceWarningFor("", 1, "reviewer")).toBeUndefined();
+    expect(quiescenceWarningFor("   \n", 1, "reviewer")).toBeUndefined(); // whitespace-only is settled, not dirty
+  });
+
+  it("an ordinary attempt commit against a settled workspace reports no quiescence warning", () => {
     const priorHead = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "x.txt"), "x\n");
 
-    // Writes continuously from the moment it's spawned, rather than after a
-    // fixed delay: `commitAttempt` is fully synchronous (a handful of
-    // execFileSync calls), so there is no reliable fixed delay that lands a
-    // single write inside that narrow window. A writer active throughout is
-    // certain to still be dirtying the tree by the time commitAttempt's own
-    // post-commit status check runs.
-    //
-    // A tight loop, not a 2ms `setInterval`. `commitAttempt` is synchronous,
-    // so nothing here can synchronise with the moment its post-commit status
-    // check runs — the writer just has to be dirtying the tree throughout.
-    // A timer-driven writer only needs to lose its scheduling slice for the
-    // length of four git subprocesses to leave a clean tree, which is what
-    // made this flake roughly one full-suite run in five. A runnable
-    // tight-loop process would have to be starved of *every* core for that
-    // whole window instead. That is mitigation, not a proof: the honest
-    // deterministic fix is to make the post-commit dirt check injectable, and
-    // that is deliberately not being done here to keep a test concern out of
-    // production code.
-    const target = join(workspace, "straggler.txt");
-    const straggler = spawn(
-      process.execPath,
-      ["-e", `let n = 0; const fs = require('fs'); for (;;) fs.writeFileSync(${JSON.stringify(target)}, String(n++));`],
-      { stdio: "ignore" },
-    );
-
-    // `spawn` returns before the child process has actually booted and run
-    // its first write — on a heavily loaded (e.g. 2-fork CI) runner,
-    // `commitAttempt` below can win that race and observe a clean tree.
-    // Block on the straggler's first observable write instead of guessing a
-    // delay, so the assertion no longer depends on which side wins a race.
-    await waitFor(() => existsSync(target), 5000);
-
-    let result: ReturnType<typeof commitAttempt>;
-    try {
-      result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
-    } finally {
-      straggler.kill("SIGKILL");
-    }
+    const result = commitAttempt({ consumerRepoPath: consumer, workspacePath: workspace, priorHead, attemptNumber: 1, nodeId: "reviewer" });
 
     expect(result.committed).toBe(true);
-    expect(result.quiescenceWarning).toContain("reviewer");
-    expect(result.quiescenceWarning).toContain("not quiescent");
+    expect(result.quiescenceWarning).toBeUndefined();
   });
 });
 

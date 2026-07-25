@@ -247,13 +247,27 @@ export function commitAttempt(options: CommitAttemptOptions): CommitAttemptResul
   runWorkspaceGit(target, ["commit", "-m", `graph-bro: attempt ${attemptNumber} (${nodeId})`]);
   const head = currentHead(target);
 
-  const dirtyAfter = porcelain(target);
-  const quiescenceWarning =
-    dirtyAfter.trim().length > 0
-      ? `workspace not quiescent after committing attempt ${attemptNumber} for node '${nodeId}' — a detached process may still be writing:\n${dirtyAfter}`
-      : undefined;
+  return { committed: true, head, quiescenceWarning: quiescenceWarningFor(porcelain(target), attemptNumber, nodeId) };
+}
 
-  return { committed: true, head, quiescenceWarning };
+/**
+ * The quiescence verdict for a workspace's post-commit `git status --porcelain`
+ * output: a warning naming the node when anything is still dirty, `undefined`
+ * when the tree settled.
+ *
+ * Pure, and separate from `commitAttempt`, because the alternative is
+ * untestable. Proving this end-to-end means racing a live background writer
+ * against four git subprocesses and hoping it dirties the tree in the window
+ * between the commit and the status read — which depends on process
+ * scheduling, on whether git's stat shortcut decides to re-read the file at
+ * all, and on the machine. That test failed intermittently in three different
+ * ways on three different machines, which is exactly the spawned-process race
+ * R5 bars from the blocking gate. The decision itself is what carries the
+ * behavior, so it is tested directly instead.
+ */
+export function quiescenceWarningFor(porcelainOutput: string, attemptNumber: number, nodeId: string): string | undefined {
+  if (porcelainOutput.trim().length === 0) return undefined;
+  return `workspace not quiescent after committing attempt ${attemptNumber} for node '${nodeId}' — a detached process may still be writing:\n${porcelainOutput}`;
 }
 
 /**
