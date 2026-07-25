@@ -13,11 +13,12 @@ export interface ConsumerBaseline {
   porcelain: string;
   /** Catches a further edit to a file that was *already* dirty at baseline capture — porcelain alone can't, since its status line ("M") doesn't change. */
   diff: string;
-  /** `git for-each-ref` output with every `graph-bro/run-*` branch filtered out — a linked worktree commits into the consumer's real ref store on every attempt, which plain `git status` cannot see, and other concurrent runs' branches are not "the consumer's own" refs either (R15). */
+  /** `git for-each-ref` output with graph-bro's whole ref namespace filtered out — a linked worktree commits into the consumer's real ref store on every attempt, which plain `git status` cannot see, and every ref graph-bro creates under its own namespace (run branches, partial-attempt refs) is the run's declared footprint, not "the consumer's own" refs, whether from this run or a concurrent one (R16). */
   refs: string;
 }
 
-const RUN_BRANCH_REF_PREFIX = "refs/heads/graph-bro/run-";
+/** Every ref graph-bro itself creates in the consumer's shared ref store — run branches under `refs/heads/`, and partial-attempt refs outside it (KTD-13) — never the consumer's own refs. */
+const GRAPH_BRO_REF_PREFIXES = ["refs/heads/graph-bro/run-", "refs/graph-bro/"];
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -27,7 +28,7 @@ function captureRefs(consumerRepoPath: string): string {
   const output = git(consumerRepoPath, ["for-each-ref", "--format=%(refname) %(objectname)"]);
   return output
     .split("\n")
-    .filter((line) => !line.startsWith(RUN_BRANCH_REF_PREFIX))
+    .filter((line) => !GRAPH_BRO_REF_PREFIXES.some((prefix) => line.startsWith(prefix)))
     .join("\n");
 }
 

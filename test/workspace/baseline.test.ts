@@ -98,4 +98,23 @@ describe("workspace/baseline: assertConsumerBaseline (R12/R16/R17 backstop, KTD-
 
     expect(() => assertConsumerBaseline(consumer, baseline, "reader")).not.toThrow();
   });
+
+  it("Covers R16: a partial-attempt ref appearing after baseline capture does not trip the assertion — it is graph-bro's own namespace, not a consumer ref", () => {
+    const baseline = captureConsumerBaseline(consumer);
+    const head = git(consumer, ["rev-parse", "HEAD"]).trim();
+    git(consumer, ["update-ref", "refs/graph-bro/partial-attempt/run-some-run-id/1", head]);
+
+    expect(() => assertConsumerBaseline(consumer, baseline, "reader")).not.toThrow();
+  });
+
+  it("Covers R16: a run in flight is unaffected by a concurrent run's resume writing a partial-attempt ref for a different run into the same consumer repo", () => {
+    const baseline = captureConsumerBaseline(consumer);
+    const head = git(consumer, ["rev-parse", "HEAD"]).trim();
+    // Simulates a second, unrelated run being resumed against the same consumer
+    // repo while this run is still in flight — its interrupted-attempt ref
+    // lands in the same shared ref store but must not blame this run's nodes.
+    git(consumer, ["update-ref", "refs/graph-bro/partial-attempt/some-other-run-id/1", head]);
+
+    expect(() => assertConsumerBaseline(consumer, baseline, "reader")).not.toThrow();
+  });
 });

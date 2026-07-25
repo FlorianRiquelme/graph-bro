@@ -86,9 +86,32 @@ export function commitAttempt(options: CommitAttemptOptions): CommitAttemptResul
   return { committed: true, head, quiescenceWarning };
 }
 
-/** The side ref a killed run's interrupted attempt is preserved to — never the run branch, since it was never a completed attempt (R20's one-commit-per-attempt count must not include it). */
+/**
+ * The namespace prefix under which a run's preserved interrupted attempts
+ * live — never the run branch, since none of them was ever a completed
+ * attempt (R20's one-commit-per-attempt count must not include them). Keyed
+ * on the run id alone rather than a single ref name: a run can be killed and
+ * resumed more than once, and each cycle's preserved commit must stay
+ * independently reachable rather than the next cycle silently overwriting it
+ * (KTD-13). Callers enumerate this prefix with `git for-each-ref` rather than
+ * `rev-parse`-ing a single name.
+ */
 export function partialAttemptRef(runId: string): string {
   return `refs/graph-bro/partial-attempt/${runId}`;
+}
+
+/** The next unused ref under `partialAttemptRef`'s namespace for this run — one per preserved cycle, so a second kill-and-resume never displaces the first's commit (KTD-13). `refs/graph-bro/partial-attempt/*` sits outside `refs/heads/`, so git keeps no reflog and a displaced commit would be immediately gc-eligible. */
+function nextPartialAttemptRefName(workspacePath: string, runId: string): string {
+  const namespace = partialAttemptRef(runId);
+  const existing = git(workspacePath, ["for-each-ref", "--format=%(refname)", `${namespace}/*`]).trim();
+  // Highest existing suffix + 1, not a count: counting reuses a suffix as soon
+  // as any earlier ref in the namespace is gone, which would overwrite a
+  // preserved commit — the exact silent displacement KTD-13 exists to stop.
+  const highest = existing
+    .split("\n")
+    .map((refName) => Number.parseInt(refName.slice(namespace.length + 1), 10))
+    .reduce((max, suffix) => (Number.isFinite(suffix) && suffix > max ? suffix : max), 0);
+  return `${namespace}/${highest + 1}`;
 }
 
 export interface PreserveInterruptedAttemptResult {
@@ -152,7 +175,7 @@ export function preserveInterruptedAttempt(workspacePath: string, runId: string,
     "-m",
     `graph-bro: interrupted attempt for run ${runId}`,
   ]).trim();
-  git(workspacePath, ["update-ref", partialAttemptRef(runId), sha]);
+  git(workspacePath, ["update-ref", nextPartialAttemptRefName(workspacePath, runId), sha]);
 
   git(workspacePath, ["reset", "--hard", lastGood]);
   git(workspacePath, ["clean", "-fd"]);

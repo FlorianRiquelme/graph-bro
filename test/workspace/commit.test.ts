@@ -24,6 +24,16 @@ function commitCount(cwd: string, ref = "HEAD"): number {
   return Number(git(cwd, ["rev-list", "--count", ref]).trim());
 }
 
+/** Enumerates the refs preserved under a run's partial-attempt namespace — `partialAttemptRef` returns the namespace prefix, not a single ref, per KTD-13. */
+function partialAttemptRefs(cwd: string, runId: string): { refname: string; sha: string }[] {
+  const output = git(cwd, ["for-each-ref", "--format=%(refname) %(objectname)", partialAttemptRef(runId)]).trim();
+  if (output === "") return [];
+  return output.split("\n").map((line) => {
+    const spaceIndex = line.indexOf(" ");
+    return { refname: line.slice(0, spaceIndex), sha: line.slice(spaceIndex + 1) };
+  });
+}
+
 /** A throwaway workspace-shaped repo — mirrors what `createWorkspace` hands the runtime. */
 function workspaceRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "graph-bro-commit-workspace-"));
@@ -256,7 +266,7 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
 
     expect(result.preserved).toBe(false);
     expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore);
-    expect(() => git(workspace, ["rev-parse", "--verify", partialAttemptRef("run-x")])).toThrow();
+    expect(partialAttemptRefs(workspace, "run-x")).toHaveLength(0);
   });
 
   it("Covers AE9: preserves a killed run's dirty tree — tracked and untracked — as a reachable side-ref commit, then hard-resets the workspace", () => {
@@ -274,7 +284,9 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     expect(shownTracked).toBe("mid-edit\n");
     const shownUntracked = git(workspace, ["show", `${result.sha}:new-file.txt`]);
     expect(shownUntracked).toBe("untracked\n");
-    expect(git(workspace, ["rev-parse", "--verify", partialAttemptRef("run-x")]).trim()).toBe(result.sha);
+    const refs = partialAttemptRefs(workspace, "run-x");
+    expect(refs).toHaveLength(1);
+    expect(refs[0].sha).toBe(result.sha);
 
     // ...but the run branch itself is untouched by it (never folded into an attempt commit)...
     expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore);
@@ -297,6 +309,30 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     expect(git(workspace, ["show", `${result.sha}:agent-commit.txt`])).toBe("committed mid-attempt\n");
     expect(git(workspace, ["rev-parse", "HEAD"]).trim()).toBe(headBefore); // the agent's commit is gone from the branch
     expect(existsSync(join(workspace, "agent-commit.txt"))).toBe(false); // and from the working tree
+  });
+
+  it("Covers R16/KTD-13: two kill-and-resume cycles of one run leave two independently reachable preserved commits, both enumerable under the namespace", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "cycle-one.txt"), "first interrupted attempt\n");
+    const first = preserveInterruptedAttempt(workspace, "run-z", headBefore);
+    expect(first.preserved).toBe(true);
+
+    // Second kill-and-resume cycle of the *same* run — a run-id-keyed ref
+    // would silently replace the first cycle's ref here, and since it sits
+    // outside refs/heads/, git keeps no reflog and the displaced commit
+    // would be immediately gc-eligible.
+    writeFileSync(join(workspace, "cycle-two.txt"), "second interrupted attempt\n");
+    const second = preserveInterruptedAttempt(workspace, "run-z", headBefore);
+    expect(second.preserved).toBe(true);
+
+    const refs = partialAttemptRefs(workspace, "run-z");
+    expect(refs).toHaveLength(2);
+    const shas = refs.map((r) => r.sha).sort();
+    expect(shas).toEqual([first.sha, second.sha].sort());
+
+    // Both commits are independently reachable and hold their own distinct content.
+    expect(git(workspace, ["show", `${first.sha}:cycle-one.txt`])).toBe("first interrupted attempt\n");
+    expect(git(workspace, ["show", `${second.sha}:cycle-two.txt`])).toBe("second interrupted attempt\n");
   });
 });
 

@@ -126,7 +126,17 @@ describe("integration/write-crash-resume: a killed write run resumes from its la
     await waitForRunStatus(home, runId, "completed", 10_000);
 
     // The interrupted attempt is preserved and reachable, not silently discarded.
-    const partialSha = execFileSync("git", ["rev-parse", "--verify", partialAttemptRef(runId)], { cwd, encoding: "utf8" }).trim();
+    // `partialAttemptRef` returns the run's namespace prefix, not a single ref
+    // (KTD-13) — enumerate it, since only one kill-and-resume cycle happened here.
+    const partialRefs = execFileSync(
+      "git",
+      ["for-each-ref", "--format=%(objectname)", partialAttemptRef(runId)],
+      { cwd, encoding: "utf8" },
+    )
+      .trim()
+      .split("\n");
+    expect(partialRefs).toHaveLength(1);
+    const partialSha = partialRefs[0];
     expect(partialSha).toBeTruthy();
     expect(execFileSync("git", ["show", `${partialSha}:work.txt`], { cwd, encoding: "utf8" })).toBe("attempt-1");
 
