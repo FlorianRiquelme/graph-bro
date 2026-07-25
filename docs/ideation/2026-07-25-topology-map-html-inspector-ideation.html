@@ -1,0 +1,1280 @@
+<title>Ideation: HTML Topology Inspector</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --surface-2: #f4f2ee;
+    --ink: #1c1a17;
+    --ink-2: #4a4640;
+    --ink-3: #767066;
+    --rule: #e2ded6;
+    --rule-2: #cfc9be;
+    --accent: #7a4a1e;
+    --accent-soft: #f7eee3;
+    --accent-text: #6a3f18;
+    --warn: #8a5a05;
+    --warn-soft: #fbf2dd;
+    --warn-text: #6f4904;
+    --good: #2f5d3a;
+    --good-soft: #eaf2ec;
+    --good-text: #274f31;
+    --info: #2c4f6b;
+    --info-soft: #eaf1f6;
+    --info-text: #24435c;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --diagram-bg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171614;
+      --surface: #1f1e1b;
+      --surface-2: #262421;
+      --ink: #ececea;
+      --ink-2: #c3bfb8;
+      --ink-3: #938d84;
+      --rule: #34322e;
+      --rule-2: #45423d;
+      --accent: #d6a06a;
+      --accent-soft: #2c241b;
+      --accent-text: #e0b184;
+      --warn: #d9a94a;
+      --warn-soft: #2e2718;
+      --warn-text: #e2ba62;
+      --good: #7fb98c;
+      --good-soft: #1e2a21;
+      --good-text: #93c79e;
+      --info: #7fabcc;
+      --info-soft: #1c262e;
+      --info-text: #96bcd8;
+      --diagram-bg: #1f1e1b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page {
+    max-width: 58rem;
+    margin-inline: auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+  p, li { max-width: 70ch; }
+  a { color: var(--accent-text); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.875em;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 0.08em 0.32em;
+  }
+  strong { color: inherit; font-weight: 650; }
+
+  .eyebrow {
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    font-weight: 600;
+    margin: 0 0 0.6rem;
+  }
+  h1 {
+    font-size: 2.1rem;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin: 0 0 1rem;
+    font-weight: 680;
+  }
+  h2 {
+    font-size: 1.4rem;
+    letter-spacing: -0.01em;
+    margin: 3.2rem 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid var(--rule-2);
+    font-weight: 660;
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 0 0 0.2rem;
+    font-weight: 640;
+    letter-spacing: -0.005em;
+  }
+  h4 {
+    font-size: 0.8rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 1.6rem 0 0.5rem;
+    font-weight: 640;
+  }
+
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.5rem;
+    margin: 0 0 1.75rem;
+    padding: 0;
+    list-style: none;
+  }
+  .meta li {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    padding: 0.22rem 0.7rem;
+    color: var(--ink-2);
+    max-width: none;
+  }
+  .meta li b { color: var(--ink-3); font-weight: 600; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 0 0 2.5rem;
+  }
+  .stats div { background: var(--surface); padding: 0.9rem 1rem; }
+  .stats .n { font-size: 1.5rem; font-weight: 660; letter-spacing: -0.02em; display: block; }
+  .stats .k {
+    font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600;
+  }
+
+  .lede { font-size: 1.06rem; color: var(--ink-2); }
+
+  .callout {
+    border: 1px solid var(--rule-2);
+    border-radius: 8px;
+    padding: 1rem 1.15rem;
+    margin: 1.5rem 0;
+    background: var(--surface-2);
+  }
+  .callout.warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+  .callout.info { background: var(--info-soft); border-color: color-mix(in srgb, var(--info) 30%, transparent); }
+  .callout .label {
+    font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
+    font-weight: 700; margin: 0 0 0.4rem; display: block;
+  }
+  .callout.warn .label { color: var(--warn-text); }
+  .callout.info .label { color: var(--info-text); }
+  .callout p { margin: 0.4rem 0 0; }
+  .callout p:first-of-type { margin-top: 0; }
+
+  dl.ground { margin: 0; }
+  dl.ground dt {
+    font-size: 0.78rem; letter-spacing: 0.07em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 660; margin-top: 1.2rem;
+  }
+  dl.ground dd { margin: 0.3rem 0 0; }
+  dl.ground dd p { margin: 0.5rem 0 0; }
+
+  ol.axes { margin: 0; padding-left: 1.4rem; }
+  ol.axes li { margin: 0.5rem 0; }
+  ol.axes b { font-family: var(--mono); font-size: 0.9em; }
+
+  .jump {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 0 0 2rem;
+  }
+  .jump ol { margin: 0; padding-left: 1.35rem; }
+  .jump li { margin: 0.28rem 0; max-width: none; }
+  .jump .ax {
+    font-family: var(--mono); font-size: 0.72rem; color: var(--ink-3);
+  }
+
+  article.idea {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 1.5rem 1.6rem;
+    margin: 0 0 1.5rem;
+  }
+  .idea-head { display: flex; gap: 0.75rem; align-items: baseline; margin-bottom: 0.75rem; }
+  .idnum {
+    font-family: var(--mono); font-size: 0.78rem; font-weight: 700;
+    background: var(--accent-soft); color: var(--accent-text);
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 999px; padding: 0.15rem 0.6rem; flex: none;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0 0 1.1rem; }
+  .chip {
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
+    border-radius: 999px; padding: 0.18rem 0.62rem;
+    border: 1px solid var(--rule-2); background: var(--surface-2); color: var(--ink-2);
+  }
+  .chip.ax { background: var(--info-soft); color: var(--info-text); border-color: color-mix(in srgb, var(--info) 28%, transparent); }
+  .chip.cf { background: var(--good-soft); color: var(--good-text); border-color: color-mix(in srgb, var(--good) 28%, transparent); }
+  .chip.cx { background: var(--accent-soft); color: var(--accent-text); border-color: color-mix(in srgb, var(--accent) 26%, transparent); }
+
+  .idea h4:first-of-type { margin-top: 0; }
+  .idea p { margin: 0.5rem 0; }
+  .basis {
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    font-size: 0.94rem;
+  }
+  .basis p { margin: 0.45rem 0; }
+  .basis p:first-child { margin-top: 0; }
+  .basis p:last-child { margin-bottom: 0; }
+  .btag {
+    font-family: var(--mono); font-size: 0.78rem; font-weight: 700; color: var(--accent-text);
+  }
+
+  figure { margin: 1.5rem 0; }
+  figure svg { display: block; width: 100%; height: auto; }
+  .figwrap {
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    background: var(--diagram-bg);
+    padding: 0.75rem;
+  }
+  figcaption { font-size: 0.84rem; color: var(--ink-3); margin-top: 0.55rem; }
+
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.7rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th {
+    font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 660; border-bottom: 2px solid var(--rule-2);
+  }
+  td:first-child { font-family: var(--mono); font-size: 0.82rem; color: var(--ink-3); white-space: nowrap; }
+  tbody tr:hover { background: var(--surface-2); }
+
+  footer.composition-signal {
+    margin-top: 4rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+    font-size: 0.8rem; color: var(--ink-3);
+  }
+  footer.composition-signal code { font-size: 0.9em; }
+
+  /* SVG shared */
+  .d-box { fill: var(--surface-2); stroke: var(--rule-2); stroke-width: 1.5; }
+  .d-box-a { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+  .d-box-g { fill: var(--good-soft); stroke: var(--good); stroke-width: 1.5; }
+  .d-box-w { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .d-box-i { fill: var(--info-soft); stroke: var(--info); stroke-width: 1.5; }
+  .d-dash { fill: none; stroke: var(--ink-3); stroke-width: 1.5; stroke-dasharray: 5 4; }
+  .d-t { font-family: var(--sans); font-size: 12px; fill: var(--ink); }
+  .d-t-sm { font-family: var(--sans); font-size: 10.5px; fill: var(--ink-2); }
+  .d-m { font-family: var(--mono); font-size: 10.5px; fill: var(--ink-2); }
+  .d-lbl {
+    font-family: var(--sans); font-size: 10.5px; fill: var(--ink-2);
+    paint-order: stroke fill; stroke: var(--diagram-bg); stroke-width: 3.5px; stroke-linejoin: round;
+  }
+  .d-ln { fill: none; stroke: var(--ink-3); stroke-width: 1.5; }
+  .d-ln-g { fill: none; stroke: var(--good); stroke-width: 2; }
+  .d-ln-w { fill: none; stroke: var(--warn); stroke-width: 2; }
+  .d-band { fill: var(--surface-2); }
+  .d-hatch-line { stroke: var(--ink-3); stroke-width: 1; }
+</style>
+
+<div class="page">
+
+<p class="eyebrow">Ideation · graph-bro</p>
+<h1>Topology map: what the HTML inspector should be</h1>
+
+<ul class="meta">
+  <li><b>date</b> <time datetime="2026-07-25">2026-07-25</time></li>
+  <li><b>topic</b> topology-map-html-inspector</li>
+  <li><b>focus</b> issue #10 — "i want that html"</li>
+  <li><b>mode</b> repo-grounded</li>
+</ul>
+
+<p class="lede">
+  <a href="https://github.com/FlorianRiquelme/graph-bro/issues/10">Issue #10</a> offered three output
+  targets for a reviewable topology picture: a Mermaid flowchart, Graphviz DOT, or a self-contained
+  interactive HTML inspector. The third is chosen, so this set does not re-argue the target. It ideates
+  <em>inside</em> the inspector: what it draws, how it behaves, how it is built, and what to decide now
+  so the deferred run overlay is an extension rather than a rewrite.
+</p>
+
+<div class="stats">
+  <div><span class="n">36</span><span class="k">raw candidates</span></div>
+  <div><span class="n">7</span><span class="k">survivors</span></div>
+  <div><span class="n">29</span><span class="k">cut</span></div>
+  <div><span class="n">5</span><span class="k">axes covered</span></div>
+</div>
+
+<div class="callout warn">
+  <span class="label">The working tree moved during this ideation</span>
+  <p>
+    This checkout was switched mid-run by a parallel session onto
+    <code>feat/graph-bro-8-prompt-template-escape-and-lint</code>, which carries two commits not yet
+    on <code>main</code>:
+    <a href="https://github.com/FlorianRiquelme/graph-bro/commit/862e36d"><code>862e36d</code></a>
+    (escape literal <code>{{ }}</code> delimiters, #8) and
+    <a href="https://github.com/FlorianRiquelme/graph-bro/commit/ef37b53"><code>ef37b53</code></a>
+    (fail <code>start</code> on a prompt token whose root key no node writes, #7).
+    <code>src/topology/lint.ts</code> grew from 45 to 130 lines. Both sit on open
+    <a href="https://github.com/FlorianRiquelme/graph-bro/pull/11">PR #11</a> — written and in
+    review, not yet merged.
+  </p>
+  <p>
+    This matters because it <strong>refuted the most-converged candidate in the whole run</strong>. All
+    five ideation frames independently proposed "statically check prompt tokens against upstream
+    producers — nothing does this today." It ships now, as <code>checkPromptTokens</code> /
+    <code>collectStateRootKeys</code>, wired into <code>src/cli/start.ts</code>. Reading the new code
+    produced a better idea, which is survivor 6 below.
+  </p>
+</div>
+
+<h2 id="grounding-context">Grounding Context</h2>
+
+<dl class="ground">
+  <dt>Codebase Context</dt>
+  <dd>
+    <p>
+      graph-bro is a TypeScript workflow-orchestration engine that runs graphs of CLI coding-agent nodes
+      with loops, fan-out, and joins, checkpointed for crash-safe resume. Runtime dependencies are
+      exactly two — <code>better-sqlite3</code> and <code>zod</code> — and there is
+      <strong>no bundler in the project at all</strong>; <code>build</code> is a bare
+      <code>tsc</code>, with a <code>postbuild</code> that shell-copies <code>.sql</code> migrations
+      into <code>dist/</code>. CLI verb dispatch is a plain <code>switch</code> on
+      <code>process.argv[2]</code> with no CLI framework, and every existing verb emits JSON or NDJSON
+      to stdout. There is no HTML anywhere in the repo today, and CI is only
+      <code>npm ci → build → test</code>.
+    </p>
+  </dd>
+
+  <dt>What the renderer would be fed</dt>
+  <dd>
+    <p>
+      <code>compile()</code> already splits the three edge shapes into separate arrays —
+      <code>plainEdges</code>, <code>fanOutEdges</code>, <code>joinBarriers</code> — so the grammar's
+      three-way distinction is pre-made. Each <code>JoinBarrier</code> already carries a synthesized
+      <code>id</code> of the form <code>`${from.join(",")}=>${to}`</code>, which is exactly what a
+      join-drawn-as-a-node needs.
+    </p>
+    <p>
+      Two facts constrain the renderer's signature. Lint <code>warnings</code> live on
+      <code>CompileResult</code>, <strong>not</strong> inside <code>CompiledTopology</code>, so a pure
+      function that draws lint on the offending join needs both halves. And
+      <code>lint.ts</code> sets <code>join: join.to</code> — the join's <em>target node id</em>, not the
+      <code>JoinBarrier.id</code> — so warning-to-join matching is ambiguous when two joins share a
+      target.
+    </p>
+  </dd>
+
+  <dt>What is deliberately unknowable at author time</dt>
+  <dd>
+    <p>
+      Fan-out <code>N</code> is known only at run time (R3). <code>START</code> and <code>END</code> are
+      sentinel ids, not declared <code>Node</code> objects, so the renderer must synthesize them. And
+      <code>when</code> guards are <strong>used only for compile-time lint analysis in slice 1</strong> —
+      conditional routing execution is deferred (KTD-7) — so a map that draws a <code>when</code> label
+      as though it routes is asserting something the engine does not do.
+    </p>
+    <p>
+      A topology <em>may loop</em> and is explicitly not a DAG. The only bound is a single global
+      <code>max_steps</code>; the frontier is recomputed dynamically each super-step, and
+      <strong>there is no pre-computed topological rank or level anywhere in the codebase</strong>, so
+      any layered layout has to invent ranks itself.
+    </p>
+  </dd>
+
+  <dt>The reader tension</dt>
+  <dd>
+    <p>
+      <code>STRATEGY.md</code>'s observability track names <em>an agent (Opus/Fable session) as the
+      primary reader</em> of run history, and ADR-0003 keeps the CLI as the legibility layer — "the agent
+      reads CLI output, never SQL." The topology map's reader, by contrast, is a human. The inspector is
+      the first artifact in the repo where those two readers meet.
+    </p>
+  </dd>
+
+  <dt>External landscape</dt>
+  <dd>
+    <p>
+      Argo Workflows shipped a "preview graph before submitting" feature for exactly this need, and its
+      dynamic <code>withItems</code> counts remain a known UX gap — so static unknown-<code>N</code>
+      rendering is <em>poorly solved elsewhere</em>, not a solved problem. AWS Step Functions draws its
+      <code>Map</code> state as a single collapsed boundary regardless of actual <code>N</code>. BPMN's
+      multi-instance marker (three bars; vertical = parallel, horizontal = sequential) is the established
+      notation for "this becomes N at run time," and the Petri-net / workflow-patterns literature already
+      names graph-bro's resettable barrier a <em>Generalized AND-Join</em>. LangGraph Studio is
+      server-backed with no offline single-file mode, so the "opens as a file, no server" angle is
+      genuinely differentiated. For layout, elkjs has mature built-in cycle-breaking
+      (<code>GreedyCycleBreaker</code> + <code>ReversedEdgeRestorer</code>) but is heavy and async;
+      lighter Sugiyama libraries need a feedback-arc-set pre-pass.
+    </p>
+  </dd>
+
+  <dt>The one fork this set does not resolve</dt>
+  <dd>
+    <p>
+      How cycles are handled is the ticket's largest irreversible decision, and it cascades into the
+      dependency choice, the bundle size, whether a no-JS build is viable, and the snapshot strategy.
+      Four rival answers surfaced — strongly-connected-component condensation into rings,
+      music-notation-style symbolic jump marks, hand-rolling the cycle-breaker over a light library, or
+      adopting elkjs behind a seam. Survivor 4 changes what the ranks <em>mean</em> either way, but the
+      engine choice itself should be made deliberately rather than backed into.
+    </p>
+  </dd>
+</dl>
+
+<h2 id="topic-axes">Topic Axes</h2>
+
+<ol class="axes">
+  <li><b>visual-grammar</b> — how the semantics actually draw: fan-out marking, join-as-node, <code>read_only</code>, loops, <code>when</code> guards, reducers, models, <code>output_key</code>, lint warnings, START/END.</li>
+  <li><b>interaction</b> — what a reviewer reaches by clicking or hovering: prompt templates, interpolation tokens, <code>for_each</code> paths, <code>when</code> rule trees, warning messages.</li>
+  <li><b>layout-and-loops</b> — the layout engine, cyclic graphs and back-edge drawing, super-step ranking, the N-branches-share-one-node-id problem.</li>
+  <li><b>build-and-distribution</b> — single self-contained file, bundling posture, the <code>render</code> CLI verb, snapshot testing, CI use, diffability.</li>
+  <li><b>growth-path</b> — designing now so the deferred run overlay is an extension rather than a rewrite.</li>
+</ol>
+
+<h2 id="ranked-ideas">Ranked Ideas</h2>
+
+<nav class="jump">
+  <ol>
+    <li><a href="#i1">Name the <code>TopologyMapModel</code> — one object, five jobs</a> <span class="ax">· build-and-distribution</span></li>
+    <li><a href="#i2">The inspector needs no JavaScript</a> <span class="ax">· interaction</span></li>
+    <li><a href="#i3">Mimic-panel invariance: the overlay may only paint</a> <span class="ax">· growth-path</span></li>
+    <li><a href="#i4">The y-axis means super-step</a> <span class="ax">· layout-and-loops</span></li>
+    <li><a href="#i5">One ink register for everything the compiler cannot know</a> <span class="ax">· visual-grammar</span></li>
+    <li><a href="#i6">Draw the provenance the new lint computes and throws away</a> <span class="ax">· interaction</span></li>
+    <li><a href="#i7">Fan-out draws as a boundary, not a marked edge</a> <span class="ax">· visual-grammar</span></li>
+  </ol>
+</nav>
+
+<article class="idea" id="i1">
+  <div class="idea-head">
+    <span class="idnum">1</span>
+    <h3>Name the <code>TopologyMapModel</code> — one object, five jobs</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: build-and-distribution</span>
+    <span class="chip cf">confidence: 88%</span>
+    <span class="chip cx">complexity: Medium</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Split the renderer into two pure functions rather than one: <code>CompiledTopology + warnings →
+    TopologyMapModel</code>, then <code>TopologyMapModel → HTML</code>. The middle object is a
+    zod-defined description of the <em>drawing's meaning</em> — node boxes, edge classes, badges, labels,
+    ranks, warning attachments — and it is deliberately given a name and a schema instead of existing as
+    anonymous intermediate state.
+  </p>
+  <p>
+    Naming it collapses five otherwise-separate design problems into one. It is the
+    <strong>snapshot-test target</strong>, so a layout-library bump or a CSS tweak churns no fixtures and
+    every grammar decision is reviewable as text in a diff. It is the <strong>machine-readable payload</strong>
+    embedded in the emitted file, so an agent can read the HTML and answer questions about the topology
+    without a browser. Its order-normalised serialization is a <strong>semantic digest</strong>, which
+    makes "what did this PR change about the topology's meaning?" a readable diff rather than two pictures
+    to compare. It is the <strong>extension point</strong> the deferred run overlay attaches to. And its
+    node and join keys — reusing <code>compile()</code>'s own already-synthesized ids — become the
+    <strong>stable DOM ids</strong>, so the overlay never has to invent a second scheme for matching trace
+    events to elements.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 760 330" role="img" aria-label="Diagram: compile output feeds one named TopologyMapModel, which in turn serves five distinct consumers.">
+        <rect x="8" y="132" width="152" height="66" rx="7" class="d-box"/>
+        <text class="d-t" x="84" y="158" text-anchor="middle">compile()</text>
+        <text class="d-m" x="84" y="174" text-anchor="middle">CompiledTopology</text>
+        <text class="d-m" x="84" y="188" text-anchor="middle">+ warnings</text>
+
+        <path class="d-ln" d="M160 165 H236" marker-end="url(#a1)"/>
+
+        <rect x="240" y="122" width="164" height="86" rx="8" class="d-box-a"/>
+        <text class="d-t" x="322" y="152" text-anchor="middle" font-weight="650">TopologyMapModel</text>
+        <text class="d-m" x="322" y="170" text-anchor="middle">zod-defined</text>
+        <text class="d-m" x="322" y="186" text-anchor="middle">one named object</text>
+
+        <path class="d-ln" d="M404 165 C450 165 460 40 512 40" marker-end="url(#a1)"/>
+        <path class="d-ln" d="M404 165 C450 165 460 105 512 105" marker-end="url(#a1)"/>
+        <path class="d-ln" d="M404 165 H512" marker-end="url(#a1)"/>
+        <path class="d-ln" d="M404 165 C450 165 460 225 512 225" marker-end="url(#a1)"/>
+        <path class="d-ln" d="M404 165 C450 165 460 290 512 290" marker-end="url(#a1)"/>
+
+        <rect x="516" y="20" width="236" height="40" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="530" y="45">Snapshot target — grammar as text</text>
+
+        <rect x="516" y="85" width="236" height="40" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="530" y="110">Embedded payload — agent reader</text>
+
+        <rect x="516" y="145" width="236" height="40" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="530" y="170">Semantic digest — PR diffability</text>
+
+        <rect x="516" y="205" width="236" height="40" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="530" y="230">Run-overlay extension point</text>
+
+        <rect x="516" y="270" width="236" height="40" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="530" y="295">Stable DOM ids for trace matching</text>
+
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--ink-3)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption>One named intermediate object serves five consumers that would otherwise each invent their own representation.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">direct:</span> ADR-0001 states that "<em>zod-everywhere now binds</em>: topology
+      grammar, run-trace schema, and CLI-agent JSON contracts all zod-defined, not just HTTP-edge
+      validation" — so a zod-defined render model is the house pattern, not a new one.
+      <code>compile.ts</code> already synthesizes <code>JoinBarrier.id</code> as
+      <code>`${from.join(",")}=>${to}`</code>, and <code>deriveInstanceId(nodeId, itemKey)</code> already
+      produces <code>`${nodeId}:${itemKey}`</code>, so the id scheme exists and matches the trace's own
+      vocabulary (<code>Activation</code> carries <code>nodeId</code> and <code>instanceId</code>). The
+      existing <code>test/topology/__snapshots__/compile.test.ts.snap</code> is the snapshot convention to
+      follow.
+    </p>
+    <p>
+      <span class="btag">external:</span> Playwright's HTML reporter inlines its assets and data by
+      default, with a <code>doNotInlineAssets</code> escape hatch for strict-CSP environments — precedent
+      for an embedded payload inside a single self-contained report. (Note: Playwright's separate
+      <em>trace viewer</em> is not precedent here — it requires a registered service worker and cannot be
+      a single file.)
+    </p>
+    <p>
+      <span class="btag">reasoned:</span> A snapshot of a laid-out HTML document is the worst available
+      snapshot target: unreadable in review and invalidated by every cosmetic change, which trains the
+      team to stop trusting snapshot diffs. Splitting the pure function is what makes the snapshot
+      meaningful, and once the intermediate object exists and is serializable, the other four jobs are
+      nearly free consequences rather than separate features.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    Every other survivor here touches this object. It is the cheapest decision in the set to make
+    correctly and the most expensive to retrofit, because it is the one that determines whether the
+    deferred overlay ticket populates a field or redesigns a renderer. It also resolves the human-versus-agent
+    reader tension without a second output target: the SVG is the human channel and the embedded model is
+    the agent channel, honouring ADR-0003's "CLI is the legibility layer" doctrine rather than contradicting
+    it with the repo's first non-JSON artifact.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    It is more structure than the minimum that draws a picture, and the author's own conventions warn
+    against speculative abstraction. The defence is that four of the five jobs are real today (snapshot,
+    payload, digest, DOM ids) — only the overlay hook is future-facing, and survivor 3 covers that without
+    unpopulated fields. There is also a genuine question of how much of the <em>visual</em> decision belongs
+    in the model versus the template; drawn too wide, the model becomes a second CSS.
+  </p>
+</article>
+
+<article class="idea" id="i2">
+  <div class="idea-head">
+    <span class="idnum">2</span>
+    <h3>The inspector needs no JavaScript</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: interaction</span>
+    <span class="chip cf">confidence: 65%</span>
+    <span class="chip cx">complexity: Low</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Take the interaction inventory literally. Everything issue #10 asks for is <em>disclosure</em>: expand
+    a node to see its full prompt template, expand an edge to see its <code>for_each</code> path or its
+    nested <code>when</code> rule, expand a warning to read its message. Disclosure is the one interaction
+    HTML has natively. So build the inspector as inline SVG for the graph plus
+    <code>&lt;details&gt;</code>/<code>&lt;summary&gt;</code> for every panel, with
+    <code>#node-reader</code>-style URL fragments and <code>:target</code> CSS for focus — and ship zero
+    runtime JavaScript.
+  </p>
+  <p>
+    The unexpected payoff is <strong>citability</strong>. Every node, edge, and join gets a stable,
+    quotable address. A PR comment can link to <em>this join</em> instead of describing it, and so can an
+    agent. Pan, zoom, and search — the things that would need JavaScript — are replaceable by browser
+    scroll and Ctrl-F, which is also what makes the file's text searchable by an agent reading it as
+    source.
+  </p>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">reasoned:</span> Enumerate what the inspector must let a reviewer do, from the
+      issue's own list: read a prompt template (long text, needs hiding by default), read a recursive
+      <code>when</code> rule tree (unbounded depth, needs progressive expansion), read a lint message, see
+      a model and an <code>output_key</code>. Every one is show/hide. Nothing in that list requires state,
+      computation, or a layout recomputation in the browser — the layout is computed once, at render time,
+      by the CLI. The conclusion follows: the runtime is unnecessary, and the only reason to add one would
+      be features not asked for.
+    </p>
+    <p>
+      <span class="btag">direct:</span> This is the decision that resolves the build problem rather than
+      working around it. The repo has exactly two runtime dependencies and <em>no bundler at all</em> —
+      <code>build</code> is a bare <code>tsc</code> plus a <code>cp</code> for migrations. No JavaScript in
+      the artifact means no bundler needs to be introduced.
+    </p>
+    <p>
+      <span class="btag">external:</span> Metaflow Cards require <code>render()</code> to return one
+      self-contained HTML string with no external file references (images as data URIs), which is the same
+      constraint treated as load-bearing in a comparable orchestration ecosystem. Playwright's
+      <code>doNotInlineAssets</code> exists precisely because strict-CSP environments are a real
+      deployment target for report files.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    The tension the grounding surfaces most sharply is between the author's "rely on the broad, mature
+    ecosystem" convention and the fact that a mature in-browser layout engine is a heavy async dependency
+    inside a file that is supposed to be self-contained and diffable. This idea dissolves rather than
+    resolves that tension: the layout runs in Node at render time, where using a mature library costs
+    nothing at distribution, and the artifact stays a document. It also makes the file robust in the places
+    single-file reports actually get opened — email attachments, sandboxed viewers, strict CSP, an agent's
+    HTML-to-text pass.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    This is a hard architectural fork, and it is the reason confidence is only moderate: it forecloses
+    interactions that might turn out to matter for a large topology — collapse/expand of subgraph groups
+    that changes layout, drag-to-explore, live filtering. Issue #10 explicitly imagines "collapse/expand,"
+    and a purely CSS collapse cannot reflow the graph, only hide detail panels. If large topologies later
+    demand real navigation, this decision gets revisited, and revisiting it means introducing the bundler
+    this idea avoided.
+  </p>
+</article>
+
+<article class="idea" id="i3">
+  <div class="idea-head">
+    <span class="idnum">3</span>
+    <h3>Mimic-panel invariance: the overlay may only paint</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: growth-path</span>
+    <span class="chip cf">confidence: 90%</span>
+    <span class="chip cx">complexity: Low</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Commit now, as a tested invariant, that <strong>layout geometry is a pure function of compile-time
+    facts and never consults run data</strong>. The deferred run overlay is then restricted to painting:
+    fills, badges, and pre-reserved text slots. One test asserts that the layout output is byte-identical
+    with and without overlay data present.
+  </p>
+  <p>
+    The slots are already knowable from the code that exists: the fan-out marker takes the real
+    <code>N</code>, node fills take the four run statuses, and a join node takes arrived-versus-expected
+    counts. Naming them now is a line of schema, not a feature.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 700 250" role="img" aria-label="Diagram: compile-time facts determine geometry; run data may only paint, and is blocked from influencing layout.">
+        <rect x="10" y="30" width="150" height="56" rx="7" class="d-box"/>
+        <text class="d-t" x="85" y="53" text-anchor="middle">CompiledTopology</text>
+        <text class="d-m" x="85" y="70" text-anchor="middle">compile-time facts</text>
+
+        <rect x="10" y="164" width="150" height="56" rx="7" class="d-box-w"/>
+        <text class="d-t" x="85" y="187" text-anchor="middle">Trace / checkpoint</text>
+        <text class="d-m" x="85" y="204" text-anchor="middle">run data</text>
+
+        <path class="d-ln-g" d="M160 58 H300" marker-end="url(#a3g)"/>
+        <text class="d-lbl" x="230" y="48" text-anchor="middle">determines</text>
+
+        <rect x="304" y="24" width="150" height="68" rx="7" class="d-box-g"/>
+        <text class="d-t" x="379" y="50" text-anchor="middle" font-weight="650">Geometry</text>
+        <text class="d-m" x="379" y="68" text-anchor="middle">ranks, coordinates</text>
+        <text class="d-m" x="379" y="82" text-anchor="middle">slot positions</text>
+
+        <path class="d-ln-w" d="M160 192 H300" marker-end="url(#a3w)"/>
+        <text class="d-lbl" x="230" y="182" text-anchor="middle">may only paint</text>
+
+        <rect x="304" y="158" width="150" height="68" rx="7" class="d-box-w"/>
+        <text class="d-t" x="379" y="184" text-anchor="middle" font-weight="650">Illumination</text>
+        <text class="d-m" x="379" y="202" text-anchor="middle">fills, badges,</text>
+        <text class="d-m" x="379" y="216" text-anchor="middle">reserved slot text</text>
+
+        <path class="d-dash" d="M379 152 V100"/>
+        <line x1="366" y1="126" x2="392" y2="126" stroke="var(--warn)" stroke-width="2.5"/>
+        <line x1="371" y1="118" x2="387" y2="134" stroke="var(--warn)" stroke-width="2.5"/>
+        <line x1="387" y1="118" x2="371" y2="134" stroke="var(--warn)" stroke-width="2.5"/>
+        <text class="d-lbl" x="470" y="130" text-anchor="start">run data never moves anything</text>
+
+        <path class="d-ln" d="M454 58 C500 58 500 125 540 125" marker-end="url(#a3)"/>
+        <path class="d-ln" d="M454 192 C500 192 500 125 540 125" marker-end="url(#a3)"/>
+
+        <rect x="544" y="98" width="146" height="54" rx="7" class="d-box-a"/>
+        <text class="d-t" x="617" y="120" text-anchor="middle">One schematic</text>
+        <text class="d-m" x="617" y="138" text-anchor="middle">review + live</text>
+
+        <defs>
+          <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--ink-3)"/>
+          </marker>
+          <marker id="a3g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/>
+          </marker>
+          <marker id="a3w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--warn)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption>Because geometry cannot depend on run data, the pre-flight map and the live map are the same picture.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">external:</span> Railway interlocking and SCADA mimic panels use one track
+      schematic for two jobs — the engineer reviews it before commissioning, and the same geometry is the
+      illuminated panel during operation. That dual role works only because the geometry is fixed and
+      only the illumination changes, which is what preserves the operator's spatial memory. Metaflow
+      documents the same split in software, between static cards and <code>render_runtime</code>/refresh
+      variants.
+    </p>
+    <p>
+      <span class="btag">direct:</span> The overlay's data already exists in the shapes this invariant
+      needs. <code>CheckpointSnapshot</code> carries <code>frontier: Activation[]</code> with per-instance
+      <code>itemKey</code>s — precisely the "which N branches exist right now" information. Run statuses
+      are <code>running | completed | dead_end | failed</code>; note that <code>dead_end</code> has no
+      visual convention yet and will need one.
+    </p>
+    <p>
+      <span class="btag">reasoned:</span> If layout may ever consult trace data, then the pre-flight map
+      and the live map disagree in <em>position</em>, and the reviewer's memory of "the join is
+      bottom-right" becomes a liability rather than an asset. That divergence is exactly the rewrite the
+      growth-path concern exists to prevent, and it is unrecoverable once the overlay ships against a
+      layout that moves.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    The run overlay is deferred to its own ticket, which means this ticket gets to decide, for free,
+    whether that ticket is an extension or a rewrite. The entire cost is one stated invariant and one
+    test. It is also the non-speculative answer to the growth-path question: it constrains the future
+    without adding unpopulated fields to the present, which is what the author's "no unrequested
+    configurability" convention would otherwise object to.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    It forecloses overlay designs that might genuinely want to reflow — for instance, expanding one
+    authored fan-out node into its real <code>N</code> instances side by side once <code>N</code> is
+    known. That is a plausible thing to want, and this invariant rules it out or forces it into a second,
+    separate view. The invariant is also only as strong as the test that enforces it.
+  </p>
+</article>
+
+<article class="idea" id="i4">
+  <div class="idea-head">
+    <span class="idnum">4</span>
+    <h3>The y-axis means super-step</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: layout-and-loops</span>
+    <span class="chip cf">confidence: 82%</span>
+    <span class="chip cx">complexity: Medium</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Rank nodes by earliest possible super-step — breadth-first from <code>START</code> over plain and
+    fan-out edges, with barriers gated on their sources — and make the vertical axis <em>mean</em> that.
+    Row one is the first frontier, row two the second. Draw <code>max_steps</code> as the ladder's
+    declared height, so the budget is a visible scale rather than a caption. A loop then reads as an edge
+    pointing back <em>up</em> the ladder against a bound you can see.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 700 300" role="img" aria-label="Diagram: nodes arranged in horizontal bands numbered by super-step, with a back-edge pointing upward from a later band to an earlier one.">
+        <rect x="70" y="34" width="420" height="44" class="d-band"/>
+        <rect x="70" y="98" width="420" height="44" class="d-band"/>
+        <rect x="70" y="162" width="420" height="44" class="d-band"/>
+        <rect x="70" y="226" width="420" height="44" class="d-band"/>
+
+        <text class="d-m" x="60" y="61" text-anchor="end">step 1</text>
+        <text class="d-m" x="60" y="125" text-anchor="end">step 2</text>
+        <text class="d-m" x="60" y="189" text-anchor="end">step 3</text>
+        <text class="d-m" x="60" y="253" text-anchor="end">step 4</text>
+
+        <rect x="214" y="40" width="132" height="32" rx="6" class="d-box"/>
+        <text class="d-t" x="280" y="61" text-anchor="middle">dispatch</text>
+
+        <rect x="214" y="104" width="132" height="32" rx="6" class="d-box-a"/>
+        <text class="d-t" x="280" y="125" text-anchor="middle">reader</text>
+
+        <rect x="214" y="168" width="132" height="32" rx="6" class="d-box"/>
+        <text class="d-t" x="280" y="189" text-anchor="middle">review</text>
+
+        <rect x="214" y="232" width="132" height="32" rx="6" class="d-box-i"/>
+        <text class="d-t" x="280" y="253" text-anchor="middle">join → END</text>
+
+        <path class="d-ln" d="M280 72 V102" marker-end="url(#a4)"/>
+        <path class="d-ln" d="M280 136 V166" marker-end="url(#a4)"/>
+        <path class="d-ln" d="M280 200 V230" marker-end="url(#a4)"/>
+
+        <path class="d-ln-w" d="M346 184 C420 184 420 120 346 120" marker-end="url(#a4w)"/>
+        <text class="d-lbl" x="432" y="156" text-anchor="start">back up the ladder</text>
+
+        <line x1="560" y1="40" x2="560" y2="272" class="d-hatch-line"/>
+        <line x1="553" y1="40" x2="567" y2="40" class="d-hatch-line"/>
+        <line x1="553" y1="272" x2="567" y2="272" class="d-hatch-line"/>
+        <text class="d-lbl" x="576" y="150" text-anchor="start">max_steps: 8</text>
+        <text class="d-lbl" x="576" y="166" text-anchor="start">the budget, to scale</text>
+
+        <defs>
+          <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--ink-3)"/>
+          </marker>
+          <marker id="a4w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--warn)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption>Ranks have to be invented for any layered layout; making them super-steps is what gives the vertical axis meaning.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">direct:</span> <code>CONTEXT.md</code> defines the super-step as the engine's own
+      execution unit — "snapshot state, run the ready frontier, merge updates through reducers, recompute
+      the next frontier, checkpoint." <code>src/engine/loop.ts</code>'s <code>transition()</code> computes
+      the next frontier dynamically each step by walking completed-node adjacencies, and there is
+      <strong>no pre-computed topological rank or level anywhere in the codebase</strong>.
+      <code>max_steps</code> is a required positive integer, so the bound always exists to draw.
+    </p>
+    <p>
+      <span class="btag">reasoned:</span> The choice is not whether to have ranks — every layered layout
+      invents them — but whether they mean anything. Meaningless ranks are an artifact of the algorithm;
+      super-step ranks make the vertical axis answer two questions a reviewer actually has: how many
+      rounds is this, and how much of my <code>max_steps</code> budget does one loop iteration consume?
+      Neither Mermaid nor DOT answers either, which is part of why the cheap text targets are "just fine."
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    This is the idea that makes the picture say something the JSON does not. It also composes with survivor
+    3 at no cost: if rows are super-steps, then a checkpoint's <code>step</code> maps directly to a row,
+    so the deferred overlay's most natural affordance — showing where a run currently is — is a row
+    highlight rather than new layout logic.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    "Earliest possible super-step" is a static approximation of something genuinely dynamic. Conditional
+    routing and data-dependent fan-out mean the real schedule can differ from the drawn one, so the ladder
+    is a lower bound, not a prediction — and it must be drawn in a register that admits this (survivor 5).
+    It also constrains layout: a wide graph with few steps becomes short and very wide, which may read
+    worse than a conventional layered layout for some topologies.
+  </p>
+</article>
+
+<article class="idea" id="i5">
+  <div class="idea-head">
+    <span class="idnum">5</span>
+    <h3>One ink register for everything the compiler cannot know</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: visual-grammar</span>
+    <span class="chip cf">confidence: 80%</span>
+    <span class="chip cx">complexity: Medium</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Instead of inventing a separate badge for each thing the compiler cannot know, define a single
+    systematic register: everything the compiler actually asserts draws solid, and everything conjectural
+    draws in one consistently-defined "unsurveyed" treatment. The register is enumerable from the code
+    today — fan-out <code>N</code>, the synthesized <code>START</code>/<code>END</code> sentinels, the
+    approximate super-step ranks from survivor 4, and, sharpest of all, <code>when</code> guards.
+  </p>
+  <p>
+    That last one is a lie the map would otherwise tell. <code>when</code> is used only for compile-time
+    lint analysis in slice 1; conditional routing execution is deferred. A map that draws a
+    <code>when</code> label as a normal edge label asserts that the engine branches on it, which it does
+    not. Under a register, that edge is drawn as unsurveyed and the picture stays honest.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 700 260" role="img" aria-label="Diagram: two columns contrasting solid marks for compiler-asserted facts against dashed marks for facts unknowable at compile time.">
+        <text class="d-t" x="20" y="24" font-weight="650">The compiler asserts it — solid</text>
+        <text class="d-t" x="380" y="24" font-weight="650">It cannot know — unsurveyed</text>
+        <line x1="360" y1="10" x2="360" y2="248" class="d-hatch-line" stroke-dasharray="3 3"/>
+
+        <rect x="20" y="44" width="200" height="42" rx="6" class="d-box"/>
+        <text class="d-t-sm" x="34" y="62">agent node</text>
+        <text class="d-m" x="34" y="78">model · output_key</text>
+
+        <path class="d-ln" d="M40 108 H200" marker-end="url(#a5)"/>
+        <text class="d-lbl" x="120" y="126" text-anchor="middle">plain edge — always taken</text>
+
+        <rect x="20" y="146" width="200" height="42" rx="6" class="d-box-i"/>
+        <text class="d-t-sm" x="34" y="164">join barrier</text>
+        <text class="d-m" x="34" y="180">all · dedup → results</text>
+
+        <text class="d-m" x="20" y="222">reducer, mode, model, keys:</text>
+        <text class="d-m" x="20" y="238">all present in CompiledTopology</text>
+
+        <rect x="380" y="44" width="200" height="42" rx="6" class="d-dash"/>
+        <text class="d-t-sm" x="394" y="62">START / END</text>
+        <text class="d-m" x="394" y="78">synthesized, not authored</text>
+
+        <path class="d-dash" d="M400 108 H560" marker-end="url(#a5d)"/>
+        <text class="d-lbl" x="480" y="126" text-anchor="middle">fan-out — ×N at run time</text>
+
+        <path class="d-dash" d="M400 168 H560" marker-end="url(#a5d)"/>
+        <text class="d-lbl" x="480" y="186" text-anchor="middle">when — lint-only, does not route</text>
+
+        <text class="d-m" x="380" y="222">one register, not four badges —</text>
+        <text class="d-m" x="380" y="238">so the overlay knows what to survey</text>
+
+        <defs>
+          <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--ink-3)"/>
+          </marker>
+          <marker id="a5d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--ink-3)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption>A single confidence register replaces four ad-hoc badges and gives the deferred overlay an exact job description: survey the dashed parts.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">external:</span> Nautical charts do not badge uncertainty per feature; they carry
+      a register. Surveyed coastline is solid, unsurveyed shore is hachured, and IHO qualifiers
+      (<code>PA</code> position approximate, <code>ED</code> existence doubtful, plus CATZOC zones of
+      confidence) let a mariner read survey confidence from the ink itself. The ICOMOS Venice Charter's
+      Article 12 encodes the same principle in a different medium: restoration material must remain
+      visually distinguishable from surviving original fabric.
+    </p>
+    <p>
+      <span class="btag">direct:</span> <code>src/topology/schema.ts</code> states that the
+      <code>when</code> DSL is "used only for compile-time lint analysis in slice 1 (conditional routing
+      execution is deferred, KTD-7)," and that <code>START</code>/<code>END</code> are "not declared as
+      <code>Node</code> objects — only referenced from <code>from</code>/<code>to</code>." Fan-out
+      <code>N</code> is known only at run time (R3). Three separate grammar problems, one property.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    Issue #10 treats unknown <code>N</code>, the sentinels, and <code>when</code> labels as separate
+    drawing decisions, each inviting its own badge. They are one problem with one answer, and naming the
+    register up front means the deferred run overlay has an exact job description: survey the unsurveyed
+    parts. It also catches a lie nobody flagged — slice 1 would happily draw <code>when</code> labels on
+    edges the engine does not branch on.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    A register is only legible if it is small; adding a third tier ("known but approximate" for the
+    super-step ranks) starts to erode the binary that makes it readable at a glance. There is also a real
+    argument that <code>when</code> should simply not be drawn at all in slice 1 rather than drawn
+    hedged, and someone will make it. That is a legitimate alternative this idea should be weighed
+    against rather than assumed past.
+  </p>
+</article>
+
+<article class="idea" id="i6">
+  <div class="idea-head">
+    <span class="idnum">6</span>
+    <h3>Draw the provenance the new lint computes and throws away</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: interaction</span>
+    <span class="chip cf">confidence: 85%</span>
+    <span class="chip cx">complexity: Low</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    The prompt-token lint that landed mid-run computes exactly the right set and then discards its most
+    useful half. <code>collectStateRootKeys</code> gathers every root key the run can produce — from
+    <code>set</code> update keys, agent <code>output_key</code>s, fan-out <code>as</code> bindings, join
+    <code>into</code> keys, and the <code>--input</code> snapshot — and <code>checkPromptTokens</code>
+    then reduces all of it to a yes/no membership test per token.
+  </p>
+  <p>
+    The inspector should keep the association it throws away: for each interpolation token in each prompt
+    template, draw <em>which node produces that root key</em>. A token becomes a link to its producer. Two
+    things the lint deliberately cannot do then come free from the drawing. The lint is root-keys-only and
+    flat by design, so dotted depth goes unchecked — but the panel can show the token's full path next to
+    the producer's declared key, making a depth mismatch visible to a human. More importantly, the lint is
+    whole-topology and not per-node: a key produced <em>anywhere</em> counts <em>everywhere</em>, which the
+    code itself calls "the cheap half of the check," explicitly ruling out the "what keys exist at node X"
+    reachability analysis as oversized. A picture answers reachability by eye — you can simply see whether
+    the producer is upstream of the consumer, or off in a branch that never runs first.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 700 250" role="img" aria-label="Diagram: a prompt token linked back to the node that produces its root key, contrasted with a token whose producer is downstream and therefore unreachable.">
+        <rect x="20" y="30" width="150" height="40" rx="6" class="d-box"/>
+        <text class="d-t-sm" x="34" y="47">dispatch (set)</text>
+        <text class="d-m" x="34" y="62">writes batch.items</text>
+
+        <rect x="20" y="102" width="150" height="40" rx="6" class="d-box"/>
+        <text class="d-t-sm" x="34" y="119">fan-out edge</text>
+        <text class="d-m" x="34" y="134">binds as: item</text>
+
+        <rect x="250" y="66" width="190" height="52" rx="6" class="d-box-a"/>
+        <text class="d-t-sm" x="264" y="86">reader (agent)</text>
+        <text class="d-m" x="264" y="102">prompt: {{ item }}</text>
+        <text class="d-m" x="264" y="112">        {{ summary.text }}</text>
+
+        <path class="d-ln-g" d="M170 122 C210 122 214 96 246 96" marker-end="url(#a6g)"/>
+        <text class="d-lbl" x="208" y="140" text-anchor="middle">producer — upstream</text>
+
+        <rect x="250" y="186" width="190" height="40" rx="6" class="d-box-w"/>
+        <text class="d-t-sm" x="264" y="203">summarize (agent)</text>
+        <text class="d-m" x="264" y="218">output_key: summary</text>
+
+        <path class="d-ln-w" d="M345 182 V124" marker-end="url(#a6w)"/>
+        <text class="d-lbl" x="356" y="156" text-anchor="start">producer — but downstream</text>
+
+        <text class="d-m" x="470" y="52">The lint passes both:</text>
+        <text class="d-m" x="470" y="68">`summary` is a known root</text>
+        <text class="d-m" x="470" y="84">key somewhere in the graph.</text>
+        <text class="d-m" x="470" y="112">The picture shows the</text>
+        <text class="d-m" x="470" y="128">second one can never</text>
+        <text class="d-m" x="470" y="144">resolve on the first pass.</text>
+
+        <defs>
+          <marker id="a6g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--good)"/>
+          </marker>
+          <marker id="a6w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="var(--warn)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <figcaption>The lint answers "does this key exist anywhere"; the drawing answers "is its producer upstream of here" — the analysis the lint's own comment rules out as oversized.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">direct:</span> <code>src/topology/lint.ts</code>, as of
+      <code>ef37b53</code>, documents both limits in its own comments. On flatness: "Root keys only, and
+      deliberately flat… Enumerating roots is therefore exact, while anything deeper is a runtime fact." On
+      reachability: "Whole-topology, not per-node reachability — a key produced anywhere counts everywhere.
+      That is the cheap half of the check: it catches typos without the 'what keys exist at node X'
+      analysis the issue rules out as oversized." <code>collectStateRootKeys</code> builds the producing set
+      and <code>checkPromptTokens</code> reduces it to <code>known.has(root)</code>, discarding which node
+      contributed each key.
+    </p>
+    <p>
+      <span class="btag">reasoned:</span> The expensive part of per-node reachability analysis is
+      presenting it, not computing it — and a laid-out graph <em>is</em> the presentation. Once nodes are
+      ranked (survivor 4), "is the producer upstream" is a comparison a human makes by looking, at zero
+      analysis cost. So the drawing can deliver the check the lint explicitly declined to build, without
+      building it.
+    </p>
+    <p>
+      <span class="btag">external:</span> A Baroque figured bass is a deliberately unrealized score — bass
+      line plus numerals, resolved by the performer at performance time. What makes it workable is the
+      strict rule that every figure must be realizable from the notated bass, so an unrealizable figure is
+      an error catchable on the page. The same split exists here between prompt template and resolved
+      prompt, and the same page-level check applies.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    This is the strongest evidence in the run that reading the code beats reasoning about it. Five of five
+    ideation frames proposed adding a static token check; the check was already written and in review.
+    Reading it revealed something better: the feature's own comments name two limits it accepted
+    deliberately, and a picture relieves both. It also gives click-to-inspect a purpose beyond displaying
+    prompt text — each token becomes a navigable link to its producer.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    Upstream-ness is genuinely subtle in a cyclic graph: a producer that is "downstream" on the first pass
+    is perfectly reachable on the second iteration of a loop, so a naive reachability read would produce
+    false alarms on exactly the topologies graph-bro exists to run. This must be presented as information
+    for a human to judge, not as a warning — and getting that tone wrong makes it worse than absent. It
+    also needs the token extraction to respect the new escape grammar from <code>862e36d</code>, since
+    escaped delimiters are text rather than tokens.
+  </p>
+</article>
+
+<article class="idea" id="i7">
+  <div class="idea-head">
+    <span class="idnum">7</span>
+    <h3>Fan-out draws as a boundary, not a marked edge</h3>
+  </div>
+  <div class="chips">
+    <span class="chip ax">axis: visual-grammar</span>
+    <span class="chip cf">confidence: 70%</span>
+    <span class="chip cx">complexity: Medium</span>
+  </div>
+
+  <h4>Description</h4>
+  <p>
+    Issue #10 commits to drawing fan-out as one target with a marked, labelled edge, precisely because
+    drawing <code>N</code> copies statically would be a lie. Keep that commitment but strengthen the mark:
+    wrap the fan-out target in a labelled, collapsible <strong>boundary</strong> carrying
+    <code>for_each batch.items · as item · ×N at run time</code>, with BPMN multi-instance bars on the
+    target inside it.
+  </p>
+  <p>
+    A boundary <em>states</em> "one authored node, N runtime instances," where a marked edge can only imply
+    it. It also scales: on a large topology a marked edge into a single target is invisible, while a frame
+    is not. And it is the natural attachment point for the real <code>N</code> when the overlay lands, and
+    the natural collapse handle if large topologies ever need one.
+  </p>
+
+  <figure>
+    <div class="figwrap">
+      <svg viewBox="0 0 700 240" role="img" aria-label="Diagram: on the left, three drawn copies of a node labelled as a lie because N is unknown; on the right, one node inside a labelled boundary with multi-instance bars.">
+        <text class="d-t" x="20" y="24" font-weight="650">Drawing N copies</text>
+        <text class="d-m" x="20" y="42">N is unknown at author time — a lie</text>
+
+        <rect x="24" y="62" width="104" height="34" rx="6" class="d-dash"/>
+        <text class="d-t-sm" x="76" y="84" text-anchor="middle">reader</text>
+        <rect x="24" y="108" width="104" height="34" rx="6" class="d-dash"/>
+        <text class="d-t-sm" x="76" y="130" text-anchor="middle">reader</text>
+        <rect x="24" y="154" width="104" height="34" rx="6" class="d-dash"/>
+        <text class="d-t-sm" x="76" y="176" text-anchor="middle">reader</text>
+        <text class="d-m" x="24" y="210">why three? nothing says three.</text>
+
+        <line x1="240" y1="10" x2="240" y2="228" class="d-hatch-line" stroke-dasharray="3 3"/>
+
+        <text class="d-t" x="280" y="24" font-weight="650">Drawing the boundary</text>
+        <text class="d-m" x="280" y="42">one authored node, N runtime instances</text>
+
+        <rect x="284" y="62" width="290" height="104" rx="9" class="d-dash"/>
+        <text class="d-m" x="298" y="82">for_each batch.items · as item</text>
+        <text class="d-m" x="298" y="98">×N at run time</text>
+
+        <rect x="330" y="110" width="150" height="42" rx="6" class="d-box-a"/>
+        <text class="d-t-sm" x="405" y="132" text-anchor="middle">reader</text>
+        <line x1="392" y1="140" x2="392" y2="148" stroke="var(--accent)" stroke-width="2"/>
+        <line x1="399" y1="140" x2="399" y2="148" stroke="var(--accent)" stroke-width="2"/>
+        <line x1="406" y1="140" x2="406" y2="148" stroke="var(--accent)" stroke-width="2"/>
+        <text class="d-lbl" x="500" y="146" text-anchor="start">BPMN bars:</text>
+        <text class="d-lbl" x="500" y="160" text-anchor="start">parallel instances</text>
+
+        <text class="d-m" x="284" y="196">the frame is where the real N is written</text>
+        <text class="d-m" x="284" y="212">when the run overlay lands</text>
+
+        <defs></defs>
+      </svg>
+    </div>
+    <figcaption>The boundary is honest about multiplicity and gives the deferred overlay a place to write the real N without moving anything.</figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="btag">external:</span> AWS Step Functions Workflow Studio draws the <code>Map</code>
+      state — including Distributed Map at 10,000-way fan-out — as a single collapsed sub-graph boundary
+      regardless of actual <code>N</code>. That is the canonical answer to "one node, N unknown at design
+      time": a container wrapping the iteration body. BPMN's multi-instance marker supplies the glyph — three
+      bars, vertical for parallel instances, horizontal for sequential — which is the established notation
+      readers may already know. Argo Workflows, by contrast, renders dynamic fan-out as named sibling nodes
+      only once counts are known, and its unresolved-count rendering is an open UX gap, so this is a
+      differentiated answer rather than a copied one.
+    </p>
+    <p>
+      <span class="btag">direct:</span> The fan-out edge carries exactly the two labels the frame needs:
+      <code>for_each</code> (a dotted state path) and <code>as</code> (the per-branch binding). And the
+      adjacency is mechanically derivable rather than authored — a join whose <code>sources</code> is a
+      single element matching some <code>fanOutEdge.to</code> is a fan-out join, which the schema comment
+      spells out: "a single-element array is valid: a dynamic fan-out reuses one node id for all N branches,
+      so the join's static source list has size 1."
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <p>
+    This is the single most load-bearing grammar call in the ticket, because fan-out and join are the
+    vocabulary's whole point — a map where they are plain arrows is worse than no map. It also removes an
+    ambiguity a reviewer would otherwise have to resolve by squinting: whether a one-source join is really
+    eating a fan-out. The compiler already has the answer.
+  </p>
+
+  <h4>Downsides</h4>
+  <p>
+    A boundary costs vertical and horizontal space, which works against survivor 4's ladder on a graph with
+    many fan-outs, and nested boundaries (a fan-out inside a loop) could get visually crowded fast. It also
+    competes with two other notations that surfaced — a repeat-unit bracket with the count's source as a
+    subscript, and bare BPMN bars with no frame — and the bracket has a real argument in its favour, since
+    it makes the count's <em>binding</em> part of the mark. Confidence is moderate because this is a
+    genuine three-way design choice, not a settled one.
+  </p>
+</article>
+
+<h2 id="rejection-summary">Rejection Summary</h2>
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>Join-desync warning drawn as a highlighted router → source → join path, not a badge</td><td>Sound and cheap, but a presentation detail of one existing lint rule — below the bar for a direction-setting idea. Fold into whichever grammar work ships.</td></tr>
+    <tr><td>2</td><td>Drop the per-node <code>read_only</code> badge; assert it once globally and reserve a loud register for write-capable nodes</td><td>Verified sound, and it names a real tension with issue #10's stated commitment that <code>read_only</code> is visible on the node — but it is one badge's placement, resolvable in review.</td></tr>
+    <tr><td>3</td><td>Fan-out as an IUPAC-style repeat-unit bracket <code>[reader]ₙ</code> with the subscript bound to <code>for_each</code></td><td>Notation is real, but the claimed edge over BPMN bars does not hold — a BPMN marker can carry the same caption. Mutually exclusive with the stronger boundary idea.</td></tr>
+    <tr><td>4</td><td>Fan-out as BPMN multi-instance bars, with the fan-out/join adjacency auto-detected</td><td>Absorbed: the auto-detection and the bars both live inside the boundary survivor rather than rivalling it.</td></tr>
+    <tr><td>5</td><td>Dual view — a second graph whose nodes are state keys</td><td>Motivating example refuted: the <code>results</code> "double write" is covered by the join's <code>dedup</code> reducer, and <code>StateConflictError</code> fires only when no reducer is registered. Needs a real finding first.</td></tr>
+    <tr><td>6</td><td>Legend bound to the <code>CONTEXT.md</code> glossary so the map teaches the vocabulary</td><td>Standard good practice; does not warrant team discussion.</td></tr>
+    <tr><td>7</td><td>Schema-introspective badge rendering by walking the zod shape</td><td>Speculative abstraction against the author's own conventions, and depends on zod internals — fragile for a one-field problem.</td></tr>
+    <tr><td>8</td><td>Flatten the <code>when</code> tree to boolean notation as the label; click for the raw tree</td><td>Sound, but a component-level choice inside the no-JavaScript disclosure model, not a separate direction.</td></tr>
+    <tr><td>9</td><td>Verdict-first first screen; open the document focused on the offending path</td><td>Genuinely good and cheap — cut only to hold the survivor set at seven. It rides naturally on the disclosure and provenance survivors.</td></tr>
+    <tr><td>10</td><td>Double-writer and orphan-key claims as an explicit checkable list</td><td>Duplicate of the state-key dual view and rests on the same refuted hazard; the runtime already errors on unreduced conflicts.</td></tr>
+    <tr><td>11</td><td>Strongly-connected-component condensation, each component drawn as a ring</td><td>Reasoning is textbook-correct, but the KEGG analogy is decorative (those charts are hand-drawn, not automated), and merging ring clusters into a layered outer layout is materially more work than framed.</td></tr>
+    <tr><td>12</td><td>Segno and volta jump marks instead of back-arcs</td><td>Volta brackets index repeat-pass number, not an arbitrary predicate, so they cannot carry the <code>when</code> DSL — and drawing <code>when</code> as a live jump contradicts the honesty-register survivor.</td></tr>
+    <tr><td>13</td><td>Own the cycle-breaker, rent the layering</td><td>Premise is dated — d3-dag has since added handling for cycle-forming links — which weakens the build-versus-rent split as argued.</td></tr>
+    <tr><td>14</td><td>elkjs behind a pure-function layout seam</td><td>The seam is real and worth having, but it is already implied by the <code>TopologyMapModel</code> split; as a standalone idea it is the conventional answer.</td></tr>
+    <tr><td>15</td><td>Annotate each back-edge with the loop's own <code>max_steps</code> budget</td><td>Factually wrong: the schema has exactly one global <code>max_steps</code>, so this would print the identical number on every back-edge.</td></tr>
+    <tr><td>16</td><td>Snapshot the render model rather than the HTML</td><td>Merged into the <code>TopologyMapModel</code> survivor — one of the five jobs the named object does.</td></tr>
+    <tr><td>17</td><td>Self-containment as a CI-enforced invariant test</td><td>Sound and cheap; a test to write during implementation rather than a direction to choose between.</td></tr>
+    <tr><td>18</td><td>Vendor elkjs's prebuilt bundle via the existing <code>postbuild</code> copy pattern</td><td>Sound mechanism, but it presupposes the cycle-layout decision it depends on. Revisit once that fork is settled — and note the no-JavaScript survivor may remove the need entirely.</td></tr>
+    <tr><td>19</td><td>Exhaustive-kind <code>switch</code> so a new node kind is a <code>tsc</code> error</td><td>Correct and near-free, which is exactly why it fails the meeting test — do it, do not deliberate it.</td></tr>
+    <tr><td>20</td><td>Calibration stamp plus a CI staleness gate on committed maps</td><td>Real problem — a stale map is a confidently wrong picture — but the framing understates it: committing rendered artifacts is a workflow commitment, not a hash function.</td></tr>
+    <tr><td>21</td><td>Semantic diff of two topologies</td><td>Merged into the <code>TopologyMapModel</code> survivor as the order-normalised digest.</td></tr>
+    <tr><td>22</td><td>Reuse <code>compile()</code>'s ids as DOM <code>data-*</code> ids</td><td>Merged into the <code>TopologyMapModel</code> survivor, and constrained by the mimic-panel invariant.</td></tr>
+    <tr><td>23</td><td>Dual-reader single file with an embedded machine-readable payload</td><td>Merged into the <code>TopologyMapModel</code> survivor. Its Playwright trace-viewer citation was wrong — the trace viewer needs a service worker and cannot be single-file; the HTML reporter's asset inlining is the correct precedent.</td></tr>
+    <tr><td>24</td><td>Render model with reserved optional overlay fields</td><td>Speculative abstraction against the author's stated conventions, and the mimic-panel invariant achieves the same protection without unpopulated fields.</td></tr>
+    <tr><td>25</td><td>Paper-run: a hypothetical state input whose shape is a checkpoint's <code>state</code></td><td>Strongest idea cut. The input-shape insight is excellent, but "the two pure, small pieces" undersells it — correct multi-super-step frontier propagation with re-arming barriers is close to a second execution engine. Worth its own ticket.</td></tr>
+    <tr><td>26</td><td>Examples gallery — one document, many topologies</td><td>Low-risk and useful, but default-good-practice rather than a fork worth deliberating.</td></tr>
+    <tr><td>27</td><td>Reframe: the inspector is a pre-flight check that draws a picture</td><td>Its headline five-way convergence rested on the refuted token-provenance candidate. What survives of it is the provenance survivor, stated correctly against the code that actually shipped.</td></tr>
+    <tr><td>28</td><td>Ink and geometry both as semantic claims</td><td>Its three components — the confidence register, the super-step ladder, and the mimic-panel invariant — all survive individually; as a separate entry it adds framing, not a decision.</td></tr>
+    <tr><td>29</td><td>Cycle handling as the ticket's one irreversible fork</td><td>Correct and important, but it is a decision to make rather than a candidate to choose. Recorded in Codebase Context instead.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<footer class="composition-signal">
+  Composed 2026-07-25 by ce-ideate from <a href="https://github.com/FlorianRiquelme/graph-bro/issues/10">issue #10</a>, grounded against <code>graph-bro</code> at <code>ef37b53</code>.
+</footer>
+
+</div>
