@@ -10,6 +10,7 @@ import { openDb } from "../../src/store/db.js";
 import { appendEvent, listEvents } from "../../src/store/trace.js";
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-claude.mjs");
+const LATE_ENVELOPE_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-claude-late-envelope.mjs");
 
 describe("executor: claude-code — prompt delivery (§13.4 compile-time rule)", () => {
   it("substitutes the {prompt} token into argv and closes stdin when the token is present", () => {
@@ -46,6 +47,33 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     delete process.env.FAKE_CLAUDE_MODE;
     delete process.env.FAKE_CLAUDE_SILENT_MS;
   });
+
+  it("keeps reading stdout until the stream ends, not until the node process exits", async () => {
+    // `exit` fires when the process ends, not when its stdout has been
+    // drained, so a CLI that writes its terminal envelope and exits promptly
+    // can have that envelope still unread in the pipe. A parent that stops
+    // reading at `exit` discards it and reports a *successful* node as failed
+    // — exit code 0, no signal, no stderr. That was a ~50% failure of one
+    // fan-out branch on the CI runner, invisible on a fast dev machine, which
+    // drains the pipe before `exit` is even delivered.
+    //
+    // The fixture makes that ordering deterministic instead of racing for it
+    // (see its header): a grandchild writes the envelope after the node
+    // process is already gone, so reading only to `exit` always misses it.
+    const executor = new ClaudeCodeExecutor({ binary: LATE_ENVELOPE_FIXTURE });
+
+    const result = await executor.run("ping", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 10_000,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe("written after the parent exited");
+    expect(result.cost).toBe(0.001);
+  }, 15_000);
 
   it("streams NDJSON events to the callback while the node runs, terminal event on type === 'result'", async () => {
     process.env.FAKE_CLAUDE_MODE = "success";

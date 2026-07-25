@@ -10,6 +10,14 @@ import { buildWritePolicy } from "./write-policy.js";
 export const PROMPT_TOKEN = "{prompt}";
 
 /**
+ * How long to keep reading stdout after the node process has exited, before
+ * concluding the stream will never end. Only ever spent when a forked
+ * grandchild inherited stdout and outlived its parent; an ordinary drain
+ * completes in an event-loop turn.
+ */
+const STDOUT_DRAIN_GRACE_MS = 2000;
+
+/**
  * §13.4's compile-time prompt-delivery rule: if the command template
  * contains the literal `{prompt}` token, the prompt is substituted into argv
  * and stdin is closed; otherwise the whole prompt is piped on stdin and the
@@ -159,11 +167,44 @@ export class ClaudeCodeExecutor implements Executor {
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     try {
+      // Waits for the process to exit AND its stdout to drain, not just the
+      // former. `exit` fires when the process ends, while whatever it wrote
+      // last can still be sitting unread in the pipe — so resolving on `exit`
+      // alone and closing the reader (below) discards the terminal envelope
+      // of any CLI that writes it and exits promptly. That loses a
+      // *successful* node to a synthetic "no terminal envelope" error, and it
+      // is load-dependent: invisible on a fast machine that drains the pipe
+      // before `exit` is delivered, roughly a coin flip per node on a busy
+      // CI runner.
       await new Promise<void>((resolve, reject) => {
+        let exited = false;
+        let drained = false;
+        let drainTimer: NodeJS.Timeout | undefined;
+        const settle = (): void => {
+          if (!exited || !drained) return;
+          if (drainTimer) clearTimeout(drainTimer);
+          resolve();
+        };
+        // readline closes when its input stream ends — i.e. once every
+        // buffered line has been emitted.
+        rl.once("close", () => {
+          drained = true;
+          settle();
+        });
         spawned.child.once("exit", (code, signal) => {
           exitCode = code;
           exitSignal = signal;
-          resolve();
+          exited = true;
+          // Bounded, because stdout is inherited: a grandchild the CLI forked
+          // and left running holds the pipe open indefinitely after the CLI
+          // itself is gone. Draining a pipe takes an event-loop turn, so this
+          // grace is never spent on a healthy node — only on that leak, where
+          // giving up beats hanging the run.
+          drainTimer ??= setTimeout(() => {
+            drained = true;
+            settle();
+          }, STDOUT_DRAIN_GRACE_MS);
+          settle();
         });
         spawned.child.once("error", (err) => reject(err));
       });
