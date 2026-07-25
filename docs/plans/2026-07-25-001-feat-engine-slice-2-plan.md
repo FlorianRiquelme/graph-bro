@@ -253,7 +253,7 @@ residue, and it needs triage first.
 
 #### Deferred to Follow-Up Work
 
-- **Run reproducibility independent of the operator's own CLI configuration.** The operator's user-level hooks and instruction files load into every node invocation, because the CLI's isolation mode cannot be used (see KTD-4). Suppressing the remainder is a separate piece of work; this slice clears hooks and records the residue.
+- **Run independence from the operator's own CLI configuration.** The operator's user-level hooks and instruction files load into every node invocation, because the CLI's isolation mode cannot be used and hooks **merge** across scopes rather than being replaced (KTD-4). Layer 5 of KTD-3 suppresses user-scoped MCP servers, which is the half this slice does close. **The hook half is not cleared by this slice** — settings delivery cannot unmerge a merged hook — and it stays an open, unmitigated enforcement risk rather than a recorded residue (see Risks and Dependencies). Closing it is separate work.
 - **`lintJoinDesync` behavior once routing executes.** It currently advises a funnel node whenever a join source is only conditionally reached — advice that is wrong for a loop. Moot for single-track (no joins), and it belongs with slice 2b's lanes.
 
 ### Dependencies and Assumptions
@@ -267,7 +267,7 @@ residue, and it needs triage first.
 - Slice 1's prompt-template interpolation is the carrier for R4, and structured output makes it sufficient: with a parsed object at `output_key`, a fix node's prompt reads `{{ verdict.findings }}` and needs no new mechanism.
 - `mergeWrites` assigns write keys verbatim and flat, while read paths are dotted and traverse nesting — so a parsed object at a flat `output_key` is addressable by `when` rules and prompt tokens without change.
 - `runs.status` is unconstrained `TEXT NOT NULL` (`001_init.sql:7`) and `resume` gates on owner-pid liveness and topology path only, never on status (`cli/resume.ts:34-45`) — so R7's distinct terminal status needs no migration and no resume change.
-- Cost and token capture (ADR-0009) is implemented end-to-end today, so R26 is an aggregation concern rather than new instrumentation.
+- Cost and token *capture* (ADR-0009) is implemented end-to-end today. Per-attempt *attribution* is not: the only cost-bearing events are the `node_complete` rows `withTracing` writes, and they carry no step or attempt, so `step` lands NULL. R26 needs the attempt number threaded into the tracing decorator (U9), not aggregation alone.
 - The per-node hard timeout is **idle**-based, not wall-clock (`claude-code.ts:125` compares `Date.now() - lastLineAt`), so a long-running write node that streams continuously is not killed by the existing 10-minute bound.
 - The boundary invariant is scoped to the shipped engine and example graphs, matching slice 1's acceptance test. ADRs naming the validating consumer as the driver of a decision are inside that line.
 - The solo-operator trust model from KTD-8 continues to hold: read scoping means no-mutation-outside-workspace, not repo-scoped reads.
@@ -329,10 +329,12 @@ The attempt bound's placement and the unmatched-router failure are settled above
 ### Product Contract preservation
 
 Product Contract unchanged. Requirements, actors, flows, and acceptance examples carry forward with
-their IDs intact. Two editorial updates, neither a product-scope change: the Outstanding Questions
-subsection now records where each deferred question was settled, and two non-blocking items moved
-into a `Deferred to Follow-Up Work` subsection under Scope Boundaries. Three assumptions were added
-recording probe findings.
+their IDs intact. Three editorial updates, none a product-scope change: the Outstanding Questions
+subsection now records where each deferred question was settled; two non-blocking items moved into a
+`Deferred to Follow-Up Work` subsection under Scope Boundaries; and the operator-CLI-configuration
+bullet in that subsection was corrected to match KTD-4, having previously claimed this slice clears
+hooks — which KTD-4 and the Risks section retract. Three assumptions were added recording probe
+findings.
 
 ### Key Technical Decisions
 
@@ -354,9 +356,9 @@ recording probe findings.
 
 - **KTD-5. Attempt counts persist in the checkpoint and continue across a resume.** Restarting the count would let a resume launder a run past its declared bound, which contradicts R7's purpose — the bound exists so a diverging loop stops. Continuing means a resumed run can hit `not_converged` immediately, which is correct: it already spent its attempts. The trade this accepts: a plain node's activation has no pending-write dedup (`src/engine/loop.ts:306-308` leaves durability to the next checkpoint), so a resumed run re-dispatches the checkpointed frontier and can spend an attempt on work that produced nothing — a repeatedly-killed run can exhaust its bound without ever diverging. Taken deliberately, because burning an attempt is recoverable by raising the bound and resuming, which is the sanctioned operator action for `not_converged`, while laundering past a bound is not recoverable at all. Settles the grill's resume-count question.
 
-- **KTD-6. The unmatched router is its own engine error, detected per activation, and non-exhaustive routing is a lint warning.** (inherits the Product Contract decision; the warning is the demotion that decision names.) Detection must **not** test whether the frontier came back empty. `transition()` aggregates every activation's targets into one array (`src/engine/loop.ts:219-256`), so one activation routing successfully hides another that matched nothing — the silent give-up R3 exists to forbid. The condition is per activation: *this activation contributed no frontier entry and no barrier arrival, and its out-edge set is non-empty and entirely guarded.* Both exclusions are load-bearing — a join source contributes an arrival rather than an activation (`loop.ts:245-253`), and a fan-out over an empty list legitimately contributes nothing, so testing "all guards false" without them raises a spurious loud failure in both. The new case returns a failed result rather than throwing, matching how `dead_end` and `failed` already return while a stalled join throws.
+- **KTD-6. The unmatched router is its own engine error, detected per activation on guard evaluation, and non-exhaustive routing is a lint warning.** (inherits the Product Contract decision; the warning is the demotion that decision names.) Detection must **not** be expressed in terms of the frontier at all — neither aggregate emptiness nor per-activation contribution. Aggregate emptiness fails because `transition()` collects every activation's targets into one array (`src/engine/loop.ts:219-256`), so one activation routing successfully hides another that matched nothing — the silent give-up R3 exists to forbid. Per-activation *contribution* fails for a second reason: `pushUnique` dedups on `instanceId` and every plain-edge target gets `instanceId: edge.to` (`loop.ts:219-231`), so in a diamond where A→C and B→C both carry **satisfied** guards, B's push is swallowed, B contributes no frontier entry, and the condition fires against a node that routed correctly — the inverse of R3's purpose. The condition is therefore stated on guard evaluation: *this activation's out-edge set is non-empty and entirely guarded, no guard on it evaluated true, and it contributed no barrier arrival.* Counting satisfied guards per activation is immune to dedup. Both exclusions stay load-bearing — a join source contributes an arrival rather than an activation (`loop.ts:245-253`), and a fan-out over an empty list legitimately produces nothing — so a condition without them raises a spurious loud failure in both. The new case returns a failed result rather than throwing, matching how `dead_end` and `failed` already return while a stalled join throws.
 
-- **KTD-7. The attempt commit boundary is the super-step preceding the bounded node's next activation, not "after each write node".** (inherits the Product Contract decision; ADR-0013.) The engine records workspace HEAD, compares after, and squash-folds whatever the agent committed into one commit. Defining the boundary by write node would break R20 the moment a loop body holds two of them — an implement node plus a docs node produces two commits for one attempt, desynchronising the single number the bound, the commit message, and the trace are supposed to share. Anchoring it to the bounded node's re-activation keeps "one commit per attempt" true for any loop-body shape. Engine commits run with hooks disabled: a consumer repo whose committed content supplies a hooks path would otherwise execute repo content inside the unsandboxed engine process on every attempt. The workspace also excludes the CLI's own scratch directory, which is load-bearing beyond commit hygiene — an untracked entry there would falsely trip slice 1's tree-clean assertion on the *read-only* nodes that now run in the workspace too.
+- **KTD-7. The attempt commit boundary is the super-step preceding the bounded node's next activation, not "after each write node".** (inherits the Product Contract decision; ADR-0013.) The engine records workspace HEAD, compares after, and squash-folds whatever the agent committed into one commit. Defining the boundary by write node would break R20 the moment a loop body holds two of them — an implement node plus a docs node produces two commits for one attempt, desynchronising the single number the bound, the commit message, and the trace are supposed to share. Anchoring it to the bounded node's re-activation keeps "one commit per attempt" true for any loop-body shape. In the runtime's only composition seam — per node invocation (`buildNodeFns` / `withTracing`, `src/runtime/run.ts:55-111`) — that boundary is expressed as a **before-invocation** hook on the bounded node: commit whatever the workspace holds, then invoke. It cannot be expressed by decorating write nodes, which is the shape that fires twice per attempt in a two-write-node loop body. The hook only fires on re-entry, so it is paired with a **teardown commit on every terminal path**: a run that converges or fails without re-activating the bounded node must still commit its last attempt, which R21 requires and U8's side-ref write covers only for resume. Engine commits run with hooks disabled: a consumer repo whose committed content supplies a hooks path would otherwise execute repo content inside the unsandboxed engine process on every attempt. The workspace also excludes the CLI's own scratch directory, which keeps attempt commits clean and keeps the CLI's own files out of every node's tree comparison — but it is *not* what keeps slice 1's read-only tree-clean assertion from false-tripping now that read-only nodes share the workspace with a write node's uncommitted work. That needs the per-node baseline U6 introduces.
 
 - **KTD-8. The engine validates the returned structured value, in the engine module that writes it to state.** R2 and AE2 make the engine responsible for naming the node and the violation, and "the backend already validated it" is not a claim the engine can verify. Validation lives next to the `output_key` write (`src/engine/loop.ts:127`), not in the executor — putting it behind the seam would make every future backend re-implement it. A mature JSON Schema validator is added as a dependency, consistent with the standing preference for the broad ecosystem over a hand-rolled subset. The topology declares JSON Schema because that is the contract the backend consumes; zod continues to validate the topology document itself, including that `output_schema` is well-formed. This **supersedes ADR-0014's consequence** that a node's schema is authored as zod and emitted via conversion: a topology is a JSON file, so zod cannot be authored inside one, and zod converts to JSON Schema but cannot validate against an arbitrary one. ADR-0014 is amended rather than left standing.
 
@@ -417,7 +419,8 @@ flowchart TB
 ```
 
 Note the one dependency rule this encodes: `src/engine` never imports `src/workspace` (KTD-10). Commits
-are composed onto write nodes by the runtime's existing node-decorator seam, so the loop stays free of
+are composed onto the **bounded** node by the runtime's existing node-decorator seam — a
+before-invocation hook, plus a teardown commit on terminal paths (KTD-7) — so the loop stays free of
 I/O and its tests stay free of real repositories.
 
 **One attempt, end to end.** The commit boundaries are what make the attempt count, the history, and the trace share one number.
@@ -427,10 +430,11 @@ sequenceDiagram
   participant E as Engine
   participant G as Workspace (git)
   participant C as claude CLI
-  E->>G: record HEAD
-  E->>C: invoke write node (synthesized settings, workspace as cwd)
+  E->>G: record HEAD (attempt start)
+  E->>C: invoke write node(s) (synthesized settings, workspace as cwd)
   C-->>C: edits, shell commands (kernel-confined)
   C-->>E: result envelope (text, tokens, cost)
+  Note over E,G: boundary: bounded node is about to activate
   E->>G: compare HEAD
   alt agent committed
     E->>G: squash-fold into one attempt commit
@@ -438,7 +442,7 @@ sequenceDiagram
     E->>G: stage and commit the attempt
   end
   E->>E: increment attempt count, checkpoint
-  E->>C: invoke review node (schema declared)
+  E->>C: invoke bounded review node (schema declared)
   C-->>E: envelope with structured field
   E->>E: validate against declared schema, write parsed object to state
   E->>E: evaluate guarded out-edges, trace the routing decision
@@ -475,8 +479,10 @@ below is where `max_steps` actually lands today.
 ### Sequencing
 
 Four phases. Phases A and B are provable with the existing fake-CLI harness and touch no filesystem
-beyond a temp database; C and D need real git repositories and real sandbox behavior. A and B are
-independent of C, so they can land in either order — but C depends on A for the executor seam's shape.
+beyond a temp database; C and D need real git repositories and real sandbox behavior. A precedes
+everything — C depends on it for the executor seam's shape. B and C are only partly interchangeable:
+U5 and U6 can land before Phase B, but **U7 cannot**, because it needs the attempt counter and the
+bounded-node identity U4 creates.
 
 - **Phase A — Foundations.** U1, U2. The seam and the authoring surface.
 - **Phase B — Routing and loops.** U3, U4. The engine primitives, provable without any write capability.
@@ -501,7 +507,7 @@ independent of C, so they can land in either order — but C depends on A for th
 
 - **The executor seam widens, but in intent rather than in backend vocabulary.** ADR-0010's seam carried argv; it now carries a workspace root, permitted domains, a declared output schema, and a capability discriminant replacing today's read-only boolean. Settings synthesis stays behind the Claude Code adapter (KTD-12). The one real narrowing: a backend must be able to answer whether an OS boundary is available, because a write run refuses to start without one.
 - **The consumer's `.git` is writable from the workspace.** A linked worktree writes objects, the run branch's ref, and its own admin files on every commit — all outside the workspace directory. That is how handback works without a push, and it is also why the backstop has to compare the ref set rather than the working tree alone (KTD-11).
-- **Every node's cwd changes.** Read-only nodes previously ran in the consumer's checkout and now run in the workspace, so slice 1's tree-clean assertion now describes the workspace. KTD-7's exclusion is what keeps that assertion from false-tripping.
+- **Every node's cwd changes, and the workspace they share is one a write node has already dirtied.** Read-only nodes previously ran in the consumer's checkout and now run in the workspace, so slice 1's tree-clean assertion now describes the workspace. KTD-7's scratch-directory exclusion covers only the CLI's own scratch files; it does **not** keep the assertion from false-tripping on a prior write node's uncommitted work — which is exactly the multi-stage shape the Product Contract's first Key Decision mandates. U6 rescopes that assertion to a per-node baseline diff.
 - **The consumer repo gains a footprint it did not have.** Worktree admin entries and run branches accumulate in the consumer's `.git`. R16 holds — the working tree and index are untouched — but "graph-bro leaves nothing behind" is no longer true, and the operator sees run branches in `git branch`.
 - **A new terminal status reaches every status consumer.** `status`, `result`, and the trace all need to render `not_converged` without treating it as failure.
 
@@ -512,12 +518,12 @@ independent of C, so they can land in either order — but C depends on A for th
 | U-ID | Title | Files touched (primary) | Depends on |
 |---|---|---|---|
 | U1 | Structured output through the executor seam | `src/executor/{envelope,executor,claude-code}.ts`, `src/engine/output-schema.ts` | — |
-| U2 | Topology surface for write, schema, attempts, base ref | `src/topology/{schema,compile}.ts` | — |
+| U2 | Topology surface for write, schema, attempts, base ref; `when` grammar repair | `src/topology/{schema,compile}.ts` | — |
 | U3 | `when` evaluation, routing trace, loud unmatched router | `src/engine/when.ts`, `src/engine/loop.ts`, `src/topology/lint.ts` | U2 |
 | U4 | Attempt bound and the `not_converged` status | `src/engine/loop.ts`, `src/runtime/run.ts` | U2, U3 |
 | U5 | Workspace lifecycle | `src/workspace/lifecycle.ts`, `src/cli/start.ts`, `src/store/` | U2 |
 | U6 | Write-node execution policy and enforcement | `src/executor/{write-policy,read-only-policy,claude-code}.ts`, `src/workspace/baseline.ts` | U1, U2, U5 |
-| U7 | Engine-owned attempt commits | `src/workspace/commit.ts`, `src/runtime/run.ts` | U5, U6 |
+| U7 | Engine-owned attempt commits | `src/workspace/commit.ts`, `src/runtime/run.ts` | U4, U5, U6 |
 | U8 | Resume for write runs | `src/cli/resume.ts`, `src/runtime/run.ts`, `src/workspace/` | U4, U7 |
 | U9 | Trace and reporting | `src/store/trace.ts`, `src/cli/{result,status}.ts` | U3, U4, U7 |
 | U10 | Showcase example and smoke test | `examples/review-fix-loop/`, `test/smoke/` | U1–U9 |
@@ -562,18 +568,20 @@ independent of C, so they can land in either order — but C depends on A for th
 
 ### U2. Topology surface for write, schema, attempts, and base ref
 
-**Goal:** A topology can declare a write-capable node, an output schema, an attempt bound, permitted network domains, and the run's base ref.
+**Goal:** A topology can declare a write-capable node, an output schema, an attempt bound, permitted network domains, and the run's base ref — and every `when` rule an author writes survives parsing intact.
 
-**Requirements:** R8, R2, R6, R11, R14.
+**Requirements:** R8, R2, R6, R11, R14, and the grammar half of R1 (see Approach).
 
 **Dependencies:** none.
 
 **Files:**
-- `src/topology/schema.ts` — replace the `read_only` literal pin with a boolean; add the optional output schema, attempt bound, and network domains to the agent node; add the graph-level base ref.
+- `src/topology/schema.ts` — replace the `read_only` literal pin with a boolean; add the optional output schema, attempt bound, and network domains to the agent node; add the graph-level base ref; make the `when` leaf variants unambiguously resolvable.
 - `src/topology/compile.ts` — carry the new fields into the compiled shape and validate their combinations.
 - `test/topology/schema.test.ts`, `test/topology/compile.test.ts`
 
-**Approach:** The compile-time wall is one literal; the rest of the unit is additive optional fields. Compile-time validation should reject the combinations that cannot mean anything — network domains or an output schema on a non-agent node, an attempt bound that is not positive — so authoring errors surface before a run id exists, matching how slice 1 gates prompt tokens. Reject a write-capable node reachable from a fan-out edge, naming slice 2b: single-track is a scope decision, not an engine constraint, and nothing else stops an author from putting N concurrent write nodes in one worktree — which is precisely the silent-loss failure mode this milestone cites as its reason to isolate at all. This is the cheapest possible enforcement of the plan's own deferral. Use the vocabulary already coined in `CONTEXT.md` rather than inventing synonyms.
+**Approach:** The compile-time wall is one literal; the rest of the unit is additive optional fields.
+
+**Repair the `when` grammar before anything is built to evaluate it.** `WhenRuleSchema` (`src/topology/schema.ts:31-43`) is a `z.union` whose `{key, equals: z.unknown()}` member matches first for the `truthy`, `falsy`, `not_equals`, and `contains` shapes, because `z.unknown()` accepts a missing key; zod's default strip mode then discards the operator. Probe-verified against the repo's own zod: `{key:"v.ok",truthy:true}` parses to `{"key":"v.ok"}`, and so do the `not_equals` and `contains` forms — mutually indistinguishable after parsing, with the same loss inside `all`/`any`/`not` nesting. Only `equals` and `exists` survive today, so four of the nine variants reach U3's evaluator as a bare key. Keep the authored leaf shape — `{key, <operator>: value}` — and make each leaf variant reject unrecognized keys and require its own operator key, so exactly one variant can match a given leaf and a bare `{key}` with no operator is rejected at compile time. Restructuring the leaves as `{key, op, value}` resolves the ambiguity too and is **not** chosen: it rewrites an authored grammar for nothing the strict form does not already give. Compile-time validation should reject the combinations that cannot mean anything — network domains or an output schema on a non-agent node, an attempt bound that is not positive — so authoring errors surface before a run id exists, matching how slice 1 gates prompt tokens. Reject a write-capable node reachable from a fan-out edge, naming slice 2b: single-track is a scope decision, not an engine constraint, and nothing else stops an author from putting N concurrent write nodes in one worktree — which is precisely the silent-loss failure mode this milestone cites as its reason to isolate at all. This is the cheapest possible enforcement of the plan's own deferral. Use the vocabulary already coined in `CONTEXT.md` rather than inventing synonyms.
 
 **Patterns to follow:** the discriminated-union node schema and the existing `CompileResult` ok/errors shape in `src/topology/compile.ts`; slice 1's fail-before-a-run-id-exists posture in `src/cli/start.ts`.
 
@@ -586,8 +594,12 @@ independent of C, so they can land in either order — but C depends on A for th
 - A write-capable node reachable from a fan-out edge is rejected, with a message naming slice 2b.
 - A read-only node reachable from a fan-out edge still compiles — the restriction is on write capability, not on fan-out.
 - A graph with no declared base ref compiles, leaving the default to be resolved at start.
+- All nine `when` variants round-trip through `compile()` with their operator key intact — asserted variant by variant, so the four that strip mode silently reduced to a bare `{key}` (`truthy`, `falsy`, `not_equals`, `contains`) each fail loudly if the defect returns.
+- The same nine variants round-trip intact when nested inside `all`, `any`, and `not`.
+- A `when` leaf carrying no operator, or two operators, is rejected at compile time naming the edge.
+- Slice-1 topologies using `when` — including the `truthy` form already in the CLI test suite — still compile without edits.
 
-**Verification:** The topology suite passes, and the slice-1 example topology still compiles untouched.
+**Verification:** The topology suite passes, and the slice-1 example topology still compiles untouched. The nine-variant round-trip runs through `compile()`, not against hand-built rule literals, since the parse step is where the loss occurred.
 
 ---
 
@@ -608,14 +620,14 @@ independent of C, so they can land in either order — but C depends on A for th
 - `test/engine/when.test.ts` — new.
 - `test/engine/loop.test.ts`, `test/topology/lint.test.ts`
 
-**Approach:** The rule grammar already exists and is already parsed — this unit supplies the missing evaluator and wires it into the one place plain edges are followed. Read state through the existing dotted-path traversal so a parsed object at a flat output key is addressable without new machinery. Detect the unmatched router **per activation**, not by testing the aggregated frontier for emptiness — see KTD-6 for why the obvious check is wrong and for the two exclusions (a join source contributes an arrival, an empty fan-out contributes nothing) that a naive condition would trip over. The lint warning is the demoted form of compile-time exhaustiveness, per the Product Contract decision — a warning, never an error, because forcing filler edges into END is worse than failing at run time with the value named.
+**Approach:** The rule grammar exists and is parsed, but until U2 lands only five of its nine leaf variants survive that parse — see U2's Approach. This unit supplies the missing evaluator on top of the repaired grammar and wires it into the one place plain edges are followed; evaluate all nine variants, and take the rules off the compiled topology so a parse-time loss cannot hide behind a hand-built literal. Read state through the existing dotted-path traversal so a parsed object at a flat output key is addressable without new machinery. Detect the unmatched router **per activation and on guard evaluation** — count the activation's guards that evaluated true and fail only when that count is zero. Do not express the condition in terms of the frontier at all: see KTD-6 for why both frontier-shaped checks are wrong (aggregate emptiness hides one activation behind another; per-activation contribution false-fires when `pushUnique` dedups a diamond's second satisfied edge), and for the two exclusions (a join source contributes an arrival, an empty fan-out produces nothing) that a naive condition would trip over. The lint warning is the demoted form of compile-time exhaustiveness, per the Product Contract decision — a warning, never an error, because forcing filler edges into END is worse than failing at run time with the value named.
 
 **Patterns to follow:** the existing dotted-path read helper in `src/engine/state.ts`; the recursive grammar already declared in `src/topology/schema.ts`; the warning shape `lintJoinDesync` returns.
 
 **Test scenarios:**
 - Covers AE1. Two guarded out-edges, state satisfying exactly one: only that target activates.
 - Covers AE3. Every out-edge guarded, none satisfied: the run fails, naming the node, each rule, and the values read — and does not report the no-out-edges status.
-- Every rule variant in the grammar evaluates correctly, including the nested boolean combinators and negation.
+- Every rule variant in the grammar evaluates correctly, including the nested boolean combinators and negation. Read the rules off a **compiled** topology rather than from hand-built rule objects — a hand-built literal skips the parse step, which is precisely where four of the nine variants were being discarded before U2.
 - A guard reading a dotted path into a parsed object written by a structured-output node resolves.
 - A guard reading a path that does not exist in state evaluates false rather than throwing.
 - An unguarded plain edge is still traversed unconditionally — slice-1 behavior is unchanged.
@@ -625,6 +637,7 @@ independent of C, so they can land in either order — but C depends on A for th
 - One activation routing successfully while a second matches none of its guards: the run still fails, naming the second node. The aggregated frontier is non-empty in this case, which is why the naive emptiness check would miss it.
 - A node that is both a join source and has guarded plain out-edges, none satisfied: contributes a barrier arrival, so no spurious unmatched-router failure.
 - A node with a fan-out edge over an empty list: contributes nothing, and does not trigger the unmatched-router failure.
+- A diamond where A→C and B→C both carry **satisfied** guards: `pushUnique` dedups B's push on `instanceId`, so B contributes no frontier entry — and the run must still succeed. A contribution-based condition fails here, naming a node that routed correctly.
 - The exhaustiveness lint warns on a fully-guarded node and stays silent when an unguarded edge is present.
 - Each routing decision is traced with the rule and the values read.
 
@@ -674,13 +687,13 @@ independent of C, so they can land in either order — but C depends on A for th
 
 **Files:**
 - `src/workspace/lifecycle.ts` — new: resolve the base ref, create the worktree and run branch, write the exclusion, retain or remove per terminal status, prune the admin entry.
-- `src/cli/start.ts` — resolve and report the base ref before spawning.
-- `src/runtime/run.ts` — create the workspace at boot; use it as every node's working directory.
+- `src/cli/start.ts` — resolve and report the base ref before spawning, and pass the resolved SHA to the engine on argv.
+- `src/runtime/run.ts` — create the workspace at boot from the SHA on argv; use it as every node's working directory.
 - `src/store/` — a migration recording the resolved base ref, workspace path, and run branch on the run row.
 - `test/workspace/lifecycle.test.ts` — new.
 - `test/integration/workspace-isolation.test.ts` — new.
 
-**Approach:** Name the workspace directory by run id — the worktree admin name derives from the directory basename, and two runs sharing a basename get silently de-duplicated names that are then unpredictable to prune. Place workspaces in a root that is a **sibling of** the run store, never inside its directory: the store is the only record of what a run did, so a write scope covering it would let a node rewrite its own trace. Resolve the base ref to a commit SHA at start and create the worktree from the recorded SHA, not from the symbolic ref — a moving branch tip between start and boot is the same class of window graph-bro#12 already cost this project. Capture the consumer baseline (porcelain output plus tracked-file hashes, plus the ref set) here, since KTD-11's backstop compares against it. Write the CLI's scratch directory into the worktree's exclude file at creation: this keeps attempt commits clean *and* prevents slice 1's tree-clean assertion from false-tripping now that read-only nodes also run here. Retain the worktree on a halted run with its HEAD detached so the run branch stays checkout-able, and remove it on a converged one, per KTD-9.
+**Approach:** Name the workspace directory by run id — the worktree admin name derives from the directory basename, and two runs sharing a basename get silently de-duplicated names that are then unpredictable to prune. Place workspaces in a root that is a **sibling of** the run store, never inside its directory: the store is the only record of what a run did, so a write scope covering it would let a node rewrite its own trace. Resolve the base ref to a commit SHA at start and create the worktree from the resolved SHA, not from the symbolic ref — a moving branch tip between start and boot is the same class of window graph-bro#12 already cost this project. **Deliver that SHA on the engine's argv**, the way the topology path and the input snapshot already are, rather than having the child read it back off the run row: `src/cli/start.ts` calls `spawnDetachedEngine` at `:68` and `createRun` only at `:76`, so no run row exists when the child boots, and U5 introduces exactly the read slice 1 never performed — an intermittent failure keyed on Node startup timing. The run-row column stays the durable record for `status`, `result`, and resume to read; it is not the transport. Capture the consumer baseline (porcelain output plus tracked-file hashes, plus the ref set) here, since KTD-11's backstop compares against it. Write the CLI's scratch directory into the worktree's exclude file at creation: this keeps attempt commits clean and keeps the CLI's own files out of every node's tree comparison. It does **not** by itself keep the read-only backstop from false-tripping on a prior write node's uncommitted work — U6 rescopes that assertion to a per-node baseline. Retain the worktree on a halted run with its HEAD detached so the run branch stays checkout-able, and remove it on a converged one, per KTD-9.
 
 **Patterns to follow:** the existing `~/.graph-bro` home and `GRAPH_BRO_HOME` override in `src/store/db.ts`; the idempotent numbered-migration convention in `src/store/`; the throwaway-git-repo helper in `test/fixtures/cli-harness.ts`.
 
@@ -697,6 +710,7 @@ independent of C, so they can land in either order — but C depends on A for th
 - A converged run's worktree is removed and its branch survives and is readable from the consumer.
 - A halted run's worktree is retained, and the run branch can still be checked out elsewhere while it exists.
 - The base ref is recorded as a commit SHA, and a branch tip that moves between start and engine boot does not change the workspace's content.
+- The engine receives the resolved SHA on argv: a boot that races ahead of the run row's insert still creates the workspace from the right commit, rather than failing intermittently on a missing row.
 - The workspace root is not inside the run store's directory, and a write node cannot modify the store or its sidecar files.
 - Covers R19. A killed run leaves the consumer's working tree and index untouched.
 - A non-git consumer directory fails with a clear message rather than proceeding unisolated.
@@ -724,6 +738,8 @@ independent of C, so they can land in either order — but C depends on A for th
 
 **Approach:** Build KTD-3's five layers. The single most important thing this unit must not get wrong: **path-scope the file-tool allow rules.** A bare tool name is not path-scoped, and a probe of the earlier design wrote an absolute path outside the workspace through the file tool while the sandbox was active. Use the auto-deny permission mode — a probe confirmed a denied call does not abort a headless run, contradicting the rationale an earlier version of this plan carried. Canonicalise the workspace path before synthesizing any scope or deny rule, or a symlinked ancestor makes the boundary silently match nothing. Suppress user-scoped MCP servers, without which R11 is false. Synthesize a minimal environment rather than inheriting the engine's. Refuse to start a write run where the OS boundary is unavailable rather than running unconfined. Widen the read-only allowlist too: a review node's whole job is judging a diff, and the slice-1 allowlist carries only status and log — the milestone bar runs straight into this, and the fake backend will not catch it because it never runs a tool.
 
+**Rescope the read-only tree-clean backstop to a per-node baseline.** `assertRepoClean` fires unconditionally for read-only nodes (`src/executor/claude-code.ts:152`, `src/executor/read-only-policy.ts:37-42`) and throws on any non-empty porcelain output. Now that every node shares one workspace, a read-only node activating after a write node but before the attempt commit fails the run naming a node that touched nothing — in exactly the multi-stage graph the Product Contract's first Key Decision mandates. Record the workspace's porcelain state before the node and compare after, mirroring what KTD-11 already does for the consumer. The assertion then means "this node changed nothing", which is what it was always for, rather than "the tree is clean", which stopped being true the moment write nodes moved in.
+
 **Patterns to follow:** `src/executor/read-only-policy.ts` — mirror its shape (exported policy constant plus an assertion helper) and its recorded-probe comment convention, but **not** its flag choice: its allowlist is a permission allowlist, which is the wrong instrument for path confinement.
 
 **Execution note:** the escape cases must be proven against the real CLI and a real filesystem, not a fake. A stub cannot demonstrate that the boundary refused a write, which is the only thing R10 actually claims. Each escape test needs a negative control — an in-workspace write that succeeds in the same run — or a scope misconfigured to block everything would pass.
@@ -745,7 +761,8 @@ independent of C, so they can land in either order — but C depends on A for th
 - The node subprocess does not see a planted secret from the engine's environment.
 - Covers AE7/R12. The backstop passes when the consumer's checkout is dirty at start and unchanged at the end, and names the offending node when tracked content changed.
 - Covers AE14. The backstop names the offending node when a consumer ref other than the run branch moved or was deleted.
-- A read-only node can diff and show inside the workspace, and its tree-clean assertion still applies.
+- A read-only node can diff and show inside the workspace, and its backstop still names it when it does modify a tracked file.
+- A read-only node activating over an earlier write node's uncommitted changes passes its backstop — the per-node baseline is what keeps the run from failing a node that touched nothing.
 - A platform where the OS boundary is unavailable: a write run refuses to start, with a message naming the reason.
 
 **Verification:** The enforcement suite passes with the escape cases asserting on filesystem state — the absence of the file — rather than on a returned error string, and each escape case paired with its in-run negative control. The file-tool escape case and the self-written-configuration case both pass, since those are the two the earlier design missed.
@@ -756,16 +773,20 @@ independent of C, so they can land in either order — but C depends on A for th
 
 **Goal:** Each attempt produces exactly one commit on the run branch, whatever the agent did inside the workspace.
 
-**Requirements:** R20 (AE8), R21, R17. Implements KTD-7.
+**Requirements:** R20 (AE8), R21, R17, R18 (AE10). Implements KTD-7.
 
-**Dependencies:** U5, U6.
+**Dependencies:** U4, U5, U6 — the attempt counter and the bounded-node identity come from U4, which is why this unit cannot land ahead of Phase B even though the rest of Phase C can.
 
 **Files:**
 - `src/workspace/commit.ts` — new: record and compare HEAD, squash-fold agent commits, commit an attempt, write a failing attempt to a side ref.
-- `src/runtime/run.ts` — compose the commit onto write nodes through the existing node-decorator seam, and expose the attempt count to it via an injected callback.
+- `src/runtime/run.ts` — compose the commit as a before-invocation hook on the bounded node through the existing node-decorator seam, add the teardown commit on terminal paths, and expose the attempt count to both via an injected callback.
 - `test/workspace/commit.test.ts` — new.
 
-**Approach:** Compare workspace HEAD before and after and fold whatever appeared into one commit, per the Product Contract decision — detection cannot be talked around, whereas a command allowlist can. Fold rather than fail: halting an unattended run over something harmless defeats the point. Anchor the commit to the attempt boundary defined in KTD-7 — the super-step preceding the bounded node's next activation — not to each write node, or a loop body with two write nodes silently produces two commits for one attempt. Run engine commits with hooks disabled, so a consumer repo whose committed content supplies a hooks path cannot execute repo content inside the unsandboxed engine process. Re-check that the workspace is quiescent after committing and trace a warning naming the node if not, since a detached child can outlive the node. **Note the ownership constraint from KTD-10:** this unit touches no file under `src/engine` — commits compose in the runtime, so the loop keeps its no-I/O property and loop tests keep working without real repositories.
+**Approach:** Compare workspace HEAD before and after and fold whatever appeared into one commit, per the Product Contract decision — detection cannot be talked around, whereas a command allowlist can. Fold rather than fail: halting an unattended run over something harmless defeats the point. Anchor the commit to the attempt boundary defined in KTD-7 — the super-step preceding the bounded node's next activation — not to each write node, or a loop body with two write nodes silently produces two commits for one attempt.
+
+**Express that boundary as a before-invocation hook on the bounded node**: commit whatever the workspace holds, then invoke. The runtime's only composition seam is per node invocation (`buildNodeFns` / `withTracing`, `src/runtime/run.ts:55-111`) and KTD-10 forbids the loop from importing the workspace module, so decorating *write* nodes is the only other option in that seam — and it fires twice per attempt in a two-write-node body, the exact outcome KTD-7 forbids and the scenario below tests against. "Commit, then run the bounded node" is literally KTD-7's definition and fits the seam unchanged.
+
+**Commit the final attempt at teardown as well.** The boundary hook only fires on re-entry, so a run that converges — or fails — without re-activating the bounded node leaves its last attempt uncommitted, contradicting R21's promise that every attempt is committed. U8's side-ref write covers only the resume path and is not a substitute. Commit at run teardown on every terminal path; the runtime already owns disposal (KTD-10), and the teardown commit is a no-op when the boundary hook already fired and the workspace is clean. Run engine commits with hooks disabled, so a consumer repo whose committed content supplies a hooks path cannot execute repo content inside the unsandboxed engine process. Re-check that the workspace is quiescent after committing and trace a warning naming the node if not, since a detached child can outlive the node. **Note the ownership constraint from KTD-10:** this unit touches no file under `src/engine` — commits compose in the runtime, so the loop keeps its no-I/O property and loop tests keep working without real repositories.
 
 **Patterns to follow:** `withTracing` and `buildNodeFns` in `src/runtime/run.ts:55-111` — the existing decorator seam this unit extends; the git-invocation style in `src/executor/read-only-policy.ts`.
 
@@ -779,6 +800,9 @@ independent of C, so they can land in either order — but C depends on A for th
 - Covers R17. The consumer's pre-existing branches and history are unchanged after the run.
 - The CLI's scratch directory is not present in any attempt commit.
 - Covers AE8. A loop body containing two write nodes still produces exactly one commit for the attempt — the case that a per-write-node boundary would get wrong.
+- Covers R21. A run that converges on its first attempt, never re-activating the bounded node afterwards: that attempt is still committed. The boundary hook alone leaves it uncommitted, so this is the teardown commit's test.
+- Covers R21. A run that fails after a write node without re-entering the bounded node: the attempt is committed on the failure path too.
+- Covers AE10. A completed run against a consumer with a configured remote: nothing was pushed, no remote-tracking ref moved, and no PR was opened. The run has no push path at all — this pins that it stays that way.
 - A consumer repo whose committed content supplies a hooks path: the hook does not execute during an engine commit.
 - A write node that leaves a detached background writer behind: exactly one attempt commit, and the stray writer is reported rather than silently absorbed.
 - The engine loop module is unchanged by this unit, and loop tests still run without a real repository.
@@ -803,7 +827,9 @@ independent of C, so they can land in either order — but C depends on A for th
 - `src/workspace/commit.ts`, `src/workspace/lifecycle.ts` — the side-ref write and the reset to the last good commit.
 - `test/integration/write-crash-resume.test.ts` — new.
 
-**Approach:** Resume writes the partial attempt to a side ref, hard-resets the workspace to the last committed attempt, then re-enters — the sequence the Product Contract decision names, which is what makes retaining a workspace and re-entering it compatible. Continue the attempt count rather than restarting it, per KTD-5, so resume cannot launder a run past its bound. Leave the existing owner-pid eligibility gate alone; it never consults status, so the new terminal status is resumable without change.
+**Approach:** Resume writes the partial attempt to a side ref, hard-resets the workspace to the last committed attempt, then re-enters — the sequence the Product Contract decision names, which is what makes retaining a workspace and re-entering it compatible. Continue the attempt count rather than restarting it, per KTD-5, so resume cannot launder a run past its bound.
+
+**Re-attach the worktree to the run branch before committing anything.** KTD-9 leaves a retained worktree's HEAD detached precisely so the operator can check the run branch out elsewhere — and if they did, resume must not fall back to committing on a detached HEAD, which loses every post-resume attempt from the handback silently. Re-attach first; if the branch is held by another worktree, abort with a message naming the holding path rather than proceeding detached. Leave the existing owner-pid eligibility gate alone; it never consults status, so the new terminal status is resumable without change.
 
 **Patterns to follow:** the ownership claim-before-spawn race guard in `src/cli/resume.ts`; the crash-resume integration test in `test/integration/crash-resume.test.ts`.
 
@@ -817,6 +843,8 @@ independent of C, so they can land in either order — but C depends on A for th
 - Covers R19. The consumer's working tree and index are untouched across the kill and the resume.
 - A run halted at its bound is resumable — the eligibility gate does not consult status.
 - Resuming a run whose workspace was removed by hand fails with a clear message rather than re-running from scratch.
+- A retained worktree with a detached HEAD: resume re-attaches it to the run branch, and post-resume attempts land on the branch the operator reads — not on a detached HEAD.
+- The run branch checked out in another worktree at resume time: resume aborts naming the holding worktree, rather than committing detached and losing the work.
 
 **Verification:** The crash-resume integration suite passes, asserting both the workspace tree state and the continued attempt count after resume.
 
@@ -834,9 +862,10 @@ independent of C, so they can land in either order — but C depends on A for th
 - `src/store/trace.ts` — the new payload shapes for routing decisions and attempt commits.
 - `src/cli/result.ts`, `src/cli/status.ts` — surface the stop reason and the per-attempt aggregation.
 - `src/engine/loop.ts` — emit the new events.
+- `src/runtime/run.ts` — stamp the attempt number onto the cost-bearing `node_complete` events `withTracing` writes; without it there is no grouping key to aggregate on.
 - `test/store/trace.test.ts`, `test/cli/cli.test.ts`
 
-**Approach:** Token and cost capture already exists end-to-end, so this is aggregation and two new payload types rather than new instrumentation. Group by the attempt counter U4 maintains, so the trace, the commit history, and the bound all key off one number. Surface tokens as the primary figure with reported USD alongside, per the Product Contract's no-cost-ceiling decision: the scarce resource is the usage window.
+**Approach:** Token and cost *capture* already exists end-to-end; per-attempt *attribution* does not. The only cost-bearing events are the `node_complete` rows `withTracing` writes (`src/runtime/run.ts:63-74`), and they pass no step and no attempt, so `step` is written NULL — R26's per-attempt figure and the four-attribution assertion below cannot be computed from what exists today. Thread the attempt number into `withTracing` and stamp it on those events; the attempt callback U7 already injects into the runtime is the natural carrier. The rest is aggregation and two new payload types. Group by the attempt counter U4 maintains, so the trace, the commit history, and the bound all key off one number. Surface tokens as the primary figure with reported USD alongside, per the Product Contract's no-cost-ceiling decision: the scarce resource is the usage window.
 
 **Patterns to follow:** the open `payload` discriminator already used for node lifecycle events in `src/store/trace.ts`; the cursor-paged event listing behind `tail`.
 
@@ -864,9 +893,10 @@ independent of C, so they can land in either order — but C depends on A for th
 - `examples/review-fix-loop/topology.json` — new.
 - `examples/review-fix-loop/README.md` — new.
 - `test/smoke/review-fix-loop.test.ts` — new.
-- `test/fixtures/fake-claude.mjs` — a scripted sequence that fails review once, then passes.
+- `test/fixtures/fake-claude.mjs` — an invocation counter persisted to a state file, so one mode can vary its response across invocations; plus a mode that writes a file into its cwd, so the workspace actually goes dirty.
+- the fixture's counter state file — path supplied by an environment variable pointing inside the test's temp home, so concurrent tests never share a counter.
 
-**Approach:** Mirror the slice-1 example's structure so the pair reads as a set — a shape walkthrough naming each node and the mechanic it demonstrates, then a run-it section. Script the fake CLI to fail review on the first attempt and pass on the second: an example that converges immediately demonstrates routing, not self-correction, which is the distinction R27 exists to enforce. Keep every name generic — the boundary-invariant test greps the shipped example directories.
+**Approach:** Mirror the slice-1 example's structure so the pair reads as a set — a shape walkthrough naming each node and the mechanic it demonstrates, then a run-it section. Script the fake CLI to fail review on the first attempt and pass on the second: an example that converges immediately demonstrates routing, not self-correction, which is the distinction R27 exists to enforce. **Extend the fixture before writing either scenario** — both are unwritable against it as it stands. It reads one `FAKE_CLAUDE_MODE` per invocation and holds no cross-invocation state, so it cannot fail review on attempt one and pass on attempt two; and it writes nothing, so the workspace never goes dirty and "one commit per attempt" would assert zero commits. The invocation counter and the cwd-writing mode in the Files list are what make both scenarios expressible. Keep every name generic — the boundary-invariant test greps the shipped example directories.
 
 **Patterns to follow:** `examples/fanout-read-join/` for both files; `test/smoke/example-graph.test.ts` for driving the real built CLI against the fake backend with a temp home and a direct database poll.
 
@@ -935,28 +965,12 @@ CI gate. sensei#24 is the mechanics smoke test on the way to it.
 
 ### From 2026-07-25 review
 
-Findings from the document-review pass, deferred rather than applied. Each is a change to *this
-document*, to make before implementation starts. Severity and the confidence anchor are the
-reviewer's. Items marked **probe-verified** were confirmed against the real source or the installed
-CLI in the review session — do not re-derive them, and do not treat them as claims needing a second
-opinion.
-
-**Blockers — a unit cannot be built as currently written**
-
-1. **The `when` grammar destroys four of its nine variants at parse time.** (P1, confidence 100, **probe-verified**.) `WhenRuleSchema` in `src/topology/schema.ts:31-43` is a `z.union` whose `{key, equals: z.unknown()}` member matches first for the `truthy`, `falsy`, `not_equals`, and `contains` shapes; zod's default strip mode then discards the operator key. Probed against the repo's zod: `{key:"v.ok",truthy:true}` → `{"key":"v.ok"}`, `{key:"v.status",not_equals:"pass"}` → `{"key":"v.status"}`, `{key:"v.findings",contains:"x"}` → `{"key":"v.findings"}` — mutually indistinguishable, and the loss also occurs inside `all`/`any`/`not` nesting. Only `equals` and `exists` survive. U3's Approach therefore rests on a false premise ("the grammar already exists and is already parsed — this unit supplies the missing evaluator"): four of nine guard forms cannot be evaluated at all. **Fix:** add `src/topology/schema.ts` to U2's Files and make the leaf variants unambiguously resolvable (require the operator key per leaf, or restructure leaves as `{key, op, value?}`). Add a U2 scenario asserting all nine variants round-trip through `compile()` with the operator intact, and make U3's every-variant scenario read rules off the compiled topology rather than hand-built literals so the parse loss cannot hide.
-2. **The commit decorator cannot express KTD-7's super-step boundary.** (P2, confidence 75.) The runtime's only composition seam is per-node-invocation (`buildNodeFns` / `withTracing`, `src/runtime/run.ts:55-111`), and KTD-10 forbids the loop from importing the workspace module — so decorating *write* nodes fires twice per attempt in a two-write-node loop body, which is exactly the outcome KTD-7 forbids and U7's own scenario tests against. **Fix:** compose the commit onto the **bounded** node as a before-invocation hook ("commit whatever the workspace holds, then run the bounded node") — that is expressible in the existing seam and is literally KTD-7's definition. This exposes a real gap to close in the same edit: state what commits the **final** attempt of a run that converges or fails without ever re-activating the bounded node, since R21 promises every attempt is committed but the boundary only fires on re-entry and U8's side-ref write only fires on resume.
-3. **The read-only tree-clean assertion will false-trip on a prior write node's uncommitted work.** (P2, confidence 75.) `assertRepoClean` fires unconditionally for read-only nodes (`src/executor/claude-code.ts:152`, `src/executor/read-only-policy.ts:37-42`) and throws on any non-empty porcelain output. Now that every node shares the workspace, a read-only node activating after a write node but before the attempt commit fails the run naming a node that touched nothing — in exactly the multi-stage graph the Product Contract's first Key Decision mandates. The System-Wide Impact claim that KTD-7's exclusion prevents false-tripping is wrong: that exclusion covers only the CLI's scratch directory. **Fix:** scope the read-only backstop to a per-node baseline diff, mirroring what KTD-11 already does for the consumer, and correct the System-Wide Impact bullet. Add a U6 scenario: a read-only node activating over an earlier write node's uncommitted changes passes its backstop.
-
-**Corrections to text that is now wrong**
-
-4. **Scope Boundaries still claims this slice clears hooks.** (P1, confidence 100.) The `Deferred to Follow-Up Work` bullet reads "this slice clears hooks and records the residue", which the corrected KTD-4 and the Risks section explicitly retract — hooks merge across scopes and cannot be unmerged by settings delivery. A reader checking only Scope Boundaries concludes hook exposure is handled. **Fix:** rewrite that bullet to match KTD-4: user-scoped MCP servers are suppressed by KTD-3's layer 5, hook exposure is an open unmitigated risk, and drop "this slice clears hooks."
-5. **The base ref is recorded after the engine is spawned.** (P1, confidence 75, **probe-verified**.) `src/cli/start.ts` calls `spawnDetachedEngine` at line 68 and `createRun` only at line 76, so no run row exists when the child boots — and U5 introduces exactly the read of that row which slice 1 never performed. Produces an intermittent failure keyed on Node startup timing. **Fix:** pass the resolved base-ref SHA to the engine on argv the way the topology path and input snapshot already are, keeping the run-row column as the record for `status`/`result` rather than the transport. Commit to one option in U5's Approach.
-6. **U7's dependency row omits U4.** (P2, confidence 75.) The Unit Index lists U7 as depending on U5 and U6, but U7's own Approach needs the attempt counter and the bounded-node identity that U4 creates — and Sequencing explicitly permits landing Phase C before Phase B. **Fix:** change U7's depends-on to U4, U5, U6 and correct the Sequencing paragraph.
-7. **Per-attempt token attribution has no grouping key.** (P1, confidence 75.) The only cost-bearing events are `node_complete` rows from `withTracing` (`src/runtime/run.ts:63-74`), which pass no step or attempt, so `step` is written NULL — R26's per-attempt figure and U9's four-attribution assertion cannot be computed. U9's Files list omits `src/runtime/run.ts`, where the stamping must happen. **Fix:** add that file to U9, thread the attempt number into `withTracing` (the attempt callback U7 already injects is the natural carrier), and soften the Dependencies line: token *capture* exists, per-attempt *attribution* does not.
-8. **KTD-6's unmatched-router condition false-fires on frontier dedup.** (P2, confidence 75.) `pushUnique` dedups on `instanceId` and every plain-edge target gets `instanceId: edge.to` (`src/engine/loop.ts:219-231`), so in a diamond where A→C and B→C both carry *satisfied* guards, B's push is swallowed, B contributed no frontier entry, and the condition fires — failing the run naming an innocent node, the inverse of R3's purpose. **Fix:** restate the condition in terms of guard evaluation rather than frontier contribution — track per activation whether any guarded out-edge evaluated true, and fail only when that count is zero, keeping the barrier-arrival and empty-fan-out exclusions. Add the diamond scenario to U3.
-9. **A detached retained worktree blocks resume from advancing the run branch.** (P2, confidence 75.) KTD-9 detaches the retained worktree's HEAD so the operator can check the branch out elsewhere; if they do, resume cannot re-attach, and committing on a detached HEAD silently loses every post-resume attempt from the handback. **Fix:** add the re-attach step to U8's Approach, aborting with a message naming the holding worktree rather than falling back to a detached commit. Add the scenario.
-10. **AE10 is enforced by no unit's test scenarios.** (P1, confidence 100.) Definition of Done requires all fifteen acceptance examples to be covered by a named test; AE10 (nothing pushed, no PR opened) is cited nowhere. **Fix:** attach it to whichever unit owns handback verification.
-11. **The fake CLI fixture cannot script attempts or produce commits.** (P3, confidence 75.) `test/fixtures/fake-claude.mjs` reads one `FAKE_CLAUDE_MODE` per invocation with no cross-invocation state, so it cannot fail review on attempt one and pass on attempt two; and it writes nothing, so the workspace is never dirty and "one commit per attempt" asserts zero commits. Both U10 scenarios are unwritable as scoped. **Fix:** specify an invocation-counter state file and a mode that writes into its cwd, and name both in U10's Files.
+The eleven findings from that document-review pass — three blockers and eight corrections — were
+**applied to this document on 2026-07-25** and are no longer listed here. Where a finding was
+probe-verified, the probe's own evidence travelled into the text it corrected, so the claim is
+readable at the point of use: the `when` parse loss in U2's Approach, the `spawnDetachedEngine`
+ordering in U5's, the file-tool escape already in KTD-3 and U6. What remains below is the one
+advisory item and the carried questions, neither of which was a change to make before implementation.
 
 **FYI — advisory, no decision needed**
 
