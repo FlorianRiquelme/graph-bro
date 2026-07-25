@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,6 +115,40 @@ describe("integration/workspace-isolation: every run executes in its own worktre
 
     const result = runCliSync(["result", runId], { cwd, env });
     expect(JSON.parse(result.stdout)).toMatchObject({ status: "completed", output: { greeting: "pong" } });
+  }, 15_000);
+
+  it("Covers R10: a full run leaves the consumer's own '.git/info/exclude' byte-identical, whether it pre-existed or not", async () => {
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const consumerExcludePath = join(cwd, ".git", "info", "exclude");
+    const bytesBefore = existsSync(consumerExcludePath) ? readFileSync(consumerExcludePath) : null;
+    const env = baseEnv("success");
+
+    const start = runCliSync(["start", topologyPath], { cwd, env });
+    expect(start.status).toBe(0);
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    if (bytesBefore === null) {
+      expect(existsSync(consumerExcludePath)).toBe(false); // must not have been created by the run
+    } else {
+      expect(readFileSync(consumerExcludePath)).toEqual(bytesBefore); // byte-identical
+    }
+  }, 15_000);
+
+  it("Covers R10: a full run leaves the consumer's own '.git/info/exclude' byte-identical when it did not exist beforehand", async () => {
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const consumerExcludePath = join(cwd, ".git", "info", "exclude");
+    rmSync(consumerExcludePath, { force: true }); // simulate the file never having existed
+    const env = baseEnv("success");
+
+    const start = runCliSync(["start", topologyPath], { cwd, env });
+    expect(start.status).toBe(0);
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    expect(existsSync(consumerExcludePath)).toBe(false); // must not have been created by the run
   }, 15_000);
 
   it("Covers R19: a killed run leaves the consumer's working tree and index untouched", async () => {

@@ -154,6 +154,33 @@ describe("workspace/lifecycle: createWorkspace / finalizeWorkspace (R13/R15/R16/
     expect(git(workspacePath, ["status", "--porcelain"])).toBe("");
   });
 
+  it("Covers R10: creating a workspace never touches the consumer's own '.git/info/exclude', even when that file did not exist beforehand", () => {
+    const consumerExcludePath = join(consumer, ".git", "info", "exclude");
+    rmSync(consumerExcludePath, { force: true }); // simulate the file never having existed
+
+    const runId = "run-consumer-exclude";
+    const baseRefSha = resolveBaseRef(consumer);
+    const workspacePath = workspacePathForRun(runId, workspacesRoot);
+    createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath, runBranch: runBranchForRun(runId) });
+
+    expect(existsSync(consumerExcludePath)).toBe(false); // must not be created either
+  });
+
+  it("Covers R10: a second run against the same consumer repo does not accumulate duplicate lines in the workspace's own exclude file", () => {
+    const runIdA = "run-exclude-dupe-a";
+    const runIdB = "run-exclude-dupe-b";
+    const baseRefSha = resolveBaseRef(consumer);
+    const workspaceA = workspacePathForRun(runIdA, workspacesRoot);
+    const workspaceB = workspacePathForRun(runIdB, workspacesRoot);
+    createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath: workspaceA, runBranch: runBranchForRun(runIdA) });
+    createWorkspace({ consumerRepoPath: consumer, baseRefSha, workspacePath: workspaceB, runBranch: runBranchForRun(runIdB) });
+
+    const gitDirA = git(workspaceA, ["rev-parse", "--git-dir"]).trim();
+    const resolvedA = join(gitDirA.startsWith("/") ? gitDirA : join(workspaceA, gitDirA), "info", "exclude");
+    const lines = readFileSync(resolvedA, "utf8").split("\n").filter((l) => l.trim() === "/.claude/");
+    expect(lines).toHaveLength(1);
+  });
+
   it("a converged run's worktree is removed and its branch survives, readable from the consumer", () => {
     const runId = "run-converged";
     const baseRefSha = resolveBaseRef(consumer);

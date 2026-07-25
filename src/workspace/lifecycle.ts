@@ -66,18 +66,32 @@ export function resolveBaseRef(consumerRepoPath: string, declaredRef?: string): 
 /**
  * The CLI's own scratch directory (Claude Code's project-local `.claude/`)
  * excluded from the worktree at creation — keeps attempt commits clean and
- * keeps the CLI's own files out of every node's tree comparison. Written via
- * `git rev-parse --git-path info/exclude` rather than a hardcoded
- * `.git/info/exclude` path, since a linked worktree's effective exclude file
- * is not guaranteed to live at that literal relative path.
+ * keeps the CLI's own files out of every node's tree comparison.
+ *
+ * `git rev-parse --git-path info/exclude` resolves to the *common* git dir —
+ * `info/` is shared across all worktrees of a repo (only
+ * `info/sparse-checkout` is per-worktree) — so writing there would append to
+ * the consumer's own `.git/info/exclude`, permanently, on every run. That
+ * would leave the consumer's `git status`/`git add -A` silently ignoring an
+ * untracked `.claude/` in their main working tree from then on, with no
+ * mention of it in the run's output. `git rev-parse --git-dir`, by contrast,
+ * resolves to the worktree's own private admin directory
+ * (`<common-dir>/worktrees/<name>`), which git also honours for this
+ * worktree's own exclude file — so writing `info/exclude` under it keeps the
+ * workspace's scratch directory ignored without ever touching the consumer's
+ * copy. That per-worktree `info/` directory does not exist by default and
+ * must be created.
  */
 function excludeScratchDirectory(workspacePath: string): void {
-  const relativeExcludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+  const gitDir = execFileSync("git", ["rev-parse", "--git-dir"], {
     cwd: workspacePath,
     encoding: "utf8",
     stdio: GIT_STDIO,
   }).trim();
-  const excludePath = isAbsolute(relativeExcludePath) ? relativeExcludePath : join(workspacePath, relativeExcludePath);
+  const worktreeGitDir = isAbsolute(gitDir) ? gitDir : join(workspacePath, gitDir);
+  const infoDir = join(worktreeGitDir, "info");
+  mkdirSync(infoDir, { recursive: true });
+  const excludePath = join(infoDir, "exclude");
   const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
   const line = "/.claude/";
   if (existing.split("\n").some((l) => l.trim() === line)) return;
