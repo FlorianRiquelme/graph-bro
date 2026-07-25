@@ -1,12 +1,16 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
 import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+const FAKE_CLAUDE_FIX_REVIEW = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -434,4 +438,160 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     },
     15_000,
   );
+});
+
+describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)", () => {
+  let home: string;
+  let cwd: string;
+  let counterDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "graph-bro-trace-home-"));
+    cwd = gitRepo();
+    counterDir = mkdtempSync(join(tmpdir(), "graph-bro-trace-counter-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(counterDir, { recursive: true, force: true });
+  });
+
+  function fixReviewEnv(passOnAttempt: number): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
+      GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_FIX_REVIEW,
+      FAKE_CLAUDE_COUNTER_DIR: counterDir,
+      FAKE_CLAUDE_PASS_ON_ATTEMPT: String(passOnAttempt),
+    };
+  }
+
+  function fixReviewLoopTopology(maxAttempts: number) {
+    return {
+      nodes: [
+        {
+          id: "writer",
+          kind: "agent",
+          read_only: false,
+          model: "claude-haiku-4-5",
+          prompt: JSON.stringify({ write: { path: "work.txt", content: "attempt" } }),
+          output_key: "written",
+        },
+        {
+          id: "review",
+          kind: "agent",
+          read_only: true,
+          model: "claude-haiku-4-5",
+          prompt: "review the work",
+          output_key: "verdict",
+          output_schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+          max_attempts: maxAttempts,
+        },
+      ],
+      edges: [
+        { from: "START", to: "writer" },
+        { from: "writer", to: "review" },
+        { from: "review", to: "writer", when: { key: "verdict.verdict", equals: "fail" } },
+        { from: "review", to: "END", when: { key: "verdict.verdict", equals: "pass" } },
+      ],
+      max_steps: 20,
+    };
+  }
+
+  it("Covers R26: a four-attempt run's result shows exactly four per-attempt attributions, each with tokens and USD", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(4) });
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env: fixReviewEnv(4) }).stdout);
+    expect(result.status).toBe("completed");
+    expect(result.attempts).toHaveLength(4);
+    expect(result.attempts.map((a: { attempt: number }) => a.attempt)).toEqual([1, 2, 3, 4]);
+    for (const attempt of result.attempts) {
+      expect(attempt.inputTokens).toBeGreaterThan(0);
+      expect(attempt.outputTokens).toBeGreaterThan(0);
+      expect(attempt.costUsd).toBeGreaterThan(0);
+    }
+  }, 20_000);
+
+  it("Covers R25: the three stop reasons are distinguishable in result's output — converged, bound hit, and failed", async () => {
+    const convergedCwd = gitRepo();
+    const failedCwd = gitRepo();
+    try {
+      const convergedTopologyPath = writeTopology(convergedCwd, fixReviewLoopTopology(5));
+      const convergedStart = runCliSync(["start", convergedTopologyPath], { cwd: convergedCwd, env: fixReviewEnv(1) });
+      const convergedRunId = convergedStart.stdout.trim();
+      await waitForRunStatus(home, convergedRunId, "completed", 10_000);
+      const convergedResult = JSON.parse(runCliSync(["result", convergedRunId], { cwd: convergedCwd, env: fixReviewEnv(1) }).stdout);
+      expect(convergedResult.status).toBe("completed");
+      expect(convergedResult.error).toBeUndefined();
+
+      const boundTopologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+      const boundStart = runCliSync(["start", boundTopologyPath], { cwd, env: fixReviewEnv(99) });
+      const boundRunId = boundStart.stdout.trim();
+      await waitForRunStatus(home, boundRunId, "not_converged", 10_000);
+      const boundResult = JSON.parse(runCliSync(["result", boundRunId], { cwd, env: fixReviewEnv(99) }).stdout);
+      expect(boundResult.status).toBe("not_converged");
+      expect(boundResult.error).toBeUndefined(); // not a failure — distinct from it
+
+      // A real runtime failure (not the CLI's own start-time validation
+      // gate): max_steps exceeded before the never-converging loop ever
+      // reaches its attempt bound, so `result.error` carries a real message.
+      const failedTopologyPath = writeTopology(failedCwd, { ...fixReviewLoopTopology(99), max_steps: 2 });
+      const failedStart = runCliSync(["start", failedTopologyPath], { cwd: failedCwd, env: fixReviewEnv(99) });
+      const failedRunId = failedStart.stdout.trim();
+      await waitForRunStatus(home, failedRunId, "failed", 10_000);
+      const failedResult = JSON.parse(runCliSync(["result", failedRunId], { cwd: failedCwd, env: fixReviewEnv(99) }).stdout);
+      expect(failedResult.status).toBe("failed");
+      expect(failedResult.error).toBeTruthy();
+    } finally {
+      rmSync(convergedCwd, { recursive: true, force: true });
+      rmSync(failedCwd, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("a slice-1-shaped read-only run's result/status output is unchanged — no attempts or error keys appear", async () => {
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const env = {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
+      GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
+      FAKE_CLAUDE_MODE: "success",
+    };
+    const start = runCliSync(["start", topologyPath], { cwd, env });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env }).stdout);
+    expect(Object.keys(result).sort()).toEqual(["output", "runId", "status"]);
+
+    const status = JSON.parse(runCliSync(["status", runId], { cwd, env }).stdout);
+    expect(Object.keys(status).sort()).toEqual(["createdAt", "ownerPid", "runId", "status"]);
+  }, 15_000);
+
+  it("Covers R24: a routing decision (rule, values read) and a node's structured output are both readable from the trace", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(1) });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const events = runCliSync(["tail", runId], { cwd, env: fixReviewEnv(1) })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+
+    const routing = events.find((e) => e.payload.type === "routing_decision" && e.payload.result === true);
+    expect(routing).toBeDefined();
+    expect(routing.payload.rule).toEqual({ key: "verdict.verdict", equals: "pass" });
+    expect(routing.payload.reads).toBeDefined();
+
+    const reviewComplete = events.find((e) => e.node === "review" && e.payload.type === "node_complete");
+    expect(reviewComplete.payload.update.verdict).toEqual({ verdict: "pass" });
+  }, 15_000);
 });

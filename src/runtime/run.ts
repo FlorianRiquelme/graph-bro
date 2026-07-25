@@ -63,10 +63,31 @@ function installKillCascade(registry: InMemoryNodeRegistry): void {
   process.on("SIGINT", handle);
 }
 
-/** Wraps a node fn with start/complete/error trace events (R12 legibility) so `graph-bro tail` can page per-node activity. */
-function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: string, fn: NodeFn): NodeFn {
+/** Shared across every node's trace wrapper — `withAttemptCommit` advances it, `withTracing` stamps it. */
+interface AttemptState {
+  current: number;
+}
+
+/**
+ * Wraps a node fn with start/complete/error trace events (R12 legibility) so
+ * `graph-bro tail` can page per-node activity. U9/R26: every event is
+ * stamped with `attemptState.current` on the shared `step` column, the
+ * grouping key `graph-bro result`'s per-attempt aggregation keys off — the
+ * same counter `withAttemptCommit` advances, so a node's trace attribution
+ * and its work's actual attempt commit always agree. For the bounded node's
+ * own activation, its `node_start` reads the value from *before*
+ * `withAttemptCommit`'s hook (nested inside this `fn`) advances it, while
+ * `node_complete` reads the value *after* — the hook increments-then-commits
+ * before invoking the node it wraps, so by the time this function's own
+ * `await fn(state)` resolves, the counter already reflects the attempt that
+ * node's own commit just closed. A topology with no bounded node never
+ * advances this counter at all, so every event stays stamped `0` — the
+ * pre-U9 slice-1 shape, since `graph-bro result` treats an all-zero trace as
+ * "no attempt aggregation" (below).
+ */
+function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: string, attemptState: AttemptState, fn: NodeFn): NodeFn {
   return async (state) => {
-    appendEvent(db, { runId, node: nodeId, payload: { type: "node_start" } });
+    appendEvent(db, { runId, node: nodeId, step: attemptState.current, payload: { type: "node_start" } });
     try {
       const update = await fn(state);
       // ADR-0009: fold the executor's per-node cost/token/model/duration
@@ -75,6 +96,7 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
       appendEvent(db, {
         runId,
         node: nodeId,
+        step: attemptState.current,
         model: meta?.model,
         inputTokens: meta?.inputTokens,
         outputTokens: meta?.outputTokens,
@@ -89,6 +111,7 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
       appendEvent(db, {
         runId,
         node: nodeId,
+        step: attemptState.current,
         payload: { type: "node_error", error: err instanceof Error ? err.message : String(err) },
       });
       throw err;
@@ -125,6 +148,7 @@ function withAttemptCommit(
   nodeId: string,
   attemptCounts: Map<string, number>,
   headState: WorkspaceHeadState,
+  attemptState: AttemptState,
   db: ReturnType<typeof openDb>,
   runId: string,
   fn: NodeFn,
@@ -132,10 +156,11 @@ function withAttemptCommit(
   return async (state) => {
     const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
     attemptCounts.set(nodeId, attemptNumber);
+    attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
     const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId });
     headState.current = result.head;
     if (result.quiescenceWarning) {
-      appendEvent(db, { runId, node: nodeId, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+      appendEvent(db, { runId, node: nodeId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
     }
     return fn(state);
   };
@@ -161,7 +186,7 @@ function commitFinalAttempt(
   const result = commitAttempt({ workspacePath, priorHead: headState.current, attemptNumber, nodeId: "run-teardown" });
   headState.current = result.head;
   if (result.quiescenceWarning) {
-    appendEvent(db, { runId, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+    appendEvent(db, { runId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
   }
 }
 
@@ -334,15 +359,19 @@ async function main(): Promise<void> {
   // it (`resume`, no special-casing needed since git already reflects it).
   const headState = { current: readHead(workspacePath) };
   const commitAttemptCounts = new Map<string, number>(Object.entries(resumed?.attempts ?? {}));
+  // U9: seeded from the same continued counts on resume, so the trace's
+  // attempt attribution picks up where a crashed run's left off rather than
+  // restarting at 0 and re-using attempt numbers a prior process already spent.
+  const attemptState: AttemptState = { current: Math.max(0, ...Object.values(resumed?.attempts ?? {})) };
 
   const rawNodeFns = buildNodeFns(compiled, executor, workspacePath);
   const nodeFns: Record<string, NodeFn> = {};
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
     let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
     if (attemptBounds[nodeId] !== undefined) {
-      wrapped = withAttemptCommit(workspacePath, nodeId, commitAttemptCounts, headState, db, runId, wrapped);
+      wrapped = withAttemptCommit(workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
     }
-    nodeFns[nodeId] = withTracing(db, runId, nodeId, wrapped);
+    nodeFns[nodeId] = withTracing(db, runId, nodeId, attemptState, wrapped);
   }
 
   let runLoopOptions: RunLoopOptions;
@@ -382,6 +411,16 @@ async function main(): Promise<void> {
 
   try {
     const result = await runLoop(runLoopOptions);
+    // R25: the three stop reasons (converged, bound hit, failed — dead_end
+    // folds into "failed" here since both are unrecoverable) are otherwise
+    // only distinguishable by separately reading the `runs` row's `status`
+    // column — this puts the same distinction directly in the trace, next
+    // to the node events it explains.
+    appendEvent(db, {
+      runId,
+      step: attemptState.current,
+      payload: { type: "run_stopped", status: result.status, error: result.status === "failed" ? result.error?.message : undefined },
+    });
     // `runLoop` only checkpoints a step's INCOMING frontier before dispatch, so a
     // "completed" run's very last step (the one that reaches END) is never itself
     // checkpointed. Persist that true final state here so `graph-bro result` reads it
