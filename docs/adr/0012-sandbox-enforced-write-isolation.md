@@ -6,9 +6,24 @@
 
 ## Decision
 
-A write-capable node's Claude Code subprocess is spawned under an **OS-enforced sandbox** the agent cannot opt out of: the engine synthesizes per-node settings JSON (`sandbox.enabled`, `allowUnsandboxedCommands: false`, filesystem writes scoped to the run's workspace, network denied unless the topology declares domains) and passes it via `--settings`. Tool policy (`--allowedTools`/`--tools`, no `--add-dir`) governs the non-Bash tools, which the sandbox does not cover. The consumer-checkout-clean assertion from ADR-0007 is retained as a **secondary** backstop.
+A write-capable node's Claude Code subprocess runs under **five layered enforcement mechanisms**
+(engine slice 2 planning, KTD-3), not two: (1) the auto-deny (`dontAsk`) permission mode, so anything
+not explicitly allowed is refused without blocking the run; (2) a **path-scoped** allow rule
+(`Edit(/**)`, anchored to the canonicalised workspace as cwd) confining the file tools — a bare tool
+name carries no path scope, which is the exact defect an earlier version of this design was falsified
+by probe over; (3) deny rules — binding in every permission mode — for the workspace's own
+CLI-configuration paths and the built-in web tools; (4) the OS sandbox (`sandbox.enabled`,
+`sandbox.failIfUnavailable`) for the Bash tool's filesystem and network reach, with topology-declared
+domains feeding its network allowlist; (5) strict MCP configuration (`--strict-mcp-config`, no
+`--mcp-config`), so the operator's own user-scoped MCP servers never load. **The layers are not
+independent** — layer 1's mode is what gives layers 2 and 3 any force at all. Tool policy governs the
+non-Bash tools, which the sandbox does not cover. The consumer-checkout-clean assertion from ADR-0007
+is retained as a **secondary** backstop, now comparing against a baseline captured at run start rather
+than asserting cleanliness (KTD-11), since a run may start from a deliberately dirty consumer checkout.
 
-As in ADR-0007, this fixes the *mechanism* — prevention at the OS level, layered under prevention at the tool-permission level — not the exact settings spelling, which planning resolves against the installed CLI.
+As in ADR-0007, this fixes the *mechanism* — prevention at the OS level, layered under prevention at
+the tool-permission level — not the exact settings spelling, which planning resolves against the
+installed CLI.
 
 ## Rationale
 
@@ -25,8 +40,9 @@ Consistent with the standing convention that supervised interactive work needs n
 
 ## Consequences
 
-- **ADR-0010's "narrow executor seam" widens.** The engine now generates Claude-Code-specific settings JSON, not only argv. A second backend gets meaningfully harder to add — accepted, since ADR-0010 already committed to one backend and treats the seam as narrow-by-intent rather than portable-by-design.
-- **The engine acquires a platform assumption.** Sandboxing needs seatbelt (macOS) or bubblewrap (Linux).
-- **The sandbox covers only the Bash tool.** Read/Write/Edit, WebFetch, and MCP tools are unaffected by it and remain governed by tool policy and cwd. Both halves are required; neither alone satisfies R10.
-- **Network becomes a topology-declared surface.** With `allowUnsandboxedCommands: false` and network denied by default, any test command that fetches will fail until its domains are declared. This is new authoring surface introduced by this decision.
+- ~~**ADR-0010's "narrow executor seam" widens.** The engine now generates Claude-Code-specific settings JSON, not only argv.~~ **Corrected by KTD-12 (Engine Slice 2 planning):** the seam itself does not widen to carry settings JSON — it stays narrow, gaining only a workspace root, permitted domains, a declared output schema, and a named capability discriminant (`NodeCapability`, replacing the old `readOnly: boolean`). Settings synthesis (the five layers above) stays entirely behind the seam, inside the Claude Code backend (`src/executor/write-policy.ts`, `claude-code.ts`) — a second backend still only needs to honor the same narrow intent, not reproduce Claude-Code-specific settings JSON. One genuine narrowing does belong on the seam: a backend must be able to answer whether an OS boundary is available, since a write run refuses to start without one (KTD-12).
+- **The engine acquires a platform assumption.** Sandboxing needs Seatbelt (macOS) or bubblewrap + socat (Linux/WSL2); native Windows has none. A write run checks this before creating a workspace and refuses to start, naming the reason, rather than running unconfined.
+- **The sandbox covers only the Bash tool.** Read/Write/Edit, WebFetch, and MCP tools are unaffected by it and remain governed by layers 2/3/5 above. All layers are required; none alone satisfies R10.
+- **Network becomes a topology-declared surface.** With network denied by default, any shell command that fetches will fail until its domains are declared. This is new authoring surface introduced by this decision.
 - **Prevention, not detection, for the primary case:** an escape attempt does not occur, rather than being caught afterwards — so the acceptance test asserts absence of the write, not presence of an error.
+- **A synthesized minimal environment replaces inheritance for write nodes** (KTD-4): the subprocess gets an allowlisted set of env vars (`PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `TMPDIR`, `TERM`), not the engine's own environment, so a secret sitting in the engine's process never reaches a write node.
