@@ -217,6 +217,34 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     // (see below) — reaching this point without throwing already proves it passed.
   });
 
+  it("Covers R9/KTD-9: a read-only node's spawn carries the OS-sandbox settings block, no writable paths, no allowed domains", async () => {
+    process.env.FAKE_CLAUDE_MODE = "success";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+    let initEvent: { argv: string[] } | undefined;
+
+    await executor.run("attempt an edit", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+      onEvent: (event) => {
+        const typed = event as { type?: string; argv?: string[] };
+        if (typed.type === "system") initEvent = event as { argv: string[] };
+      },
+    });
+
+    expect(initEvent?.argv).toContain("--settings");
+    const settings = JSON.parse(initEvent!.argv[initEvent!.argv.indexOf("--settings") + 1]);
+    expect(settings.sandbox.enabled).toBe(true);
+    expect(settings.sandbox.failIfUnavailable).toBe(true);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([]);
+    expect(settings.sandbox.network.allowedDomains).toEqual([]);
+    // Not the write policy's confinement — no --strict-mcp-config, no minimal
+    // env, for this half of U6; that half is deliberately deferred.
+    expect(initEvent!.argv).not.toContain("--strict-mcp-config");
+  });
+
   it("Covers R7 backstop (KTD-10): run() raises a loud, node-attributed failure when a read-only node's completion leaves the cwd dirty", async () => {
     // "mutate-cwd": simulates an allowlist gap where something slips through
     // and mutates cwd *during* the node's run — the baseline is captured

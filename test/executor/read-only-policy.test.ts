@@ -3,7 +3,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ReadOnlyViolationError, assertRepoClean, buildReadOnlyArgs, capturePorcelain } from "../../src/executor/read-only-policy.js";
+import {
+  ReadOnlyViolationError,
+  assertRepoClean,
+  buildReadOnlyArgs,
+  buildReadOnlyPolicy,
+  capturePorcelain,
+} from "../../src/executor/read-only-policy.js";
 
 describe("executor: read-only-policy", () => {
   it("builds the mutation-denying allowlist with no --dangerously-skip-permissions", () => {
@@ -19,6 +25,28 @@ describe("executor: read-only-policy", () => {
     expect(allowlist).not.toContain("Write");
     expect(allowlist).not.toContain("NotebookEdit");
     expect(args.join(" ")).not.toContain("--dangerously-skip-permissions");
+  });
+
+  describe("buildReadOnlyPolicy (R9/KTD-9: the OS-sandbox layer)", () => {
+    it("declares the sandbox enabled and failIfUnavailable, mirroring buildWritePolicy's shape", () => {
+      const policy = buildReadOnlyPolicy();
+      expect(policy.argv).toContain("--settings");
+      const settings = JSON.parse(policy.argv[policy.argv.indexOf("--settings") + 1]);
+      expect(settings.sandbox.enabled).toBe(true);
+      expect(settings.sandbox.failIfUnavailable).toBe(true);
+    });
+
+    it("declares no writable paths — a read-only node has no legitimate write target", () => {
+      const policy = buildReadOnlyPolicy();
+      const settings = JSON.parse(policy.argv[policy.argv.indexOf("--settings") + 1]);
+      expect(settings.sandbox.filesystem.allowWrite).toEqual([]);
+    });
+
+    it("declares no allowed network domains", () => {
+      const policy = buildReadOnlyPolicy();
+      const settings = JSON.parse(policy.argv[policy.argv.indexOf("--settings") + 1]);
+      expect(settings.sandbox.network.allowedDomains).toEqual([]);
+    });
   });
 
   describe("assertRepoClean (KTD-10 backstop)", () => {

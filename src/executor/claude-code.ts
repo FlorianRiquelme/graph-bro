@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import type { Executor, NodeRegistry, RunOptions, RunResult, TokenUsage } from "./executor.js";
 import { spawnDetached, killProcessGroup } from "./subprocess.js";
 import { parseEnvelope, type ResultEnvelope } from "./envelope.js";
-import { assertRepoClean, buildReadOnlyArgs, capturePorcelain } from "./read-only-policy.js";
+import { assertRepoClean, buildReadOnlyArgs, buildReadOnlyPolicy, capturePorcelain } from "./read-only-policy.js";
 import { buildWritePolicy } from "./write-policy.js";
 
 /** The literal token a command template substitutes the prompt into, when present. */
@@ -94,6 +94,10 @@ export class ClaudeCodeExecutor implements Executor {
       "--model",
       options.model,
       ...(options.capability === "read_only" ? buildReadOnlyArgs() : []),
+      // R9/KTD-9: a read-only node's OS sandbox layer — closes the
+      // `git diff --output=`/`git show --output=` escape the allowlist
+      // string can't express (see read-only-policy.ts).
+      ...(options.capability === "read_only" ? buildReadOnlyPolicy().argv : []),
       ...(writePolicy?.argv ?? []),
       // KTD-8: forwards the topology-declared output schema as the backend's
       // structured-output contract; the response's parsed value comes back

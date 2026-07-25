@@ -366,4 +366,57 @@ describe("integration/sandbox-enforcement: a write run refuses to start where th
 
     expect(existsSync(join(home, "workspaces", runId))).toBe(false);
   });
+
+  // U6/R9/KTD-9: read-only nodes now carry their own sandbox layer, so the
+  // precheck above is extended from write-bearing runs to any run with an
+  // agent node — a read-only-only topology must refuse to start the same
+  // way, naming why, rather than running unconfined.
+  it("names the reason and never creates a workspace, for a read-only-only topology with no OS sandbox", async () => {
+    const topologyPath = join(consumer, "topology.json");
+    writeFileSync(
+      topologyPath,
+      JSON.stringify({
+        nodes: [{ id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "ping", output_key: "out" }],
+        edges: [
+          { from: "START", to: "reader" },
+          { from: "reader", to: "END" },
+        ],
+        max_steps: 10,
+      }),
+    );
+    execFileSync("git", ["add", "-A"], { cwd: consumer });
+    execFileSync("git", ["commit", "-q", "-m", "add topology"], { cwd: consumer });
+
+    const env = {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
+      GRAPH_BRO_TEST_PLATFORM: "win32",
+    };
+
+    const start = runCliSync(["start", topologyPath], { cwd: consumer, env });
+    expect(start.status).toBe(0); // `start` itself only spawns the engine; the refusal happens inside it
+    const runId = start.stdout.trim();
+
+    await waitFor(() => {
+      const db = openDb({ baseDir: home });
+      try {
+        return getRun(db, runId)?.status === "failed";
+      } finally {
+        db.close();
+      }
+    }, 5000);
+
+    const db = openDb({ baseDir: home });
+    try {
+      const events = db.prepare("select payload from events where run_id = ?").all(runId) as { payload: string }[];
+      const errorEvent = events.map((e) => JSON.parse(e.payload)).find((p) => p.type === "run_error");
+      expect(errorEvent?.error).toMatch(/OS sandbox unavailable/);
+      expect(errorEvent?.error).toMatch(/win32/);
+    } finally {
+      db.close();
+    }
+
+    expect(existsSync(join(home, "workspaces", runId))).toBe(false);
+  });
 });

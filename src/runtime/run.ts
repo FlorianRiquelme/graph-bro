@@ -277,11 +277,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  // U6/KTD-3: refuse to start a write run where the OS boundary is
+  // U6/KTD-3/KTD-9: refuse to start a run where the OS boundary is
   // unavailable rather than running unconfined — checked before a workspace
-  // ever gets created. A read-only-only topology needs no sandbox.
-  const hasWriteNode = compiled.nodes.some((node) => node.kind === "agent" && !node.read_only);
-  if (hasWriteNode) {
+  // ever gets created. Extended from write-bearing runs to any run with an
+  // agent node: a read-only node now carries its own sandbox layer too (R9),
+  // so a read-only-only topology needs the same OS boundary a write node
+  // needs, and must refuse to start rather than discover the gap mid-run.
+  const hasAgentNode = compiled.nodes.some((node) => node.kind === "agent");
+  if (hasAgentNode) {
     const boundary = checkOsBoundary(process.env.GRAPH_BRO_TEST_PLATFORM as NodeJS.Platform | undefined);
     if (!boundary.available) {
       appendEvent(db, { runId, payload: { type: "run_error", error: boundary.reason } });
