@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +8,8 @@ import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
 import { createRun, getRun } from "../../src/store/pending-writes.js";
 import { listEvents } from "../../src/store/trace.js";
-import { workspacePathForRun } from "../../src/workspace/lifecycle.js";
-import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { createWorkspace, resolveBaseRef, runBranchForRun, workspacePathForRun } from "../../src/workspace/lifecycle.js";
+import { createGitShim, FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const FAKE_CLAUDE_WRITE = join(FIXTURES_DIR, "fake-claude-write.mjs");
@@ -588,5 +588,183 @@ describe("integration/terminal-status: the terminal write is decided by the loop
     } finally {
       rmSync(elsewhere, { recursive: true, force: true });
     }
+  }, 15_000);
+});
+
+describe("integration/setup-failure-disposal: a `start` failing between workspace creation and the manifest append disposes; a `resume` failing there never does (U7)", () => {
+  let home: string;
+  let workspaces: string;
+  let cwd: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "graph-bro-setup-failure-home-"));
+    workspaces = join(home, "workspaces");
+    cwd = gitRepo();
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  function baseEnv(): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: workspaces,
+      GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
+      FAKE_CLAUDE_MODE: "success",
+    };
+  }
+
+  function singleNodeTopology() {
+    return {
+      nodes: [{ id: "reader", kind: "agent", read_only: true, model: "claude-haiku-4-5", prompt: "ping", output_key: "greeting" }],
+      edges: [
+        { from: "START", to: "reader" },
+        { from: "reader", to: "END" },
+      ],
+      max_steps: 10,
+    };
+  }
+
+  /**
+   * A `git` shim that lets the real `worktree add` run exactly as
+   * `createWorkspace` invokes it — same argv, same real git — and, only once
+   * that real invocation has already succeeded, chmods a tracked
+   * config-surface file (checked out into the new workspace, never the
+   * consumer repo) unreadable. `hashConfigPath`'s `existsSync`/`statSync`
+   * guards tolerate any stat failure, but the `readFileSync` on a *present*
+   * file does not — a real `EACCES` stands in for "the workspace changed
+   * between creation and the manifest capture" without racing a background
+   * writer against the engine (the corruption happens synchronously, inside
+   * the same blocking `execFileSync` call `createWorkspace` makes, before
+   * that call — and therefore `captureWorkspaceIntegrityManifest` right
+   * after it — ever returns). A file, not a directory, so the later forced
+   * `git worktree remove` this unit adds (disposal) never has to descend into
+   * an unreadable directory to succeed.
+   */
+  function createManifestCorruptingGitShim(relPathToCorrupt: string): { dir: string; cleanup: () => void } {
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim().split("\n")[0];
+    const dir = mkdtempSync(join(tmpdir(), "graph-bro-manifest-corrupt-shim-"));
+    const gitPath = join(dir, "git");
+    const script = `#!/bin/bash
+set -u
+REAL_GIT=${JSON.stringify(realGit)}
+"$REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$1" = "worktree" ] && [ "$2" = "add" ] && [ "$3" = "-b" ]; then
+  chmod 000 "$5/${relPathToCorrupt}"
+fi
+exit "$status"
+`;
+    writeFileSync(gitPath, script);
+    chmodSync(gitPath, 0o755);
+    return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  it("a start whose manifest capture fails after workspace creation leaves no worktree registered against the consumer repo, and the run branch is not pinned", async () => {
+    // Tracked in the base commit so it's checked out into the fresh
+    // workspace — the shim below corrupts this exact path there, never
+    // anything in the consumer repo itself.
+    mkdirSync(join(cwd, ".claude"), { recursive: true });
+    writeFileSync(join(cwd, ".claude", "settings.local.json"), "{}");
+    execFileSync("git", ["add", "-A"], { cwd });
+    execFileSync("git", ["commit", "-q", "-m", "add claude config"], { cwd });
+
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const shim = createManifestCorruptingGitShim(".claude/settings.local.json");
+    try {
+      const env = { ...baseEnv(), PATH: `${shim.dir}:${process.env.PATH}` };
+      const start = runCliSync(["start", topologyPath], { cwd, env });
+      const runId = start.stdout.trim();
+      expect(runId).not.toBe("");
+
+      const runBranch = `graph-bro/run-${runId}`;
+      const workspacePath = workspacePathForRun(runId, workspaces);
+
+      await waitForRunStatus(home, runId, "failed", 10_000);
+
+      // R11 writes the status before disposing of the workspace (KTD-12) —
+      // disposal is only eventually observable here, not atomic with the
+      // status write, mirroring every other disposal assertion in this file.
+      await waitFor(() => !existsSync(workspacePath), 5000);
+      expect(execFileSync("git", ["worktree", "list"], { cwd, encoding: "utf8" })).not.toContain(workspacePath);
+
+      // Not pinned: the branch is reachable and checkable out elsewhere.
+      const elsewhere = mkdtempSync(join(tmpdir(), "graph-bro-setup-failure-elsewhere-"));
+      try {
+        execFileSync("git", ["worktree", "add", elsewhere, runBranch], { cwd, encoding: "utf8" });
+      } finally {
+        rmSync(elsewhere, { recursive: true, force: true });
+      }
+
+      // Disposal did not overwrite the outcome: the run is still `failed`,
+      // and the original setup error (a real EACCES, not a mock) is still
+      // the one in the trace.
+      const db = openDb({ baseDir: home });
+      const run = getRun(db, runId);
+      const events = listEvents(db, runId);
+      db.close();
+      expect(run?.status).toBe("failed");
+      const setupError = events.find((e) => (e.payload as { type?: string } | undefined)?.type === "run_error");
+      expect(String((setupError?.payload as { error?: string } | undefined)?.error)).toMatch(/EACCES|permission denied/i);
+    } finally {
+      shim.cleanup();
+    }
+  }, 15_000);
+
+  it("a createWorkspace failure itself (the worktree add fails outright) still reports that error, with at most an additional finalize-error trace event and no crash", async () => {
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const shim = createGitShim({ match: ["worktree", "add"], stderr: "fatal: shim-forced worktree add failure\n" });
+    try {
+      const env = { ...baseEnv(), PATH: `${shim.dir}:${process.env.PATH}` };
+      const start = runCliSync(["start", topologyPath], { cwd, env });
+      const runId = start.stdout.trim();
+      expect(runId).not.toBe("");
+
+      await waitForRunStatus(home, runId, "failed", 10_000);
+
+      const db = openDb({ baseDir: home });
+      const events = listEvents(db, runId);
+      db.close();
+      const setupError = events.find((e) => (e.payload as { type?: string } | undefined)?.type === "run_error");
+      expect(String((setupError?.payload as { error?: string } | undefined)?.error)).toContain("could not create workspace worktree");
+      // No crash: at most one additional finalize-error event from disposing
+      // of a workspace that was never actually created.
+      const finalizeErrors = events.filter((e) => (e.payload as { type?: string } | undefined)?.type === "workspace_finalize_error");
+      expect(finalizeErrors.length).toBeLessThanOrEqual(1);
+    } finally {
+      shim.cleanup();
+    }
+  }, 15_000);
+
+  it("a failing resume leaves the workspace on disk and still resumable — the mode === 'start' guard holds", async () => {
+    const runId = "resume-setup-failure-guard-run";
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const baseRef = resolveBaseRef(cwd);
+    const workspacePath = workspacePathForRun(runId, workspaces);
+    const runBranch = runBranchForRun(runId);
+    createWorkspace({ consumerRepoPath: cwd, baseRefSha: baseRef, workspacePath, runBranch });
+    // Deliberately no workspace-integrity-manifest event appended (unlike
+    // `seedWorkspaceForRun`) — trips resume's own "no workspace integrity
+    // manifest recorded" throw, inside the very setup `try` this unit's guard
+    // covers, deterministically and without racing a real node's timing.
+    const db = openDb({ baseDir: home });
+    createRun(db, runId, 999_999, topologyPath, { baseRef, workspacePath, runBranch }); // a dead owner pid, so resume self-heals
+    writeCheckpoint(db, runId, { state: {}, frontier: [{ nodeId: "reader", instanceId: "reader" }], barrier: {}, step: 0 });
+    db.close();
+
+    const resume = runCliSync(["resume", runId], { cwd, env: baseEnv() });
+    expect(resume.status).toBe(0); // `resume` only spawns the engine — the failure is inside it
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    // Give any (incorrect) disposal every chance to land before asserting its
+    // absence — the mirror image of the positive `waitFor(() =>
+    // !existsSync(...))` disposal assertions elsewhere in this file.
+    await waitFor(() => !existsSync(workspacePath), 2000).catch(() => {});
+    expect(existsSync(workspacePath)).toBe(true);
+    expect(execFileSync("git", ["worktree", "list"], { cwd, encoding: "utf8" })).toContain(workspacePath);
   }, 15_000);
 });

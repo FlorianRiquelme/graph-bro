@@ -398,6 +398,19 @@ async function main(): Promise<void> {
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
     updateRunStatus(db, runId, "failed");
+    // U7: guarded to `start` — this catch is shared with `resume`, whose own
+    // arm can fail (`reuseWorkspace`/`reattachToRunBranch`/the missing-
+    // manifest throw/`preserveInterruptedAttempt`) against a workspace that
+    // is meant to stay retained for inspection or a later resume (KTD-9). A
+    // `start` failure here is different: nothing has dispatched against the
+    // workspace yet, so nothing about it is worth keeping, and leaving it
+    // undisposed strands a worktree pinning the run branch with no way back
+    // in (the manifest event never landed, so `resume` can never pass its own
+    // integrity check against this run again). `disposeWorkspace` isolates
+    // its own failure (e.g. `createWorkspace` itself never having created
+    // anything to remove) into a `workspace_finalize_error` trace event
+    // rather than overwriting the "failed" status just written above.
+    if (mode === "start") disposeWorkspace(true);
     db.close();
     process.exitCode = 1;
     return;
