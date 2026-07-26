@@ -25,4 +25,13 @@ jobs:
       # write path instead of failing the OS-boundary precheck and timing out.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap socat
 
+      # Proves bwrap can actually sandbox on this runner (unprivileged user
+      # namespaces enabled), not merely that the package is installed — a
+      # runner that forbids them would otherwise go green on presence alone.
+      # This only proves the runner's own shell can sandbox, not that the
+      # CLI's own sandbox invocation succeeds; end-to-end evidence is deferred
+      # to #19. It also says nothing about the macOS path an operator
+      # develops against — Seatbelt is unverified by this or any CI job.
+      - run: bwrap --dev-bind / / --ro-bind /etc /etc true
+
       - run: npm test

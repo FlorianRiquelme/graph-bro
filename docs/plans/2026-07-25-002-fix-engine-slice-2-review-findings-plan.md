@@ -94,7 +94,7 @@ Out of scope, unchanged from slice 2: fan-out write lanes, push, PR-opening, cos
 ### Dependencies and Assumptions
 
 - CI runs `ubuntu-latest`; `bubblewrap` and `socat` install from apt without a container change.
-- The installed CLI accepts a sandbox block with an empty `filesystem.allowWrite` array as "no writable paths". U6 must probe this before relying on it — the fallback is a minimal-scope placeholder path with no matching files.
+- The installed CLI treats an empty `filesystem.allowWrite` array as "no writable paths beyond its own default writable set" — live-probed against `claude` 2.1.220, cwd and `$TMPDIR` stay writable regardless, and only paths outside that default set are refused. U6 must probe this before relying on it — the fallback is a minimal-scope placeholder path with no matching files.
 - The operator's machine has `commit.gpgsign=true` with `gpg.format=ssh`, globally and in this repo. Verified 2026-07-25. Every test scratch repo sets it `false`, so the suite structurally cannot observe #14.
 - Baseline: `npx vitest run --exclude 'test/integration/sandbox-enforcement.test.ts'` is green on darwin — 33 files, 319 tests, 27s. Verified 2026-07-25.
 - The engine takes the consumer repo path from its own working directory, so a `resume` invoked from a different directory than `start` already misresolves it. U3 makes that constraint load-bearing on every git call rather than only on workspace disposal. Pre-existing; not fixed here.
