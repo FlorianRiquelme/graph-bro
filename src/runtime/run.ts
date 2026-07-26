@@ -141,6 +141,27 @@ interface WorkspaceHeadState {
 }
 
 /**
+ * U3/KTD-17: the integrity backstop as its own wrapper, applied to every
+ * agent node's activation regardless of whether that node declares
+ * `max_attempts` — before U3, the assertion lived inside `withAttemptCommit`
+ * and so only ever fired on a bounded node's re-entry, leaving every
+ * unbounded write-capable node (the shipped `examples/review-fix-loop`'s
+ * `fix` node, for one) with no coverage at all. Composed in `main()` as the
+ * *outer* wrapper around `withAttemptCommit` (applied after it in the loop
+ * below, which — since the loop wraps innermost-first — puts this one
+ * outside): the assertion must still run before `withAttemptCommit`'s own
+ * fold, for the same check-before-fold reason `withAttemptCommit`'s doc
+ * comment below explains, so getting the composition order backwards would
+ * silently move it to after the commit instead.
+ */
+function withWorkspaceIntegrity(workspacePath: string, nodeId: string, integrityManifest: WorkspaceIntegrityManifest, fn: NodeFn): NodeFn {
+  return async (state) => {
+    assertWorkspaceIntegrity(workspacePath, integrityManifest, nodeId);
+    return fn(state);
+  };
+}
+
+/**
  * KTD-7: the attempt commit boundary, expressed as a before-invocation hook
  * on the bounded node — "commit whatever the workspace holds, then invoke"
  * is the boundary's own definition. `attemptCounts` mirrors the loop's own
@@ -150,11 +171,10 @@ interface WorkspaceHeadState {
  * KTD-10 forbids `src/engine` from importing the workspace module, so this
  * lives entirely on the runtime side of that seam.
  *
- * R8/KTD-8: `assertWorkspaceIntegrity` runs first, before `commitAttempt` —
- * naming `nodeId` (the node about to be invoked, the same node whose
- * previous activation is the only thing that could have tampered since the
- * last check) on divergence. Checking before the fold is load-bearing: this
- * is the one seam that would otherwise commit a planted `.claude` file (or a
+ * R8/KTD-8/KTD-17: the integrity check itself now lives in
+ * `withWorkspaceIntegrity` above, composed to run before this hook's own
+ * `commitAttempt` — checking before the fold is load-bearing: this is the
+ * one seam that would otherwise commit a planted `.claude` file (or a
  * rewritten gitlink) into real run history before anything ever inspected it
  * — after which the failure would name a commit, not a node.
  */
@@ -167,11 +187,9 @@ function withAttemptCommit(
   attemptState: AttemptState,
   db: ReturnType<typeof openDb>,
   runId: string,
-  integrityManifest: WorkspaceIntegrityManifest,
   fn: NodeFn,
 ): NodeFn {
   return async (state) => {
-    assertWorkspaceIntegrity(workspacePath, integrityManifest, nodeId);
     const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
     attemptCounts.set(nodeId, attemptNumber);
     attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
@@ -360,12 +378,22 @@ async function main(): Promise<void> {
       // whatever a kill left dirty mid-attempt (F3/AE9) and hard-reset to
       // the last actually committed attempt before re-entering.
       reattachToRunBranch(consumerRepoPath, workspacePath, runBranch);
-      preserveInterruptedAttempt(consumerRepoPath, workspacePath, runId, baseRefSha);
+      // U3/KTD-17: the manifest is read — and the workspace checked against
+      // it — *before* `preserveInterruptedAttempt` runs. That call folds
+      // whatever a killed node left on disk into a partial-attempt ref via a
+      // full `add -A` / `write-tree` / `commit-tree`, with nothing checking
+      // it first; a kill is the most likely way a write run ends, and the
+      // terminal assertion only covers a graceful exit, never the kill path
+      // (the signal handler's `process.exit(1)` bypasses it entirely). Moving
+      // the read ahead means the *next* resume is where a kill-time tamper
+      // gets caught, before it is folded into history.
       const recorded = findRecordedManifest(listEvents(db, runId));
       if (!recorded) {
         throw new Error(`no workspace integrity manifest recorded for run '${runId}' — cannot resume safely`);
       }
       integrityManifest = recorded;
+      assertWorkspaceIntegrity(workspacePath, integrityManifest, "run-resume");
+      preserveInterruptedAttempt(consumerRepoPath, workspacePath, runId, baseRefSha);
     }
   } catch (err) {
     appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
@@ -491,7 +519,14 @@ async function main(): Promise<void> {
   for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
     let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
     if (attemptBounds[nodeId] !== undefined) {
-      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, integrityManifest, wrapped);
+      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
+    }
+    // U3/KTD-17: applied to every agent node (never a `set` node, which does
+    // no CLI startup and has nothing to check) — after `withAttemptCommit`
+    // above, which (the loop wraps innermost-first) makes this the *outer*
+    // wrapper so the assertion still runs before that hook's own fold.
+    if (compiled.nodes.find((node) => node.id === nodeId)?.kind === "agent") {
+      wrapped = withWorkspaceIntegrity(workspacePath, nodeId, integrityManifest, wrapped);
     }
     nodeFns[nodeId] = withTracing(db, runId, nodeId, attemptState, wrapped);
   }

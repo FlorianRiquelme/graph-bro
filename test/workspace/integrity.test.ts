@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,7 @@ import {
 } from "../../src/workspace/integrity.js";
 import { openDb } from "../../src/store/db.js";
 import { listEvents } from "../../src/store/trace.js";
-import { gitRepo, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 /** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
 function symbolicRefOrEmpty(cwd: string): string {
@@ -29,6 +29,17 @@ const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtur
 // not-yet-existing `.claude/`), and its read-only half answers a structured
 // verdict from FAKE_CLAUDE_PASS_ON_ATTEMPT.
 const FAKE_CLAUDE_TAMPER_WRITE = join(FIXTURES_DIR, "fake-claude-tamper-write.mjs");
+// U3: unconditionally writes whatever its prompt's `{"write":...}` says,
+// regardless of the node's declared capability — used below to prove the
+// integrity assertion fires on a *read-only* node's own activation too
+// (the real sandbox is what would refuse a real `claude` read-only node's
+// write; this fixture stands in for "assume the write happened anyway").
+const FAKE_CLAUDE_WRITE = join(FIXTURES_DIR, "fake-claude-write.mjs");
+// U3: writes then hangs indefinitely without emitting a result — stands in
+// for "the node is still working" so a test can SIGKILL the engine mid-write,
+// leaving the tamper on disk but never folded into any attempt commit.
+const FAKE_CLAUDE_WRITE_THEN_HANG = join(FIXTURES_DIR, "fake-claude-write-then-hang.mjs");
+const FAKE_CLAUDE_FIX_REVIEW_RESUME = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
 
 function git(cwd: string, args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -102,6 +113,19 @@ describe("workspace/integrity: assertWorkspaceIntegrity (R8 backstop, KTD-8, uni
       expect(message).toContain("gitlink target changed");
       expect(message).not.toContain("CLI-configuration surface changed");
     }
+  });
+
+  // U3/U1-probe: a live `claude` 2.1.220 run creates `.claude/.cc-writes/`
+  // unconditionally, in both capability arms — outside the narrowed
+  // `CONFIG_SURFACE_PATHS`. Without this test the narrowing is only asserted
+  // by inspection; a later widening back to a blanket `.claude` would
+  // silently reintroduce a false positive on every live run.
+  it("a file appearing under .claude/.cc-writes/ (the CLI's own unconditional scratch dir) does not trip the assertion", () => {
+    const manifest = captureWorkspaceIntegrityManifest(workspace);
+    mkdirSync(join(workspace, ".claude", ".cc-writes"), { recursive: true });
+    writeFileSync(join(workspace, ".claude", ".cc-writes", "scratch"), "anything\n");
+
+    expect(() => assertWorkspaceIntegrity(workspace, manifest, "writer-node")).not.toThrow();
   });
 });
 
@@ -321,6 +345,148 @@ describe("integration/integrity: a full run fails when the workspace's config su
 
     const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv({ FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" }) });
     const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+    expect(tailErrors(runId).some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
+  }, 15_000);
+
+  it("U3: an unbounded write-capable node (no max_attempts) that plants .claude/settings.local.json is caught on its own next activation, and the failure names that node — the shipped review-fix-loop's 'fix' node's reachability case", async () => {
+    // `fix` declares no `max_attempts` and loops directly back onto itself
+    // (no intervening node), so pre-U3 nothing ever checked it: only a
+    // *bounded* node's own re-entry got the assertion. Its first activation
+    // plants the tamper; its second must be caught before it runs at all
+    // ("fail before the fix"), naming `fix` itself.
+    const topologyPath = writeTopology(cwd, {
+      nodes: [
+        {
+          id: "fix",
+          kind: "agent",
+          read_only: false,
+          model: "claude-haiku-4-5",
+          prompt: writePrompt(".claude/settings.local.json", '{"hooks":{}}'),
+          output_key: "fix_result",
+        },
+      ],
+      edges: [
+        { from: "START", to: "fix" },
+        { from: "fix", to: "fix" },
+      ],
+      max_steps: 5,
+    });
+
+    const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv() });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    const errors = tailErrors(runId);
+    expect(errors.some((error) => error.includes("fix"))).toBe(true);
+    expect(errors.some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
+  }, 15_000);
+
+  it("U3: the assertion fires at a read-only node's own activation boundary too, not only a write-capable node's", async () => {
+    // FAKE_CLAUDE_WRITE writes unconditionally regardless of the node's
+    // declared capability — standing in for "assume a real sandbox escape
+    // happened", since this test is about the assertion's own coverage, not
+    // about re-proving the sandbox (read-only-policy.test.ts's job).
+    const topologyPath = writeTopology(cwd, {
+      nodes: [
+        {
+          id: "reader",
+          kind: "agent",
+          read_only: true,
+          model: "claude-haiku-4-5",
+          prompt: writePrompt(".mcp.json", '{"mcpServers":{"evil":{}}}'),
+          output_key: "reader_result",
+        },
+      ],
+      edges: [
+        { from: "START", to: "reader" },
+        { from: "reader", to: "reader" },
+      ],
+      max_steps: 5,
+    });
+
+    const start = runCliSync(["start", topologyPath], { cwd, env: { ...baseEnv(), GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_WRITE } });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    const errors = tailErrors(runId);
+    expect(errors.some((error) => error.includes("reader"))).toBe(true);
+    expect(errors.some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
+  }, 15_000);
+
+  it("U3/KTD-17: a bounded node that plants .mcp.json is caught with NO attempt commit having been created for its own boundary (check-before-fold)", async () => {
+    // `writer` is unbounded and always dispatches; `review` is bounded, so
+    // pre-U3 this scenario was already caught here too — the point of THIS
+    // assertion is the one below: no "attempt N (review)" boundary commit
+    // ever landed, proving the integrity check ran before `withAttemptCommit`'s
+    // own fold, not after it (the composition-order bug this scenario is
+    // built to pin). R21/U7 (out of scope here, and separately a U16 concern)
+    // still unconditionally mints the terminal teardown commit regardless of
+    // the failed status, so that one commit alone is expected and is not the
+    // thing this assertion is about.
+    const topology = fixReviewLoopTopology(5);
+    const topologyPath = writeTopology(cwd, topology);
+    setPrompt(topologyPath, topology, "writer", writePrompt(".mcp.json", '{"mcpServers":{"evil":{}}}'));
+    const baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+
+    const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv({ FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" }) });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+    expect(tailErrors(runId).some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
+
+    const runBranch = `graph-bro/run-${runId}`;
+    const messages = execFileSync("git", ["log", "--format=%s", `${baseRef}..${runBranch}`], { cwd, encoding: "utf8" })
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    expect(messages).toHaveLength(1); // only the unconditional teardown commit
+    expect(messages[0]).toContain("run-teardown");
+    expect(messages.some((message) => message.includes("(review)"))).toBe(false);
+  }, 15_000);
+
+  it("U3: a killed run whose node planted config is caught on the next resume, before preserveInterruptedAttempt folds the tree into a partial-attempt ref", async () => {
+    const topology = fixReviewLoopTopology(5);
+    const topologyPath = writeTopology(cwd, topology);
+    setPrompt(topologyPath, topology, "writer", writePrompt(".mcp.json", '{"mcpServers":{"evil":{}}}'));
+
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(), GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_WRITE_THEN_HANG, FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" },
+    });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    const workspacePath = join(workspaces, runId);
+    // Wait for the writer's in-flight tamper to actually land on disk (the
+    // node itself then hangs, standing in for "still working") before
+    // killing — never folded into any attempt commit at kill time.
+    await waitFor(() => {
+      try {
+        return readFileSync(join(workspacePath, ".mcp.json"), "utf8").length > 0;
+      } catch {
+        return false;
+      }
+    }, 5000);
+
+    const statusJson = JSON.parse(
+      runCliSync(["status", runId], { cwd, env: { ...baseEnv(), GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_WRITE_THEN_HANG } }).stdout,
+    );
+    const ownerPid: number = statusJson.ownerPid;
+    process.kill(ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(ownerPid), 3000);
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(), GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_FIX_REVIEW_RESUME, FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" },
+    });
+    expect(resume.status).toBe(0);
 
     await waitForRunStatus(home, runId, "failed", 10_000);
     expect(tailErrors(runId).some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);

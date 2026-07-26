@@ -21,11 +21,21 @@ import type { EventRow } from "../store/trace.js";
  * runtime-owned, called from `src/runtime/run.ts`.
  */
 
-/** The CLI-configuration surface tracked relative to the workspace root — every path a node's own startup, or the next node's, reads project-scope config from. */
-const CONFIG_SURFACE_PATHS = [".claude", ".mcp.json", "CLAUDE.md"];
+/**
+ * The CLI-configuration surface tracked relative to the workspace root —
+ * every path a node's own startup, or the next node's, reads project-scope
+ * config from. U3/U1-probe: narrowed from a blanket `.claude` (its full
+ * recursive tree) to just the real startup surface, live-probed against
+ * `claude` 2.1.220 — a real run unconditionally creates
+ * `.claude/.cc-writes/` (empty scratch, CLI-owned, present in both the
+ * read-only and write arms) which a recursive `.claude` hash would trip on
+ * every single run. `.claude/hooks` is a directory, handled by
+ * `hashConfigPath`'s existing directory branch below.
+ */
+const CONFIG_SURFACE_PATHS = [".claude/settings.json", ".claude/settings.local.json", ".claude/hooks", ".mcp.json", "CLAUDE.md"];
 
 export interface WorkspaceIntegrityManifest {
-  /** Relative path -> sha256 content hash, or `null` when the path is absent. `.claude` hashes its full recursive tree, not just its own presence, since a node can add a file under an already-present directory. */
+  /** Relative path -> sha256 content hash, or `null` when the path is absent. A directory entry (`.claude/hooks`) hashes its full recursive tree, not just its own presence, since a node can add a file under an already-present directory. */
   configHashes: Record<string, string | null>;
   /**
    * The gitlink file's (`<workspace>/.git`) recorded `gitdir: <path>` target,
