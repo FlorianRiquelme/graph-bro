@@ -107,3 +107,58 @@ export function listEventsSince(db: Database.Database, runId: string, cursor: nu
     .all(runId, cursor, limit) as RawEventRow[];
   return rows.map(toEventRow);
 }
+
+/** One attempt's usage, summed across every node that ran as part of it. */
+export interface AttemptSummary {
+  attempt: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+}
+
+/**
+ * R26: per-attempt token usage with reported USD alongside, grouped by the
+ * `step` column `withTracing` stamps with the runtime's attempt counter
+ * (U9) — the same counter `commitAttempt`'s message and the trace share.
+ * Only `node_complete` events carry cost/token figures. A topology with no
+ * bounded node never advances that counter, so every event stays stamped
+ * `0` — returned as an empty array (not a single "attempt 0" bucket), so a
+ * slice-1-shaped read-only run's `graph-bro result` output is unchanged
+ * (U9's "no attempt aggregation" case, not a spurious one-attempt summary).
+ *
+ * U12/R20 residual skew: the runtime's shared counter (`src/runtime/run.ts`)
+ * is seeded to 1 rather than 0 whenever the topology declares a bound, so no
+ * invocation's cost is ever discarded here — but the counter only advances
+ * when the bounded node is *invoked*, not when its next activation is
+ * scheduled. A write node that runs after the bounded node closes an attempt
+ * (but before the bounded node's own next run) is still attributed to the
+ * attempt that just closed, one step later than the work it did. Exact
+ * alignment would mean advancing the counter at scheduling time instead —
+ * a larger change than the dropped bucket warranted; every invocation's
+ * cost is accounted for, just not always in the attempt a human would draw
+ * the boundary at.
+ */
+export function aggregateAttempts(events: EventRow[]): AttemptSummary[] {
+  const byAttempt = new Map<number, AttemptSummary>();
+  for (const event of events) {
+    if ((event.payload as { type?: string } | undefined)?.type !== "node_complete") continue;
+    if (event.step === undefined || event.step === 0) continue;
+    const existing = byAttempt.get(event.step) ?? {
+      attempt: event.step,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      costUsd: 0,
+    };
+    existing.inputTokens += event.inputTokens ?? 0;
+    existing.outputTokens += event.outputTokens ?? 0;
+    existing.cacheCreationTokens += event.cacheCreationTokens ?? 0;
+    existing.cacheReadTokens += event.cacheReadTokens ?? 0;
+    existing.costUsd += event.costUsd ?? 0;
+    byAttempt.set(event.step, existing);
+  }
+  return [...byAttempt.values()].sort((a, b) => a.attempt - b.attempt);
+}

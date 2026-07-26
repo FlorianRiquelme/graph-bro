@@ -61,4 +61,24 @@ describe("executor: envelope", () => {
   it("rejects a non-object candidate", () => {
     expect(() => parseEnvelope("not an envelope")).toThrow(EnvelopeParseError);
   });
+
+  it("Covers KTD-2: parses structured_output as a nested object, alongside the unchanged JSON-string result", () => {
+    const nested = { verdict: "pass", findings: [{ note: "ok", nested: { depth: 2 } }] };
+    const envelope = parseEnvelope({
+      type: "result",
+      is_error: false,
+      result: JSON.stringify(nested),
+      duration_ms: 30,
+      structured_output: nested,
+    });
+
+    expect(envelope.result).toBe(JSON.stringify(nested));
+    expect(envelope.structured_output).toEqual(nested);
+  });
+
+  it("leaves structured_output undefined when the envelope carries none (unchanged slice-1 shape)", () => {
+    const envelope = parseEnvelope(VALID_ENVELOPE);
+
+    expect(envelope.structured_output).toBeUndefined();
+  });
 });

@@ -1,7 +1,7 @@
 import { extractTokenPaths } from "./prompt-tokens.js";
 import type { CompiledTopology } from "./compile.js";
-import type { Edge, JoinEdge, Topology } from "./schema.js";
-import { isJoinEdge, isPlainEdge } from "./schema.js";
+import type { Edge, JoinEdge, PlainEdge, Topology } from "./schema.js";
+import { isFanOutEdge, isJoinEdge, isPlainEdge } from "./schema.js";
 
 export interface JoinDesyncWarning {
   code: "join-desync";
@@ -11,7 +11,13 @@ export interface JoinDesyncWarning {
   message: string;
 }
 
-export type LintWarning = JoinDesyncWarning;
+export interface NonExhaustiveRouterWarning {
+  code: "non-exhaustive-router";
+  node: string;
+  message: string;
+}
+
+export type LintWarning = JoinDesyncWarning | NonExhaustiveRouterWarning;
 
 /**
  * A prompt token whose *root* state key is produced by nothing in the run —
@@ -56,6 +62,43 @@ export function lintJoinDesync(topology: Topology): JoinDesyncWarning[] {
           message: `join '${join.to}' requires '${source}', but '${source}' is only conditionally reached from '${edge.from}'; insert a funnel node`,
         });
       }
+    }
+  }
+
+  return warnings;
+}
+
+/**
+ * U3/KTD-6: the demoted form of compile-time exhaustiveness (Product
+ * Contract decision) — a warning, never an error, because forcing filler
+ * edges into END is worse than failing at run time with the value named
+ * (R3). Structural only: it does not evaluate rules, only whether a node's
+ * *declared* out-edges leave no unconditional path. Mirrors the runtime
+ * check's two exclusions so the same graphs that never trip R3's loud
+ * failure at run time don't get warned about it at compile time either: a
+ * node with an (unguarded, by grammar) fan-out edge, or one that is itself a
+ * join source, always has an unconditional contribution.
+ */
+export function lintNonExhaustiveRouter(topology: Topology): NonExhaustiveRouterWarning[] {
+  const warnings: NonExhaustiveRouterWarning[] = [];
+
+  const plainEdgesBySource = new Map<string, PlainEdge[]>();
+  for (const edge of topology.edges.filter(isPlainEdge)) {
+    const list = plainEdgesBySource.get(edge.from) ?? [];
+    list.push(edge);
+    plainEdgesBySource.set(edge.from, list);
+  }
+  const fanOutSources = new Set(topology.edges.filter(isFanOutEdge).map((edge) => edge.from));
+  const joinSourceIds = new Set(topology.edges.filter(isJoinEdge).flatMap((edge) => edge.from));
+
+  for (const [source, edges] of plainEdgesBySource) {
+    if (fanOutSources.has(source) || joinSourceIds.has(source)) continue;
+    if (edges.every((edge) => edge.when !== undefined)) {
+      warnings.push({
+        code: "non-exhaustive-router",
+        node: source,
+        message: `node '${source}' has only guarded out-edges; if none match at run time the run fails loudly (R3) — add an unguarded fallback edge if that isn't intended`,
+      });
     }
   }
 

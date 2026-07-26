@@ -16,6 +16,8 @@ export interface CheckpointSnapshot {
   barrier: unknown;
   step: number;
   history?: unknown[];
+  /** KTD-5: nodeId -> attempts taken so far, for every node declaring `max_attempts` — continues across `resume` rather than restarting. */
+  attempts?: Record<string, number>;
 }
 
 interface CheckpointRow {

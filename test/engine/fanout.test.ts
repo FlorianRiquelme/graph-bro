@@ -64,7 +64,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(stub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -96,7 +96,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(tracking, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -124,7 +124,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(tracking, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -155,7 +155,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(stub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -210,7 +210,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(stub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -283,7 +283,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(stub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -335,7 +335,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(stub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",
@@ -358,7 +358,7 @@ describe("engine/fanout: bounded fan-out concurrency + fail-fast (U5)", () => {
       reader: makeAgentNodeFn(retryStub, {
         nodeId: "reader",
         model: "stub-model",
-        readOnly: true,
+        capability: "read_only",
         cwd: ".",
         timeout: 1_000,
         outputKey: "results",

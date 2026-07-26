@@ -13,16 +13,34 @@ export interface TokenUsage {
   cacheReadTokens?: number;
 }
 
+/** KTD-12: named capability discriminant, replacing the old `readOnly` boolean now that write nodes get their own enforcement (U6) rather than just the absence of one. */
+export type NodeCapability = "read_only" | "write";
+
 export interface RunOptions {
   cwd: string;
   /** The topology node id this run belongs to — attributes the KTD-10 read-only backstop's failure. */
   nodeId: string;
-  readOnly: boolean;
+  capability: NodeCapability;
   model: string;
   /** Hard wall-clock timeout in ms; also the heartbeat hard-kill threshold. */
   timeout: number;
   /** Streaming callback: every parsed NDJSON event, plus synthetic `heartbeat` events. */
   onEvent?: (event: unknown) => void;
+  /** KTD-8: a JSON Schema an agent node declares for its response, forwarded to the backend as a structured-output contract. */
+  outputSchema?: Record<string, unknown>;
+  /** KTD-3 layer 4/KTD-12: topology-declared domains a write node's Bash-tool network egress may reach; empty or undefined means none (R11). Ignored for a read-only node. */
+  networkDomains?: string[];
+  /**
+   * R6/KTD-6/KTD-7: the consumer repo the workspace at `cwd` belongs to, so the
+   * read-only backstop's own `git status` can be pinned the same way every
+   * other engine git call is. Without it that call discovers its repository by
+   * walking up from `cwd` — inside the agent-writable workspace — which both
+   * honours a rewritten gitlink (pointing the cleanliness check at a
+   * substitute repo that always looks clean) and honours `core.fsmonitor`,
+   * which git *executes*. Optional so a unit test can construct a run against
+   * a plain directory that is not a linked worktree of anything.
+   */
+  consumerRepoPath?: string;
 }
 
 export interface RunResult {
@@ -31,6 +49,8 @@ export interface RunResult {
   cost?: number;
   tokens?: TokenUsage;
   durationMs?: number;
+  /** KTD-2: the parsed structured value — present only when the node declared an `outputSchema` and the backend returned one. */
+  structuredOutput?: unknown;
 }
 
 export interface Executor {

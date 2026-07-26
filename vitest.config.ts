@@ -14,6 +14,7 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     globalSetup: ["test/setup/build-once.ts"],
+    setupFiles: ["test/setup/hermetic-git.ts"],
     ...(ci ? { poolOptions: { forks: { minForks: 1, maxForks: 2 } } } : {}),
   },
 });

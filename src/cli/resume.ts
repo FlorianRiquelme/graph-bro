@@ -43,6 +43,21 @@ export async function resumeCommand(args: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
+  // R18/KTD-14: a run row from before the workspace migration (003_workspace)
+  // has null base_ref/workspace_path/run_branch. Passing those through as
+  // empty strings would spawn a detached engine that the CLI never observes
+  // fail — the usage error lands on stdio the engine is started with
+  // `ignore`d — so ownership would be claimed against a process that's
+  // already dead, silently repeating on every later resume. Fail loudly here,
+  // before the CAS below claims ownership.
+  if (!run.baseRef || !run.workspacePath || !run.runBranch) {
+    db.close();
+    console.error(
+      `graph-bro: run '${runId}' has no recorded workspace (base ref/workspace path/run branch); predates the workspace migration and cannot resume`,
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   if (!claimOwnership(db, runId, run.ownerPid, process.pid)) {
     db.close();
@@ -51,7 +66,29 @@ export async function resumeCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const pid = spawnDetachedEngine(["resume", runId, run.topologyPath]);
+  // R14: mark the run pre-terminal the moment ownership is claimed — before
+  // the detached engine is even spawned. Without this, the run row still
+  // holds whatever terminal status the prior (now-dead) process left it in
+  // (e.g. `not_converged`), so a caller waiting on that same terminal value
+  // is satisfied by the *stale* row on its very first poll, indistinguishable
+  // from a resumed run that genuinely reached it again.
+  updateRunStatus(db, runId, "running");
+
+  // U5: the workspace lives at a path computed once at `start` and recorded
+  // on the run row — resume reads it back rather than recomputing, since a
+  // recompute would silently assume this invocation's environment
+  // (GRAPH_BRO_WORKSPACES) matches the one `start` ran under. The unused
+  // inputArg slot carries an empty placeholder; `main()`'s resume branch
+  // never reads it (state comes entirely from the checkpoint).
+  const pid = spawnDetachedEngine([
+    "resume",
+    runId,
+    run.topologyPath,
+    "",
+    run.baseRef ?? "",
+    run.workspacePath ?? "",
+    run.runBranch ?? "",
+  ]);
   if (pid === undefined) {
     // Claimed but failed to spawn: leave ownership at this (now-exiting)
     // process's pid rather than the stale dead one, so a later `resume`

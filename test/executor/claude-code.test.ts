@@ -10,6 +10,7 @@ import { openDb } from "../../src/store/db.js";
 import { appendEvent, listEvents } from "../../src/store/trace.js";
 
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-claude.mjs");
+const LATE_ENVELOPE_FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-claude-late-envelope.mjs");
 
 describe("executor: claude-code — prompt delivery (§13.4 compile-time rule)", () => {
   it("substitutes the {prompt} token into argv and closes stdin when the token is present", () => {
@@ -47,6 +48,33 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     delete process.env.FAKE_CLAUDE_SILENT_MS;
   });
 
+  it("keeps reading stdout until the stream ends, not until the node process exits", async () => {
+    // `exit` fires when the process ends, not when its stdout has been
+    // drained, so a CLI that writes its terminal envelope and exits promptly
+    // can have that envelope still unread in the pipe. A parent that stops
+    // reading at `exit` discards it and reports a *successful* node as failed
+    // — exit code 0, no signal, no stderr. That was a ~50% failure of one
+    // fan-out branch on the CI runner, invisible on a fast dev machine, which
+    // drains the pipe before `exit` is even delivered.
+    //
+    // The fixture makes that ordering deterministic instead of racing for it
+    // (see its header): a grandchild writes the envelope after the node
+    // process is already gone, so reading only to `exit` always misses it.
+    const executor = new ClaudeCodeExecutor({ binary: LATE_ENVELOPE_FIXTURE });
+
+    const result = await executor.run("ping", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 10_000,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(result.text).toBe("written after the parent exited");
+    expect(result.cost).toBe(0.001);
+  }, 15_000);
+
   it("streams NDJSON events to the callback while the node runs, terminal event on type === 'result'", async () => {
     process.env.FAKE_CLAUDE_MODE = "success";
     const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
@@ -56,7 +84,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: (event) => {
@@ -83,7 +111,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("do something forbidden", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
     });
@@ -101,7 +129,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: () => {
@@ -122,7 +150,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000, // hard threshold far above the 250ms silence — must not fire
       onEvent: (event) => events.push(event),
@@ -149,7 +177,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 100, // hard threshold — must fire well before the 5s silence ends
       onEvent: (event) => events.push(event),
@@ -170,7 +198,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     await executor.run("attempt an edit", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
       onEvent: (event) => {
@@ -189,17 +217,108 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     // (see below) — reaching this point without throwing already proves it passed.
   });
 
+  it("Covers R9/KTD-9: a read-only node's spawn carries the OS-sandbox settings block, no writable paths, no allowed domains", async () => {
+    process.env.FAKE_CLAUDE_MODE = "success";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+    let initEvent: { argv: string[] } | undefined;
+
+    await executor.run("attempt an edit", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+      onEvent: (event) => {
+        const typed = event as { type?: string; argv?: string[] };
+        if (typed.type === "system") initEvent = event as { argv: string[] };
+      },
+    });
+
+    expect(initEvent?.argv).toContain("--settings");
+    const settings = JSON.parse(initEvent!.argv[initEvent!.argv.indexOf("--settings") + 1]);
+    expect(settings.sandbox.enabled).toBe(true);
+    expect(settings.sandbox.failIfUnavailable).toBe(true);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([]);
+    expect(settings.sandbox.network.allowedDomains).toEqual([]);
+    // Not the write policy's confinement — no --strict-mcp-config, no minimal
+    // env, for this half of U6; that half is deliberately deferred.
+    expect(initEvent!.argv).not.toContain("--strict-mcp-config");
+  });
+
   it("Covers R7 backstop (KTD-10): run() raises a loud, node-attributed failure when a read-only node's completion leaves the cwd dirty", async () => {
+    // "mutate-cwd": simulates an allowlist gap where something slips through
+    // and mutates cwd *during* the node's run — the baseline is captured
+    // before this process even spawns, so a pre-existing dirty cwd (U6's
+    // rescoped per-node baseline) would not itself trip this.
+    process.env.FAKE_CLAUDE_MODE = "mutate-cwd";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+
+    await expect(
+      executor.run("ping", { cwd, nodeId: "reader-node", capability: "read_only", model: "claude-haiku-4-5", timeout: 5000 }),
+    ).rejects.toThrowError(/reader-node/);
+  });
+
+  it("U6: a read-only node activating over a prior write node's uncommitted changes passes its backstop", async () => {
     const { writeFileSync } = await import("node:fs");
-    // Simulate an allowlist gap: something slipped through and mutated the cwd anyway.
-    writeFileSync(join(cwd, "mutated-by-slipped-bash.txt"), "oops\n");
+    const { join: joinPath } = await import("node:path");
+    // Stands in for an earlier write node's uncommitted work already sitting
+    // in the shared workspace — the per-node baseline is captured *after*
+    // this, so it must not fail a read-only node that changed nothing.
+    writeFileSync(joinPath(cwd, "left-by-a-write-node.txt"), "uncommitted work\n");
 
     process.env.FAKE_CLAUDE_MODE = "success";
     const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
 
     await expect(
-      executor.run("ping", { cwd, nodeId: "reader-node", readOnly: true, model: "claude-haiku-4-5", timeout: 5000 }),
-    ).rejects.toThrowError(/reader-node/);
+      executor.run("ping", { cwd, nodeId: "reader-node", capability: "read_only", model: "claude-haiku-4-5", timeout: 5000 }),
+    ).resolves.toMatchObject({ isError: false });
+  });
+
+  it("Covers AE2/KTD-2: forwards --json-schema on the invocation and surfaces the parsed structured_output, nested object intact", async () => {
+    process.env.FAKE_CLAUDE_MODE = "structured";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+    let initEvent: { argv: string[] } | undefined;
+    const schema = { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] };
+
+    const result = await executor.run("review this", {
+      cwd,
+      nodeId: "reviewer",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+      outputSchema: schema,
+      onEvent: (event) => {
+        const typed = event as { type?: string; argv?: string[] };
+        if (typed.type === "system") initEvent = event as { argv: string[] };
+      },
+    });
+
+    expect(initEvent?.argv).toContain("--json-schema");
+    const schemaArg = initEvent!.argv[initEvent!.argv.indexOf("--json-schema") + 1];
+    expect(JSON.parse(schemaArg)).toEqual(schema);
+
+    expect(result.isError).toBe(false);
+    expect(typeof result.text).toBe("string"); // the text contract is untouched (KTD-2)
+    expect(result.structuredOutput).toEqual({ verdict: "pass", findings: [{ note: "looks good", nested: { depth: 2 } }] });
+    expect(result.cost).toBe(0.002);
+    expect(result.tokens?.inputTokens).toBe(12);
+    expect(result.durationMs).toBe(30);
+  });
+
+  it("leaves structuredOutput undefined when no schema is declared (unchanged slice-1 behavior)", async () => {
+    process.env.FAKE_CLAUDE_MODE = "success";
+    const executor = new ClaudeCodeExecutor({ binary: FIXTURE });
+
+    const result = await executor.run("ping", {
+      cwd,
+      nodeId: "reader",
+      capability: "read_only",
+      model: "claude-haiku-4-5",
+      timeout: 5000,
+    });
+
+    expect(result.structuredOutput).toBeUndefined();
+    expect(result.text).toBe("pong");
   });
 
   it("Covers cost capture: envelope tokens/total_cost_usd/duration_ms land in the events row via appendEvent", async () => {
@@ -209,7 +328,7 @@ describe("executor: claude-code — ClaudeCodeExecutor (real subprocess, scripte
     const result = await executor.run("ping", {
       cwd,
       nodeId: "reader",
-      readOnly: true,
+      capability: "read_only",
       model: "claude-haiku-4-5",
       timeout: 5000,
     });

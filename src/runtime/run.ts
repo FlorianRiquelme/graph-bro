@@ -8,6 +8,7 @@ import {
   makeAgentNodeFn,
   readNodeTraceMeta,
   type EngineGraph,
+  type LoopStatus,
   type NodeFn,
   type RunLoopOptions,
   type InitialBarrierState,
@@ -18,15 +19,33 @@ import type { EngineState, EngineUpdate } from "../engine/state.js";
 import { openDb } from "../store/db.js";
 import { resume as resumeRun, updateRunStatus } from "../store/pending-writes.js";
 import { writeCheckpoint } from "../store/checkpoints.js";
-import { appendEvent } from "../store/trace.js";
+import { appendEvent, listEvents } from "../store/trace.js";
 import { ClaudeCodeExecutor } from "../executor/claude-code.js";
 import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
+import { createWorkspace, finalizeWorkspace, reattachToRunBranch, reuseWorkspace } from "../workspace/lifecycle.js";
+import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
+import { ATTEMPT_BOUNDARY_EVENT_TYPE, attemptBoundaryCounts, commitAttempt, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
+import {
+  assertWorkspaceIntegrity,
+  captureWorkspaceIntegrityManifest,
+  findRecordedManifest,
+  WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE,
+  type WorkspaceIntegrityManifest,
+} from "../workspace/integrity.js";
+import { checkOsBoundary } from "../executor/write-policy.js";
 
 /** Hard wall-clock timeout per agent node (also the heartbeat hard-kill threshold). */
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
 /** Grace period between the SIGTERM and SIGKILL sweep of the kill cascade. */
 const KILL_GRACE_MS = 3000;
+
+/** R7: `not_converged` is a distinct exit code — it reads as "did the work, reviewer still objects", never conflated with the generic failure code a crash or `dead_end` maps to. */
+export function mapStatusToExitCode(status: LoopStatus): number {
+  if (status === "completed") return 0;
+  if (status === "not_converged") return 2;
+  return 1;
+}
 
 /**
  * KTD-13: cascades a SIGTERM/SIGINT sent to this (detached) engine process to
@@ -51,10 +70,31 @@ function installKillCascade(registry: InMemoryNodeRegistry): void {
   process.on("SIGINT", handle);
 }
 
-/** Wraps a node fn with start/complete/error trace events (R12 legibility) so `graph-bro tail` can page per-node activity. */
-function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: string, fn: NodeFn): NodeFn {
+/** Shared across every node's trace wrapper — `withAttemptCommit` advances it, `withTracing` stamps it. */
+interface AttemptState {
+  current: number;
+}
+
+/**
+ * Wraps a node fn with start/complete/error trace events (R12 legibility) so
+ * `graph-bro tail` can page per-node activity. U9/R26: every event is
+ * stamped with `attemptState.current` on the shared `step` column, the
+ * grouping key `graph-bro result`'s per-attempt aggregation keys off — the
+ * same counter `withAttemptCommit` advances, so a node's trace attribution
+ * and its work's actual attempt commit always agree. For the bounded node's
+ * own activation, its `node_start` reads the value from *before*
+ * `withAttemptCommit`'s hook (nested inside this `fn`) advances it, while
+ * `node_complete` reads the value *after* — the hook increments-then-commits
+ * before invoking the node it wraps, so by the time this function's own
+ * `await fn(state)` resolves, the counter already reflects the attempt that
+ * node's own commit just closed. A topology with no bounded node never
+ * advances this counter at all, so every event stays stamped `0` — the
+ * pre-U9 slice-1 shape, since `graph-bro result` treats an all-zero trace as
+ * "no attempt aggregation" (below).
+ */
+function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: string, attemptState: AttemptState, fn: NodeFn): NodeFn {
   return async (state) => {
-    appendEvent(db, { runId, node: nodeId, payload: { type: "node_start" } });
+    appendEvent(db, { runId, node: nodeId, step: attemptState.current, payload: { type: "node_start" } });
     try {
       const update = await fn(state);
       // ADR-0009: fold the executor's per-node cost/token/model/duration
@@ -63,6 +103,7 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
       appendEvent(db, {
         runId,
         node: nodeId,
+        step: attemptState.current,
         model: meta?.model,
         inputTokens: meta?.inputTokens,
         outputTokens: meta?.outputTokens,
@@ -77,11 +118,127 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
       appendEvent(db, {
         runId,
         node: nodeId,
+        step: attemptState.current,
         payload: { type: "node_error", error: err instanceof Error ? err.message : String(err) },
       });
       throw err;
     }
   };
+}
+
+/** Wraps a node fn with the R12/R16/R17 consumer-checkout backstop (KTD-11): compares against the run-start baseline after every node, naming the offending node on divergence. */
+function withConsumerBaseline(consumerRepoPath: string, baseline: ConsumerBaseline, nodeId: string, fn: NodeFn): NodeFn {
+  return async (state) => {
+    const update = await fn(state);
+    assertConsumerBaseline(consumerRepoPath, baseline, nodeId);
+    return update;
+  };
+}
+
+/** Tracks the workspace's HEAD across `commitAttempt` calls — updated by both the before-invocation hook and the terminal-path teardown commit. */
+interface WorkspaceHeadState {
+  current: string;
+}
+
+/**
+ * U3/KTD-17: the integrity backstop as its own wrapper, applied to every
+ * agent node's activation regardless of whether that node declares
+ * `max_attempts` — before U3, the assertion lived inside `withAttemptCommit`
+ * and so only ever fired on a bounded node's re-entry, leaving every
+ * unbounded write-capable node (the shipped `examples/review-fix-loop`'s
+ * `fix` node, for one) with no coverage at all. Composed in `main()` as the
+ * *outer* wrapper around `withAttemptCommit` (applied after it in the loop
+ * below, which — since the loop wraps innermost-first — puts this one
+ * outside): the assertion must still run before `withAttemptCommit`'s own
+ * fold, for the same check-before-fold reason `withAttemptCommit`'s doc
+ * comment below explains, so getting the composition order backwards would
+ * silently move it to after the commit instead.
+ */
+function withWorkspaceIntegrity(workspacePath: string, nodeId: string, integrityManifest: WorkspaceIntegrityManifest, fn: NodeFn): NodeFn {
+  return async (state) => {
+    assertWorkspaceIntegrity(workspacePath, integrityManifest, nodeId);
+    return fn(state);
+  };
+}
+
+/**
+ * KTD-7: the attempt commit boundary, expressed as a before-invocation hook
+ * on the bounded node — "commit whatever the workspace holds, then invoke"
+ * is the boundary's own definition. `attemptCounts` mirrors the loop's own
+ * per-node counter (KTD-5) exactly: both increment once per activation, in
+ * the same order (the loop increments then calls this fn), so the numbers
+ * always agree without the runtime reading the loop's internal state —
+ * KTD-10 forbids `src/engine` from importing the workspace module, so this
+ * lives entirely on the runtime side of that seam.
+ *
+ * R8/KTD-8/KTD-17: the integrity check itself now lives in
+ * `withWorkspaceIntegrity` above, composed to run before this hook's own
+ * `commitAttempt` — checking before the fold is load-bearing: this is the
+ * one seam that would otherwise commit a planted `.claude` file (or a
+ * rewritten gitlink) into real run history before anything ever inspected it
+ * — after which the failure would name a commit, not a node.
+ */
+function withAttemptCommit(
+  consumerRepoPath: string,
+  workspacePath: string,
+  nodeId: string,
+  attemptCounts: Map<string, number>,
+  headState: WorkspaceHeadState,
+  attemptState: AttemptState,
+  db: ReturnType<typeof openDb>,
+  runId: string,
+  fn: NodeFn,
+): NodeFn {
+  return async (state) => {
+    const attemptNumber = (attemptCounts.get(nodeId) ?? 0) + 1;
+    attemptCounts.set(nodeId, attemptNumber);
+    attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
+    const result = commitAttempt({ consumerRepoPath, workspacePath, priorHead: headState.current, attemptNumber, nodeId });
+    headState.current = result.head;
+    // U5/KTD-16: appended only after `commitAttempt` returns — never at the
+    // counter increment above. A kill in that three-git-subprocess window
+    // would otherwise let the trace claim an attempt git never actually
+    // reached; this ordering keeps the event atomic with the thing it
+    // records. `committed: false` still reaches here (an attempt that
+    // changed nothing creates no commit), which is exactly the case
+    // resume's reconciliation below needs to see and a commit-message parse
+    // could not.
+    appendEvent(db, {
+      runId,
+      node: nodeId,
+      step: attemptNumber,
+      payload: { type: ATTEMPT_BOUNDARY_EVENT_TYPE, nodeId, attemptNumber, committed: result.committed },
+    });
+    if (result.quiescenceWarning) {
+      appendEvent(db, { runId, node: nodeId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+    }
+    return fn(state);
+  };
+}
+
+/**
+ * R21: the boundary hook above only fires on the bounded node's re-entry, so
+ * a run that converges, fails, or hits `not_converged` without ever
+ * re-activating it would otherwise leave its last attempt uncommitted — and
+ * a topology with no bounded node at all never fires the hook in the first
+ * place. Called on every terminal path, right before `finalizeWorkspace`;
+ * `commitAttempt`'s own no-op check makes this a no-op when the workspace is
+ * already clean (a read-only-only run, or a hook that already just fired).
+ */
+function commitFinalAttempt(
+  consumerRepoPath: string,
+  workspacePath: string,
+  attemptCounts: Map<string, number>,
+  headState: WorkspaceHeadState,
+  db: ReturnType<typeof openDb>,
+  runId: string,
+): void {
+  const attemptNumber = attemptCounts.size > 0 ? Math.max(...attemptCounts.values()) : 1;
+  const result = commitAttempt({ consumerRepoPath, workspacePath, priorHead: headState.current, attemptNumber, nodeId: "run-teardown" });
+  headState.current = result.head;
+  if (result.quiescenceWarning) {
+    appendEvent(db, { runId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
+  }
 }
 
 /**
@@ -91,7 +248,12 @@ function withTracing(db: ReturnType<typeof openDb>, runId: string, nodeId: strin
  * (KTD-11's narrow seam). Exported so integration tests build node fns the
  * same way `main()` does, rather than hand-copying this wiring.
  */
-export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Record<string, NodeFn> {
+export function buildNodeFns(
+  compiled: CompiledTopology,
+  executor: Executor,
+  cwd: string = process.cwd(),
+  consumerRepoPath?: string,
+): Record<string, NodeFn> {
   const nodeFns: Record<string, NodeFn> = {};
   for (const node of compiled.nodes) {
     nodeFns[node.id] =
@@ -99,11 +261,14 @@ export function buildNodeFns(compiled: CompiledTopology, executor: Executor): Re
         ? makeAgentNodeFn(executor, {
             nodeId: node.id,
             model: node.model,
-            readOnly: node.read_only,
-            cwd: process.cwd(),
+            capability: node.read_only ? "read_only" : "write",
+            cwd,
             timeout: AGENT_TIMEOUT_MS,
             outputKey: node.output_key,
             prompt: (state) => renderPromptTemplate(node.prompt, state, node.id),
+            outputSchema: node.output_schema,
+            networkDomains: node.network_domains,
+            consumerRepoPath,
           })
         : (): EngineUpdate => ({ ...node.update });
   }
@@ -142,22 +307,14 @@ export function reconstructBarrierState(
 }
 
 async function main(): Promise<void> {
-  const [mode, runId, topologyPath, inputArg] = process.argv.slice(2);
-  if ((mode !== "start" && mode !== "resume") || !runId || !topologyPath) {
-    console.error("usage: run.js <start|resume> <run_id> <topology_path> [input_json]");
+  const [mode, runId, topologyPath, inputArg, baseRefSha, workspacePath, runBranch] = process.argv.slice(2);
+  if ((mode !== "start" && mode !== "resume") || !runId || !topologyPath || !workspacePath) {
+    console.error("usage: run.js <start|resume> <run_id> <topology_path> <input_json> <base_ref_sha> <workspace_path> <run_branch>");
     process.exitCode = 1;
     return;
   }
 
   const db = openDb();
-  const registry = new InMemoryNodeRegistry();
-  installKillCascade(registry);
-  // GRAPH_BRO_CLAUDE_BINARY: test-only override so integration tests can point at a
-  // scripted fake CLI instead of a real `claude` binary; unset in production.
-  const executor = new ClaudeCodeExecutor({
-    registry,
-    binary: process.env.GRAPH_BRO_CLAUDE_BINARY || undefined,
-  });
 
   let compiled: CompiledTopology;
   try {
@@ -177,32 +334,230 @@ async function main(): Promise<void> {
     return;
   }
 
+  // U6/KTD-3/KTD-9: refuse to start a run where the OS boundary is
+  // unavailable rather than running unconfined — checked before a workspace
+  // ever gets created. Extended from write-bearing runs to any run with an
+  // agent node: a read-only node now carries its own sandbox layer too (R9),
+  // so a read-only-only topology needs the same OS boundary a write node
+  // needs, and must refuse to start rather than discover the gap mid-run.
+  const hasAgentNode = compiled.nodes.some((node) => node.kind === "agent");
+  if (hasAgentNode) {
+    const boundary = checkOsBoundary(process.env.GRAPH_BRO_TEST_PLATFORM as NodeJS.Platform | undefined);
+    if (!boundary.available) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: boundary.reason } });
+      updateRunStatus(db, runId, "failed");
+      db.close();
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  // R13/KTD-1: every node in the run executes inside this one isolated
+  // worktree — never the consumer's own checkout, which `process.cwd()`
+  // would otherwise be (the engine inherits the CLI's cwd on spawn).
+  const consumerRepoPath = process.cwd();
+  // R8/KTD-8: the integrity backstop's reference point, resolved here
+  // alongside workspace creation/reuse rather than lazily — `start` captures
+  // it fresh and records it as a trace event (the run's durable record,
+  // KTD-8); `resume` reads that same recorded event back rather than
+  // recapturing it fresh against a workspace `reuseWorkspace` merely
+  // reopens (never re-created), which could already be compromised and would
+  // otherwise baseline the tamper as the new "normal" forever after.
+  let integrityManifest: WorkspaceIntegrityManifest;
+  try {
+    if (mode === "start") {
+      createWorkspace({ consumerRepoPath, baseRefSha, workspacePath, runBranch });
+      integrityManifest = captureWorkspaceIntegrityManifest(workspacePath);
+      appendEvent(db, { runId, payload: { type: WORKSPACE_INTEGRITY_MANIFEST_EVENT_TYPE, manifest: integrityManifest } });
+    } else {
+      reuseWorkspace(workspacePath);
+      // U8/KTD-9: a retained workspace's HEAD is left detached so its branch
+      // can be checked out elsewhere while it exists — resume must re-attach
+      // before committing anything, or every post-resume attempt commits
+      // onto the detached HEAD instead of the run branch. Then preserve
+      // whatever a kill left dirty mid-attempt (F3/AE9) and hard-reset to
+      // the last actually committed attempt before re-entering.
+      reattachToRunBranch(consumerRepoPath, workspacePath, runBranch);
+      // U3/KTD-17: the manifest is read — and the workspace checked against
+      // it — *before* `preserveInterruptedAttempt` runs. That call folds
+      // whatever a killed node left on disk into a partial-attempt ref via a
+      // full `add -A` / `write-tree` / `commit-tree`, with nothing checking
+      // it first; a kill is the most likely way a write run ends, and the
+      // terminal assertion only covers a graceful exit, never the kill path
+      // (the signal handler's `process.exit(1)` bypasses it entirely). Moving
+      // the read ahead means the *next* resume is where a kill-time tamper
+      // gets caught, before it is folded into history.
+      const recorded = findRecordedManifest(listEvents(db, runId));
+      if (!recorded) {
+        throw new Error(`no workspace integrity manifest recorded for run '${runId}' — cannot resume safely`);
+      }
+      integrityManifest = recorded;
+      assertWorkspaceIntegrity(workspacePath, integrityManifest, "run-resume");
+      preserveInterruptedAttempt(consumerRepoPath, workspacePath, runId, baseRefSha);
+    }
+  } catch (err) {
+    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    updateRunStatus(db, runId, "failed");
+    // U7: guarded to `start` — this catch is shared with `resume`, whose own
+    // arm can fail (`reuseWorkspace`/`reattachToRunBranch`/the missing-
+    // manifest throw/`preserveInterruptedAttempt`) against a workspace that
+    // is meant to stay retained for inspection or a later resume (KTD-9). A
+    // `start` failure here is different: nothing has dispatched against the
+    // workspace yet, so nothing about it is worth keeping, and leaving it
+    // undisposed strands a worktree pinning the run branch with no way back
+    // in (the manifest event never landed, so `resume` can never pass its own
+    // integrity check against this run again). `disposeWorkspace` isolates
+    // its own failure (e.g. `createWorkspace` itself never having created
+    // anything to remove) into a `workspace_finalize_error` trace event
+    // rather than overwriting the "failed" status just written above.
+    if (mode === "start") disposeWorkspace(true);
+    db.close();
+    process.exitCode = 1;
+    return;
+  }
+
+  // U6/KTD-11: the R12/R16/R17 backstop's baseline, captured once at run
+  // start — a fresh `reuseWorkspace` on `resume` re-baselines too, which is
+  // correct: only divergence introduced *this process's* nodes should trip it.
+  const consumerBaseline = captureConsumerBaseline(consumerRepoPath);
+
+  /**
+   * KTD-12: the one place `main()` ever disposes of the workspace — isolated
+   * so a disposal failure (the worktree locked, checked out elsewhere, or
+   * gone) can only add a `workspace_finalize_error` trace event, never
+   * revisit a status this process already wrote. Every path that fails after
+   * workspace creation calls this exactly once, matching the terminal path's
+   * own disposal below.
+   */
+  function disposeWorkspace(converged: boolean): void {
+    try {
+      finalizeWorkspace({ consumerRepoPath, workspacePath, converged });
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "workspace_finalize_error", error: err instanceof Error ? err.message : String(err) } });
+    }
+  }
+
+  const registry = new InMemoryNodeRegistry();
+  installKillCascade(registry);
+  // GRAPH_BRO_CLAUDE_BINARY: test-only override so integration tests can point at a
+  // scripted fake CLI instead of a real `claude` binary; unset in production.
+  const executor = new ClaudeCodeExecutor({
+    registry,
+    binary: process.env.GRAPH_BRO_CLAUDE_BINARY || undefined,
+  });
+
+  // R6: nodeId -> declared max_attempts, for every agent node bounding a loop it's re-entered by.
+  const attemptBounds: Record<string, number> = {};
+  // R19/KTD-10: nodeId -> capability, for every agent node — the key the
+  // loop's single-track frontier assertion reads. Without it that assertion
+  // is inert, and the compile-time guard alone cannot see a diamond that
+  // converges a write node and a read-only node from independent sources.
+  const agentNodeCapability: Record<string, "read_only" | "write"> = {};
+  for (const node of compiled.nodes) {
+    if (node.kind !== "agent") continue;
+    if (node.max_attempts !== undefined) attemptBounds[node.id] = node.max_attempts;
+    agentNodeCapability[node.id] = node.read_only ? "read_only" : "write";
+  }
+
   const graph: EngineGraph = {
     plainEdges: compiled.plainEdges,
     fanOutEdges: compiled.fanOutEdges,
     joinBarriers: compiled.joinBarriers,
     maxSteps: compiled.maxSteps,
     maxConcurrency: compiled.maxConcurrency,
+    attemptBounds,
+    agentNodeCapability,
   };
-  const rawNodeFns = buildNodeFns(compiled, executor);
+
+  // Resolved before node fns are built: U7's attempt-commit hook seeds its
+  // own per-node counter from the same continued count KTD-5 restores for
+  // the loop, so the two stay numerically identical across a resume.
+  const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
+  const resumed = mode === "resume" ? resumeRun(db, runId, { reducerForKey }) : undefined;
+
+  // R15/KTD-11/KTD-16: reconcile the resumed checkpoint's per-node attempt
+  // counts against the attempt-boundary events actually recorded in the
+  // run's own trace, now that `preserveInterruptedAttempt` above has already
+  // hard-reset the workspace to its last actually committed attempt. A
+  // checkpoint can promise more attempts than the trace recorded — a kill
+  // between the counter's own increment and the `commitAttempt` call whose
+  // boundary event is appended only after it returns — and re-entering the
+  // bounded node on that mismatch would run it against a workspace that no
+  // longer reflects what the checkpoint claims (KTD-11 explicitly rejects
+  // rolling the frontier back to re-run the predecessor instead: surface,
+  // don't guess). Reading the trace rather than git's commit messages also
+  // means an attempt that committed nothing (no diff to fold) is still
+  // visible here, so a healthy resume past exactly that attempt no longer
+  // misreads it as the mismatch this check exists to catch. The workspace is
+  // left in place, not disposed, for inspection — the same convention every
+  // other halted-run status keeps.
+  if (mode === "resume" && resumed) {
+    const recorded = attemptBoundaryCounts(listEvents(db, runId));
+    const mismatches = Object.entries(resumed.attempts).filter(([nodeId, count]) => count > (recorded[nodeId] ?? 0));
+    if (mismatches.length > 0) {
+      const detail = mismatches
+        .map(([nodeId, count]) => `'${nodeId}': checkpoint records ${count} attempt(s), ${recorded[nodeId] ?? 0} recorded in the trace`)
+        .join("; ");
+      const error = `resume attempt-count mismatch (R15/KTD-11): ${detail} — refusing to resume rather than re-enter the bounded node against a workspace that no longer reflects what the checkpoint claims`;
+      appendEvent(db, { runId, payload: { type: "run_error", error } });
+      updateRunStatus(db, runId, "failed");
+      process.exitCode = 1;
+      db.close();
+      return;
+    }
+  }
+
+  // U7/KTD-7: `headState` tracks the workspace's HEAD across attempt
+  // commits — starting at wherever the workspace already is, whether that's
+  // the creation commit (`start`) or wherever a crashed prior process left
+  // it (`resume`, no special-casing needed since git already reflects it).
+  const headState = { current: readHead(consumerRepoPath, workspacePath) };
+  const commitAttemptCounts = new Map<string, number>(Object.entries(resumed?.attempts ?? {}));
+  // U9: seeded from the same continued counts on resume, so the trace's
+  // attempt attribution picks up where a crashed run's left off rather than
+  // restarting at 0 and re-using attempt numbers a prior process already spent.
+  // U12/R20: a topology with any bounded node floors that seed at 1 rather
+  // than 0 — otherwise a fresh start's write node(s) run before the bounded
+  // node's own hook (`withAttemptCommit`) ever advances the shared counter,
+  // get stamped at attempt 0, and `aggregateAttempts` silently discards
+  // that bucket, dropping the invocation's cost from the report entirely.
+  // A topology with no bound leaves the floor at 0, so the all-zero,
+  // no-attempts-array slice-1 shape is unaffected.
+  const attemptState: AttemptState = {
+    current: Math.max(Object.keys(attemptBounds).length > 0 ? 1 : 0, ...Object.values(resumed?.attempts ?? {})),
+  };
+
+  const rawNodeFns = buildNodeFns(compiled, executor, workspacePath, consumerRepoPath);
   const nodeFns: Record<string, NodeFn> = {};
-  for (const [nodeId, fn] of Object.entries(rawNodeFns)) nodeFns[nodeId] = withTracing(db, runId, nodeId, fn);
+  for (const [nodeId, fn] of Object.entries(rawNodeFns)) {
+    let wrapped = withConsumerBaseline(consumerRepoPath, consumerBaseline, nodeId, fn);
+    if (attemptBounds[nodeId] !== undefined) {
+      wrapped = withAttemptCommit(consumerRepoPath, workspacePath, nodeId, commitAttemptCounts, headState, attemptState, db, runId, wrapped);
+    }
+    // U3/KTD-17: applied to every agent node (never a `set` node, which does
+    // no CLI startup and has nothing to check) — after `withAttemptCommit`
+    // above, which (the loop wraps innermost-first) makes this the *outer*
+    // wrapper so the assertion still runs before that hook's own fold.
+    if (compiled.nodes.find((node) => node.id === nodeId)?.kind === "agent") {
+      wrapped = withWorkspaceIntegrity(workspacePath, nodeId, integrityManifest, wrapped);
+    }
+    nodeFns[nodeId] = withTracing(db, runId, nodeId, attemptState, wrapped);
+  }
 
   let runLoopOptions: RunLoopOptions;
   if (mode === "start") {
     const input = (inputArg ? JSON.parse(inputArg) : {}) as EngineState;
     runLoopOptions = { graph, nodeFns, initialState: input, persistence: { db, runId } };
   } else {
-    const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
-    const resumed = resumeRun(db, runId, { reducerForKey });
-    const initialBarrierState = reconstructBarrierState(compiled, resumed.state, resumed.completedInstanceIds);
+    const initialBarrierState = reconstructBarrierState(compiled, resumed!.state, resumed!.completedInstanceIds);
     runLoopOptions = {
       graph,
       nodeFns,
-      initialState: resumed.state,
-      initialFrontier: resumed.frontier,
-      initialStep: resumed.step,
+      initialState: resumed!.state,
+      initialFrontier: resumed!.frontier,
+      initialStep: resumed!.step,
       initialBarrierState,
+      initialAttempts: resumed!.attempts,
       persistence: { db, runId },
     };
   }
@@ -217,30 +572,123 @@ async function main(): Promise<void> {
   // against, so an unedited topology that cleared `start` cannot fail here.
   const tokenErrors = checkPromptTokens(compiled, Object.keys(runLoopOptions.initialState ?? {}));
   if (tokenErrors.length > 0) {
-    appendEvent(db, { runId, payload: { type: "run_error", error: tokenErrors.map((error) => error.message).join("; ") } });
+    // The disposal below is named in the error itself, not left implicit: an
+    // operator's natural next move after fixing the topology is `resume`, and
+    // that will fail a second time for a reason this message is the only place
+    // to explain. The attempt commits are still on the run branch either way.
+    const tokenError = `${tokenErrors.map((error) => error.message).join("; ")} — workspace discarded; fix the topology and start a new run (this run cannot be resumed; its attempt commits remain on ${runBranch})`;
+    appendEvent(db, { runId, payload: { type: "run_error", error: tokenError } });
     updateRunStatus(db, runId, "failed");
-    db.close();
     process.exitCode = 1;
+    // R12: the workspace was already created (or reattached-to, on resume)
+    // above — nothing in this session ever dispatched a node against it, and
+    // `resume`'s own reuse path already preserved/reset any prior interrupted
+    // attempt before this gate ran, so there is nothing left in the
+    // directory this process can lose. Discarded like a converged run's,
+    // rather than retained: this failure is a fixed, re-editable authoring
+    // error (KTD-12), not partial in-session work worth inspecting, and a
+    // retained-but-pinned worktree would otherwise block the very branch a
+    // resume needs to re-approach after the topology is fixed.
+    disposeWorkspace(true);
+    db.close();
     return;
   }
 
   try {
-    const result = await runLoop(runLoopOptions);
-    // `runLoop` only checkpoints a step's INCOMING frontier before dispatch, so a
-    // "completed" run's very last step (the one that reaches END) is never itself
-    // checkpointed. Persist that true final state here so `graph-bro result` reads it
-    // (only on `completed`: a `failed`/`dead_end` run must keep its real resumable
-    // checkpoint — the still-pending frontier from before the failing step — as the
-    // latest row, so `resume` doesn't lose it).
-    if (result.status === "completed") {
-      writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
+    // R11/KTD-12: `status` is decided exactly once, here — by the loop's own
+    // `LoopResult` on the ordinary path, or by "failed" on the rare path
+    // where `runLoop` itself throws (a genuine bug, not a routed outcome —
+    // `dead_end`/`not_converged`/an agent's own failure all come back as a
+    // `LoopResult`, never a throw). Nothing below this point is allowed to
+    // revisit it.
+    let status: LoopStatus;
+    try {
+      const result = await runLoop(runLoopOptions);
+      status = result.status;
+      // R25: the three stop reasons (converged, bound hit, failed — dead_end
+      // folds into "failed" here since both are unrecoverable) are otherwise
+      // only distinguishable by separately reading the `runs` row's `status`
+      // column — this puts the same distinction directly in the trace, next
+      // to the node events it explains.
+      appendEvent(db, {
+        runId,
+        step: attemptState.current,
+        payload: { type: "run_stopped", status: result.status, error: result.status === "failed" ? result.error?.message : undefined },
+      });
+      // `runLoop` only checkpoints a step's INCOMING frontier before dispatch, so a
+      // "completed" run's very last step (the one that reaches END) is never itself
+      // checkpointed. Persist that true final state here so `graph-bro result` reads it
+      // (only on `completed`: a `failed`/`dead_end` run must keep its real resumable
+      // checkpoint — the still-pending frontier from before the failing step — as the
+      // latest row, so `resume` doesn't lose it).
+      if (result.status === "completed") {
+        writeCheckpoint(db, runId, { state: result.state, frontier: [], barrier: {}, step: result.steps });
+      }
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      status = "failed";
     }
-    updateRunStatus(db, runId, result.status);
-    process.exitCode = result.status === "completed" ? 0 : 1;
-  } catch (err) {
-    appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
-    updateRunStatus(db, runId, "failed");
-    process.exitCode = 1;
+
+    // R8/KTD-8: the terminal-path half of the integrity backstop — the
+    // boundary hook above only fires on the bounded node's re-entry, so a run
+    // that converges, fails, or hits `not_converged` without ever
+    // re-activating it (or a topology with no bounded node at all) would
+    // otherwise never have its workspace checked at all. Runs before
+    // `commitFinalAttempt` for the same reason the hook checks before its own
+    // commit: a violation must name a node, not the teardown commit that
+    // would otherwise fold it into history first. A violation here overrides
+    // whatever status the loop decided — unlike the isolated failures below,
+    // this is a genuine tamper, not a teardown mechanic, so R8 wins over
+    // "never downgrade" here.
+    let integrityViolated = false;
+    try {
+      assertWorkspaceIntegrity(workspacePath, integrityManifest, "run-teardown");
+    } catch (err) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      status = "failed";
+      integrityViolated = true;
+    }
+
+    // R21/U7: every terminal path commits whatever attempt is left, even one
+    // that never re-activated the bounded node — a no-op via commitAttempt's
+    // own check if the boundary hook already committed it. Isolated (KTD-12):
+    // a failure here (e.g. the workspace can't sign) traces a `run_error`
+    // rather than pre-empting the status write below, and is never retried —
+    // the historical bug re-ran this same call from a second, now-removed
+    // catch branch, and a second throw there left the run's status unwritten
+    // forever.
+    //
+    // U16: skipped entirely when the assertion just above tripped — the run
+    // branch is the handback artifact, so folding a detected tamper into it
+    // here would ship exactly what the assertion exists to withhold. The
+    // withheld attempt isn't lost: a `failed` run keeps its workspace
+    // (`disposeWorkspace` below), and every earlier attempt already landed
+    // via its own boundary-checked commit, so history before this point is
+    // untouched.
+    if (integrityViolated) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: "run-teardown commit skipped: workspace integrity violation detected" } });
+    } else {
+      try {
+        commitFinalAttempt(consumerRepoPath, workspacePath, commitAttemptCounts, headState, db, runId);
+      } catch (err) {
+        appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      }
+    }
+
+    // R11: the status write is unconditional from here — decided above by
+    // the loop's own result, and observable (to the CLI's `status`/`result`,
+    // or to a resuming process) only after the attempt commit above has
+    // actually landed.
+    updateRunStatus(db, runId, status);
+    process.exitCode = mapStatusToExitCode(status);
+
+    // KTD-9: a converged run needs no directory (the branch is the
+    // handback); a halted run (failed/dead_end/not_converged) keeps its
+    // workspace for `resume` and for inspection. Isolated the same way as
+    // the commit above: a disposal failure (the worktree locked, or checked
+    // out elsewhere) only adds a `workspace_finalize_error` trace event —
+    // never downgrades the status this process just wrote.
+    disposeWorkspace(status === "completed");
   } finally {
     db.close();
   }

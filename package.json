@@ -11,10 +11,12 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:e2e": "GRAPH_BRO_LIVE_CLI_TESTS=1 vitest run test/integration/sandbox-enforcement.test.ts",
     "build": "tsc -p tsconfig.json",
     "postbuild": "mkdir -p dist/store/migrations && cp src/store/migrations/*.sql dist/store/migrations/ && chmod +x dist/cli/index.js"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "better-sqlite3": "^13.0.1",
     "zod": "^3.23.8"
   },

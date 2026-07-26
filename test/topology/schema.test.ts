@@ -42,7 +42,7 @@ describe("schema", () => {
     expect(AgentNodeSchema.parse(roundTripped)).toEqual(node);
   });
 
-  it("rejects an agent node with read_only:false", () => {
+  it("Covers U2: a write-capable agent node (read_only:false) compiles", () => {
     const node = {
       id: "writer",
       kind: "agent",
@@ -51,7 +51,7 @@ describe("schema", () => {
       prompt: "edit ${item}",
       output_key: "finding",
     };
-    expect(AgentNodeSchema.safeParse(node).success).toBe(false);
+    expect(AgentNodeSchema.safeParse(node).success).toBe(true);
   });
 
   it("rejects an agent node with read_only omitted", () => {

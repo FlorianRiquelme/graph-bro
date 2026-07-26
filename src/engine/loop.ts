@@ -10,7 +10,9 @@ import { DEFAULT_MAX_CONCURRENCY, runBoundedPool, type PoolTask } from "./concur
 import { commitPendingWrite } from "../store/pending-writes.js";
 import { writeCheckpoint } from "../store/checkpoints.js";
 import { appendEvent } from "../store/trace.js";
-import type { Executor } from "../executor/executor.js";
+import type { Executor, NodeCapability } from "../executor/executor.js";
+import { MissingStructuredOutputError, validateOutput, type JsonSchema } from "./output-schema.js";
+import { evaluateWhen, type WhenEvaluation } from "./when.js";
 
 /** A plain function node (R4) — no executor/subprocess concept in this unit. */
 export type NodeFn = (state: EngineState) => EngineUpdate | Promise<EngineUpdate>;
@@ -56,6 +58,19 @@ export interface EngineGraph {
   maxSteps: number;
   /** Per-topology override of the bounded pool's width (ADR-0011); defaults to `DEFAULT_MAX_CONCURRENCY`. */
   maxConcurrency?: number;
+  /** R6: nodeId -> declared `max_attempts`, for the nodes a loop re-enters. Absent entirely means no node in this topology declared a bound. */
+  attemptBounds?: Record<string, number>;
+  /**
+   * KTD-10: nodeId -> capability, for every `agent`-kind node (a `set` node
+   * is absent — it never runs a CLI subprocess, so it is never party to the
+   * single-track hazard). Drives the frontier assertion in `runLoop`: a
+   * frontier holding a `"write"` activation must hold no other agent
+   * activation. Optional so a caller that hasn't wired it (or a test
+   * exercising unrelated behavior) gets no enforcement rather than a crash —
+   * the compile-time guard in `topology/compile.ts` is the courtesy for that
+   * gap, not a substitute for wiring this in production.
+   */
+  agentNodeCapability?: Record<string, "read_only" | "write">;
 }
 
 /** Durable wiring (U3): when provided, branches commit pending writes as they drain and the loop checkpoints each step's incoming frontier before dispatch, so a crash mid-drain resumes cleanly. */
@@ -91,6 +106,8 @@ export interface RunLoopOptions {
   initialBarrierState?: InitialBarrierState[];
   /** Overrides `graph.maxConcurrency`/the default K=5 (ADR-0011) for this run. */
   maxConcurrency?: number;
+  /** KTD-5: per-node attempt counts to continue from on resume — a resumed run does not restart the count, so it can hit `not_converged` immediately if it already spent its attempts. */
+  initialAttempts?: Record<string, number>;
   persistence?: RunLoopPersistence;
 }
 
@@ -104,11 +121,17 @@ export interface RunLoopOptions {
 export interface AgentNodeConfig {
   nodeId: string;
   model: string;
-  readOnly: boolean;
+  capability: NodeCapability;
   cwd: string;
   timeout: number;
   outputKey: string;
   prompt: string | ((state: EngineState) => string);
+  /** KTD-8: when declared, the response is validated against it and the *parsed* value — not raw text — lands at `outputKey` (R2). */
+  outputSchema?: JsonSchema;
+  /** KTD-3 layer 4: topology-declared domains this node's Bash-tool network egress may reach (R11). Ignored for a read-only node. */
+  networkDomains?: string[];
+  /** R6: forwarded to the executor so the read-only backstop's `git status` resolves its repository from the consumer, not from inside the agent-writable workspace. A path only — the engine still imports nothing from the workspace module. */
+  consumerRepoPath?: string;
 }
 
 export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): NodeFn {
@@ -117,14 +140,27 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
     const result = await executor.run(prompt, {
       cwd: config.cwd,
       nodeId: config.nodeId,
-      readOnly: config.readOnly,
+      capability: config.capability,
       model: config.model,
       timeout: config.timeout,
+      outputSchema: config.outputSchema,
+      networkDomains: config.networkDomains,
+      consumerRepoPath: config.consumerRepoPath,
     });
     if (result.isError) {
       throw new Error(`agent node '${config.nodeId}' failed: ${result.text}`);
     }
-    const update: EngineUpdate = { [config.outputKey]: result.text };
+    // KTD-8: validation lives here, next to the output_key write, not behind
+    // the executor seam — a future backend must not be able to skip it.
+    let value: unknown = result.text;
+    if (config.outputSchema) {
+      if (result.structuredOutput === undefined) {
+        throw new MissingStructuredOutputError(config.nodeId);
+      }
+      validateOutput(config.nodeId, config.outputSchema, result.structuredOutput);
+      value = result.structuredOutput;
+    }
+    const update: EngineUpdate = { [config.outputKey]: value };
     // Attach the executor's cost/token report out-of-band (ADR-0009) so the
     // trace writer records it, without leaking into state or pending writes.
     const meta: NodeTraceMeta = {
@@ -142,13 +178,16 @@ export function makeAgentNodeFn(executor: Executor, config: AgentNodeConfig): No
   };
 }
 
-export type LoopStatus = "completed" | "dead_end" | "failed";
+/** R6/R7: `not_converged` means the run did its work and the reviewer still objects — distinct from `failed`, and from `max_steps` exhaustion (also `failed`). */
+export type LoopStatus = "completed" | "dead_end" | "failed" | "not_converged";
 
 export interface LoopResult {
   status: LoopStatus;
   state: EngineState;
   steps: number;
   error?: Error;
+  /** KTD-5: nodeId -> attempts taken so far, for every node declaring `max_attempts`. Mirrors `steps`' always-present shape. */
+  attempts: Record<string, number>;
 }
 
 /** Raised when a run exceeds `max_steps` — a visible failure, never a hang (R8). */
@@ -156,6 +195,46 @@ export class MaxStepsExceededError extends Error {
   constructor(public readonly maxSteps: number) {
     super(`run exceeded max_steps (${maxSteps}) without reaching END`);
     this.name = "MaxStepsExceededError";
+  }
+}
+
+/**
+ * KTD-10: the runtime backstop for the single-track guard — the frontier is
+ * known exactly here, unlike at compile time, where only shapes provably
+ * concurrent from the static graph (one source's unguarded-or-not-mutually-
+ * exclusive out-edges) can be caught. This also catches what the compiler
+ * structurally cannot: a diamond where a write-capable node and a read-only
+ * node converge into the same frontier from independent sources. Left
+ * unchecked, the write node's edits land mid-step and the read-only node's
+ * *own* cleanliness assertion fails and names itself — the innocent party —
+ * so this fires first, naming every agent node sharing the frontier.
+ */
+export class ConcurrentWriteViolationError extends Error {
+  constructor(public readonly nodeIds: string[]) {
+    super(
+      `single-track violation (KTD-10): '${nodeIds.join("', '")}' would dispatch in the same super-step and at least one is write-capable — two agent processes cannot run concurrently against one worktree`,
+    );
+    this.name = "ConcurrentWriteViolationError";
+  }
+}
+
+/**
+ * R3/KTD-6: raised when an activation's out-edge set is non-empty, entirely
+ * guarded, and no guard evaluated true — the silent-give-up R3 forbids.
+ * Returned as a failed `LoopResult`, not thrown (KTD-6): this is a routing
+ * outcome the engine reports the same way it reports `dead_end`, not an
+ * invariant violation like a stalled join.
+ */
+export class UnmatchedRouterError extends Error {
+  constructor(
+    public readonly nodeId: string,
+    public readonly evaluations: { edge: PlainEdge; evaluation: WhenEvaluation }[],
+  ) {
+    const detail = evaluations
+      .map((g) => `-> '${g.edge.to}' ${JSON.stringify(g.edge.when)} read ${JSON.stringify(g.evaluation.reads)}`)
+      .join("; ");
+    super(`node '${nodeId}' has only guarded out-edges and none matched (R3): ${detail}`);
+    this.name = "UnmatchedRouterError";
   }
 }
 
@@ -172,6 +251,11 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
   const barriersBySource = new Map<string, ResettableJoinBarrier[]>();
   const joinBarrierMetaById = new Map<string, JoinBarrier>();
   const reducerForKey = new Map<string, ReducerName>();
+  // R6/KTD-5: nodeId -> attempts taken. Continues from `initialAttempts` on
+  // resume rather than restarting, so a resumed run cannot launder itself
+  // past its declared bound.
+  const attemptCounts = new Map<string, number>(Object.entries(options.initialAttempts ?? {}));
+  const attemptsSnapshot = (): Record<string, number> => Object.fromEntries(attemptCounts);
 
   for (const jb of graph.joinBarriers) {
     const barrier = new ResettableJoinBarrier(jb.id, jb.sources, jb.mode);
@@ -208,10 +292,17 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     }
   }
 
+  // Declared before `transition` (which closes over it) rather than beside
+  // `maxConcurrency` below: the seed transition call happens before that
+  // point, and a `const` read through a closure before its own declaration
+  // executes is a TDZ crash, not a stale-`undefined` read.
+  const persistence = options.persistence;
+
   function transition(
     completed: Activation[],
     currentState: EngineState,
-  ): { next: Activation[]; reachedEnd: boolean } {
+    step: number,
+  ): { next: Activation[]; reachedEnd: boolean; unmatchedRouterError?: UnmatchedRouterError } {
     const next: Activation[] = [];
     const seen = new Set<string>();
     let reachedEnd = false;
@@ -223,7 +314,35 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     };
 
     for (const { nodeId, instanceId } of completed) {
-      for (const edge of plainEdgesBySource.get(nodeId) ?? []) {
+      const plain = plainEdgesBySource.get(nodeId) ?? [];
+      const fanOuts = fanOutEdgesBySource.get(nodeId) ?? [];
+      const joinTargets = barriersBySource.get(nodeId) ?? [];
+      const guardEvaluations: { edge: PlainEdge; evaluation: WhenEvaluation }[] = [];
+
+      for (const edge of plain) {
+        let satisfied = true;
+        if (edge.when !== undefined) {
+          const evaluation = evaluateWhen(edge.when, currentState);
+          satisfied = evaluation.result;
+          guardEvaluations.push({ edge, evaluation });
+          // R24: every routing decision is traced with the rule and the values read,
+          // regardless of which way it went.
+          if (persistence) {
+            appendEvent(persistence.db, {
+              runId: persistence.runId,
+              node: nodeId,
+              step,
+              payload: {
+                type: "routing_decision",
+                to: edge.to,
+                rule: edge.when,
+                reads: evaluation.reads,
+                result: evaluation.result,
+              },
+            });
+          }
+        }
+        if (!satisfied) continue;
         if (edge.to === END) {
           reachedEnd = true;
           continue;
@@ -231,7 +350,22 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         pushUnique({ nodeId: edge.to, instanceId: edge.to });
       }
 
-      for (const edge of fanOutEdgesBySource.get(nodeId) ?? []) {
+      // KTD-6: the unmatched router is its own engine error, detected per
+      // activation on guard evaluation — never in terms of the frontier
+      // (aggregate emptiness hides one activation behind another;
+      // `pushUnique`'s instanceId dedup makes per-activation *contribution*
+      // false-fire on a diamond's second satisfied edge). Two exclusions
+      // stay load-bearing: a join source's own arrival is a contribution
+      // even when its plain routing produced nothing (`joinTargets.length
+      // === 0` below), and an unguarded fan-out edge means the out-edge set
+      // is never "entirely guarded" in the first place (fan-out carries no
+      // `when` — `fanOuts.length === 0` below).
+      const entirelyGuarded = plain.length > 0 && fanOuts.length === 0 && plain.every((edge) => edge.when !== undefined);
+      if (entirelyGuarded && joinTargets.length === 0 && !guardEvaluations.some((g) => g.evaluation.result)) {
+        return { next, reachedEnd, unmatchedRouterError: new UnmatchedRouterError(nodeId, guardEvaluations) };
+      }
+
+      for (const edge of fanOuts) {
         const branches = buildFanOutBranches(edge, currentState);
         for (const branch of branches) pushUnique(branch.activation);
         for (const barrier of barriersBySource.get(edge.to) ?? []) {
@@ -242,7 +376,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         }
       }
 
-      for (const barrier of barriersBySource.get(nodeId) ?? []) {
+      for (const barrier of joinTargets) {
         barrier.arrive(nodeId, instanceId);
         if (barrier.isComplete()) {
           const meta = joinBarrierMetaById.get(barrier.id)!;
@@ -262,19 +396,80 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     frontier = options.initialFrontier;
     steps = options.initialStep ?? 0;
   } else {
-    const seed = transition([{ nodeId: START, instanceId: START }], state);
-    if (seed.reachedEnd) return { status: "completed", state, steps: 0 };
+    const seed = transition([{ nodeId: START, instanceId: START }], state, 0);
+    if (seed.unmatchedRouterError)
+      return { status: "failed", state, steps: 0, error: seed.unmatchedRouterError, attempts: attemptsSnapshot() };
+    if (seed.reachedEnd) return { status: "completed", state, steps: 0, attempts: attemptsSnapshot() };
     frontier = seed.next;
     steps = 0;
   }
 
   const maxConcurrency = options.maxConcurrency ?? graph.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
-  const persistence = options.persistence;
 
   while (frontier.length > 0) {
     steps += 1;
     if (steps > graph.maxSteps) {
-      return { status: "failed", state, steps, error: new MaxStepsExceededError(graph.maxSteps) };
+      return { status: "failed", state, steps, error: new MaxStepsExceededError(graph.maxSteps), attempts: attemptsSnapshot() };
+    }
+
+    // KTD-10: the single-track frontier assertion, checked on the actual
+    // dispatch frontier before anything runs — the real enforcement, with
+    // the compile-time guard as its authoring-time courtesy. Fails before
+    // spending an attempt or writing a checkpoint for a frontier that must
+    // never dispatch.
+    if (graph.agentNodeCapability) {
+      const agentActivations = frontier.filter((activation) => graph.agentNodeCapability![activation.nodeId] !== undefined);
+      const hasWrite = agentActivations.some((activation) => graph.agentNodeCapability![activation.nodeId] === "write");
+      if (hasWrite && agentActivations.length > 1) {
+        const nodeIds = [...new Set(agentActivations.map((activation) => activation.nodeId))];
+        return {
+          status: "failed",
+          state,
+          steps,
+          error: new ConcurrentWriteViolationError(nodeIds),
+          attempts: attemptsSnapshot(),
+        };
+      }
+    }
+
+    // R6/R7: count this step's activations of any bounded node BEFORE
+    // dispatch — independent of the step budget above, per the Product
+    // Contract decision (whichever bound the actual run trips fires; this
+    // check never overrides a max_steps failure that already returned).
+    // Hitting the bound halts the run rather than spending one more attempt:
+    // the prior step's checkpoint (the last one written) already reflects
+    // "attempts spent, about to try again", so a resume recomputes this same
+    // check and can hit not_converged immediately (KTD-5) — deliberately, per
+    // its trade-off over laundering a run past its declared bound.
+    for (const activation of frontier) {
+      const bound = graph.attemptBounds?.[activation.nodeId];
+      if (bound === undefined) continue;
+      const nextCount = (attemptCounts.get(activation.nodeId) ?? 0) + 1;
+      if (nextCount > bound) {
+        // U8/KTD-11: checkpoint the refused frontier itself before halting.
+        // Without this, the durable resume point stays the *previous* step's
+        // checkpoint — whose frontier is the unbounded predecessor that fed
+        // this one — so a resume re-runs that predecessor for real (a genuine
+        // agent invocation, a genuine workspace mutation) before hitting this
+        // same bound a second time, orphaning that work under an attempt
+        // number already spent. Checkpointing this frontier means a resume
+        // re-enters exactly at the bound check and halts with no work.
+        if (persistence) {
+          writeCheckpoint(persistence.db, persistence.runId, {
+            state,
+            frontier,
+            barrier: {},
+            step: steps - 1,
+            attempts: attemptsSnapshot(),
+          });
+        }
+        return { status: "not_converged", state, steps, attempts: attemptsSnapshot() };
+      }
+    }
+    for (const activation of frontier) {
+      const bound = graph.attemptBounds?.[activation.nodeId];
+      if (bound === undefined) continue;
+      attemptCounts.set(activation.nodeId, (attemptCounts.get(activation.nodeId) ?? 0) + 1);
     }
 
     // Checkpoint this step's incoming frontier BEFORE dispatch (ADR-0008):
@@ -287,6 +482,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
         frontier,
         barrier: {},
         step: steps - 1,
+        attempts: attemptsSnapshot(),
       });
     }
 
@@ -331,7 +527,7 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
     try {
       state = mergeWrites(state, writes, (key) => reducerForKey.get(key));
     } catch (err) {
-      if (err instanceof StateConflictError) return { status: "failed", state, steps, error: err };
+      if (err instanceof StateConflictError) return { status: "failed", state, steps, error: err, attempts: attemptsSnapshot() };
       throw err;
     }
 
@@ -367,16 +563,18 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
       }
       const error =
         poolResult.firstError instanceof Error ? poolResult.firstError : new Error(String(poolResult.firstError));
-      return { status: "failed", state, steps, error };
+      return { status: "failed", state, steps, error, attempts: attemptsSnapshot() };
     }
 
-    const { next, reachedEnd } = transition(stepFrontier, state);
-    if (reachedEnd) return { status: "completed", state, steps };
+    const { next, reachedEnd, unmatchedRouterError } = transition(stepFrontier, state, steps);
+    if (unmatchedRouterError)
+      return { status: "failed", state, steps, error: unmatchedRouterError, attempts: attemptsSnapshot() };
+    if (reachedEnd) return { status: "completed", state, steps, attempts: attemptsSnapshot() };
 
     if (next.length === 0) {
       const stalled = detectStalledJoin(barriers);
       if (stalled) throw new UnreachableJoinError(stalled.joinId, stalled.missingSources);
-      return { status: "dead_end", state, steps };
+      return { status: "dead_end", state, steps, attempts: attemptsSnapshot() };
     }
 
     frontier = next;
@@ -390,5 +588,5 @@ export async function runLoop(options: RunLoopOptions): Promise<LoopResult> {
   // silently report dead_end instead of the diagnosable UnreachableJoinError.
   const stalled = detectStalledJoin(barriers);
   if (stalled) throw new UnreachableJoinError(stalled.joinId, stalled.missingSources);
-  return { status: "dead_end", state, steps };
+  return { status: "dead_end", state, steps, attempts: attemptsSnapshot() };
 }

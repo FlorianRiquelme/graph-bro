@@ -1,0 +1,42 @@
+{
+  "nodes": [
+    {
+      "id": "seed",
+      "kind": "set",
+      "update": { "findings": { "verdict": "fail", "notes": "no review yet — write an initial draft" } }
+    },
+    {
+      "id": "fix",
+      "kind": "agent",
+      "read_only": false,
+      "model": "claude-haiku-4-5",
+      "prompt": "Update notes.txt in the current directory to address this feedback: \"{{ findings.notes }}\". Keep it short.",
+      "output_key": "fix_result"
+    },
+    {
+      "id": "review",
+      "kind": "agent",
+      "read_only": true,
+      "model": "claude-haiku-4-5",
+      "prompt": "Review notes.txt against the brief: it must contain the word \"done\". Report your verdict and a short note. Do not modify anything.",
+      "output_key": "findings",
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "verdict": { "type": "string" },
+          "notes": { "type": "string" }
+        },
+        "required": ["verdict"]
+      },
+      "max_attempts": 3
+    }
+  ],
+  "edges": [
+    { "from": "START", "to": "seed" },
+    { "from": "seed", "to": "fix" },
+    { "from": "fix", "to": "review" },
+    { "from": "review", "to": "fix", "when": { "key": "findings.verdict", "equals": "fail" } },
+    { "from": "review", "to": "END", "when": { "key": "findings.verdict", "equals": "pass" } }
+  ],
+  "max_steps": 20
+}

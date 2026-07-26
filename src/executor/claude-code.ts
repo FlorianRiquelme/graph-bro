@@ -1,11 +1,21 @@
 import readline from "node:readline";
+import { realpathSync } from "node:fs";
 import type { Executor, NodeRegistry, RunOptions, RunResult, TokenUsage } from "./executor.js";
 import { spawnDetached, killProcessGroup } from "./subprocess.js";
 import { parseEnvelope, type ResultEnvelope } from "./envelope.js";
-import { assertRepoClean, buildReadOnlyArgs } from "./read-only-policy.js";
+import { assertRepoClean, buildReadOnlyArgs, buildReadOnlyPolicy, capturePorcelain } from "./read-only-policy.js";
+import { buildWritePolicy } from "./write-policy.js";
 
 /** The literal token a command template substitutes the prompt into, when present. */
 export const PROMPT_TOKEN = "{prompt}";
+
+/**
+ * How long to keep reading stdout after the node process has exited, before
+ * concluding the stream will never end. Only ever spent when a forked
+ * grandchild inherited stdout and outlived its parent; an ordinary drain
+ * completes in an event-loop turn.
+ */
+const STDOUT_DRAIN_GRACE_MS = 2000;
 
 /**
  * §13.4's compile-time prompt-delivery rule: if the command template
@@ -63,6 +73,18 @@ export class ClaudeCodeExecutor implements Executor {
     const heartbeatSoftMs = this.opts.heartbeatSoftMs ?? 15_000;
     const pollMs = this.opts.heartbeatPollMs ?? 250;
 
+    // U6/KTD-3: a write node's cwd is canonicalised before it feeds any
+    // scope or deny rule — a symlinked ancestor would otherwise make the
+    // sandbox's cwd-scoped write access silently diverge from what the
+    // synthesized settings declare.
+    const cwd = options.capability === "write" ? realpathSync(options.cwd) : options.cwd;
+    const writePolicy = options.capability === "write" ? buildWritePolicy(cwd, options.networkDomains ?? []) : undefined;
+    // U6/KTD-7: the rescoped read-only backstop compares against a baseline
+    // captured before this node ran, not against emptiness — every node now
+    // shares one workspace, so a prior write node's uncommitted work must
+    // not false-fail a read-only node that touched nothing.
+    const baselinePorcelain = options.capability === "read_only" ? capturePorcelain(cwd, options.consumerRepoPath) : undefined;
+
     // KTD-9/SDK #60: `--print --verbose --output-format stream-json` first, unconditionally.
     const template = [
       "--print",
@@ -71,15 +93,25 @@ export class ClaudeCodeExecutor implements Executor {
       "stream-json",
       "--model",
       options.model,
-      ...(options.readOnly ? buildReadOnlyArgs() : []),
+      ...(options.capability === "read_only" ? buildReadOnlyArgs() : []),
+      // R9/KTD-9: a read-only node's OS sandbox layer — closes the
+      // `git diff --output=`/`git show --output=` escape the allowlist
+      // string can't express (see read-only-policy.ts).
+      ...(options.capability === "read_only" ? buildReadOnlyPolicy().argv : []),
+      ...(writePolicy?.argv ?? []),
+      // KTD-8: forwards the topology-declared output schema as the backend's
+      // structured-output contract; the response's parsed value comes back
+      // on the envelope's `structured_output` field (see envelope.ts).
+      ...(options.outputSchema ? ["--json-schema", JSON.stringify(options.outputSchema)] : []),
       "-p",
       PROMPT_TOKEN,
     ];
     const { argv, stdin } = resolvePromptDelivery(template, prompt);
 
     const spawned = spawnDetached(binary, argv, {
-      cwd: options.cwd,
+      cwd,
       stdinMode: stdin === null ? "closed" : "piped",
+      env: writePolicy?.env,
     });
     this.opts.registry?.register({ pid: spawned.pid, pgid: spawned.pgid });
 
@@ -133,9 +165,51 @@ export class ClaudeCodeExecutor implements Executor {
       }
     }, pollMs);
 
+    // Captured in the exit handler, not read off the child afterwards: the
+    // `finally` below group-kills unconditionally, which can overwrite
+    // `signalCode` and erase how the process actually ended.
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     try {
+      // Waits for the process to exit AND its stdout to drain, not just the
+      // former. `exit` fires when the process ends, while whatever it wrote
+      // last can still be sitting unread in the pipe — so resolving on `exit`
+      // alone and closing the reader (below) discards the terminal envelope
+      // of any CLI that writes it and exits promptly. That loses a
+      // *successful* node to a synthetic "no terminal envelope" error, and it
+      // is load-dependent: invisible on a fast machine that drains the pipe
+      // before `exit` is delivered, roughly a coin flip per node on a busy
+      // CI runner.
       await new Promise<void>((resolve, reject) => {
-        spawned.child.once("exit", () => resolve());
+        let exited = false;
+        let drained = false;
+        let drainTimer: NodeJS.Timeout | undefined;
+        const settle = (): void => {
+          if (!exited || !drained) return;
+          if (drainTimer) clearTimeout(drainTimer);
+          resolve();
+        };
+        // readline closes when its input stream ends — i.e. once every
+        // buffered line has been emitted.
+        rl.once("close", () => {
+          drained = true;
+          settle();
+        });
+        spawned.child.once("exit", (code, signal) => {
+          exitCode = code;
+          exitSignal = signal;
+          exited = true;
+          // Bounded, because stdout is inherited: a grandchild the CLI forked
+          // and left running holds the pipe open indefinitely after the CLI
+          // itself is gone. Draining a pipe takes an event-loop turn, so this
+          // grace is never spent on a healthy node — only on that leak, where
+          // giving up beats hanging the run.
+          drainTimer ??= setTimeout(() => {
+            drained = true;
+            settle();
+          }, STDOUT_DRAIN_GRACE_MS);
+          settle();
+        });
         spawned.child.once("error", (err) => reject(err));
       });
     } finally {
@@ -149,7 +223,7 @@ export class ClaudeCodeExecutor implements Executor {
     // KTD-10 backstop: per read-only node completion (not once after a whole fan-out
     // drains), so a permission-policy gap is attributed to the offending node. Folded
     // into the shared `run()` path rather than left for callers to remember.
-    if (options.readOnly) assertRepoClean(options.cwd, options.nodeId);
+    if (options.capability === "read_only") assertRepoClean(cwd, options.nodeId, baselinePorcelain!, options.consumerRepoPath);
 
     if (terminalEnvelope) {
       return {
@@ -158,10 +232,22 @@ export class ClaudeCodeExecutor implements Executor {
         cost: terminalEnvelope.total_cost_usd,
         tokens: extractTokens(terminalEnvelope),
         durationMs: terminalEnvelope.duration_ms,
+        structuredOutput: terminalEnvelope.structured_output,
       };
     }
     // Process exited with no terminal event before EOF — a real hang (hard-killed) or an
     // unexpected early exit either way; report a synthetic error rather than throw.
-    return { text: "", isError: true, durationMs: Date.now() - startedAt };
+    // The cause has to be spelled out here: this text is all the caller gets
+    // (`runLoop` wraps it as "agent node '<id>' failed: <text>"), and an empty
+    // string leaves an operator — or a CI log — with a failed run and no reason.
+    const stderr = spawned.stderrTail().trim();
+    const cause = timedOut
+      ? `hard heartbeat timeout after ${options.timeout}ms of silence`
+      : `exited without a terminal result envelope (exit code ${exitCode ?? "none"}, signal ${exitSignal ?? "none"})`;
+    return {
+      text: `node process ${cause}${stderr ? `; stderr tail: ${stderr}` : "; no stderr output"}`,
+      isError: true,
+      durationMs: Date.now() - startedAt,
+    };
   }
 }

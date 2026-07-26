@@ -28,41 +28,83 @@ export type WhenRule =
   | { key: string; falsy: true }
   | { key: string; contains?: unknown };
 
-export const WhenRuleSchema: z.ZodType<WhenRule> = z.lazy(() =>
+/**
+ * A JSON value, used for `equals`/`not_equals`/`contains` operands so the
+ * key is genuinely *required* rather than merely typed. `z.unknown()` alone
+ * accepts a *missing* property too (`unknown` includes `undefined`), which
+ * is exactly the U2 grammar defect: it let the wrong leaf variant match a
+ * legitimately-authored leaf missing that variant's operator.
+ */
+const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
-    z.object({ all: z.array(WhenRuleSchema) }),
-    z.object({ any: z.array(WhenRuleSchema) }),
-    z.object({ not: WhenRuleSchema }),
-    z.object({ key: z.string().min(1), exists: z.boolean() }),
-    z.object({ key: z.string().min(1), equals: z.unknown() }),
-    z.object({ key: z.string().min(1), not_equals: z.unknown() }),
-    z.object({ key: z.string().min(1), truthy: z.literal(true) }),
-    z.object({ key: z.string().min(1), falsy: z.literal(true) }),
-    z.object({ key: z.string().min(1), contains: z.unknown() }),
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(JsonValueSchema),
+    z.record(z.string(), JsonValueSchema),
   ]),
 );
 
 /**
- * `agent` node: runs a CLI coding agent. `read_only` is `z.literal(true)` in
- * slice 1 — a write-capable node has no shipped policy yet, so it is rejected
- * at compile (KTD-8).
+ * U2 grammar repair: each leaf variant is `.strict()` so an authored leaf can
+ * match at most one variant. Two defects this fixes together — probe-verified
+ * against the repo's zod, both silently reachable before this change:
+ * (1) an extra, wrong-operator key used to be silently stripped rather than
+ * rejected (`.strict()` alone fixes this); (2) a bare `{key}` with no
+ * operator at all used to match the `equals` variant, since `z.unknown()`
+ * accepts a missing property (the `JsonValueSchema` operand type above fixes
+ * this — the operator key becomes genuinely required, not just typed).
  */
-export const AgentNodeSchema = z.object({
-  id: z.string().min(1),
-  kind: z.literal("agent"),
-  read_only: z.literal(true),
-  model: z.string().min(1),
-  prompt: z.string().min(1),
-  output_key: z.string().min(1),
-});
+export const WhenRuleSchema: z.ZodType<WhenRule> = z.lazy(() =>
+  z.union([
+    z.object({ all: z.array(WhenRuleSchema) }).strict(),
+    z.object({ any: z.array(WhenRuleSchema) }).strict(),
+    z.object({ not: WhenRuleSchema }).strict(),
+    z.object({ key: z.string().min(1), exists: z.boolean() }).strict(),
+    z.object({ key: z.string().min(1), equals: JsonValueSchema }).strict(),
+    z.object({ key: z.string().min(1), not_equals: JsonValueSchema }).strict(),
+    z.object({ key: z.string().min(1), truthy: z.literal(true) }).strict(),
+    z.object({ key: z.string().min(1), falsy: z.literal(true) }).strict(),
+    z.object({ key: z.string().min(1), contains: JsonValueSchema }).strict(),
+  ]),
+);
+
+/**
+ * `agent` node: runs a CLI coding agent. `read_only` was `z.literal(true)` in
+ * slice 1 (a write-capable node had no shipped policy yet); slice 2 gives
+ * write nodes their own enforcement (U6), so it is a plain boolean now (R8).
+ * `.strict()` so a field meaningful only for a write-capable node —
+ * `network_domains` — or one meaningful only for an agent node —
+ * `output_schema`, `max_attempts` — placed on the wrong node kind is a
+ * compile error rather than silently stripped (matches `SetNodeSchema`).
+ */
+export const AgentNodeSchema = z
+  .object({
+    id: z.string().min(1),
+    kind: z.literal("agent"),
+    read_only: z.boolean(),
+    model: z.string().min(1),
+    prompt: z.string().min(1),
+    output_key: z.string().min(1),
+    /** R2: a JSON Schema this node's response is validated against (KTD-8); well-formedness is checked in `compile()`, which owns the ajv dependency. */
+    output_schema: z.record(z.string(), z.unknown()).optional(),
+    /** R6: the attempt bound — how many times a loop's re-entered node may activate before `not_converged` (CONTEXT.md "attempt bound"). */
+    max_attempts: z.number().int().positive().optional(),
+    /** R11: domains this write-capable node's sandboxed shell may reach; absent means none. */
+    network_domains: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
 export type AgentNode = z.infer<typeof AgentNodeSchema>;
 
-/** `set` node: deterministic state write, no model call. */
-export const SetNodeSchema = z.object({
-  id: z.string().min(1),
-  kind: z.literal("set"),
-  update: z.record(z.string(), z.unknown()),
-});
+/** `set` node: deterministic state write, no model call. `.strict()`: see `AgentNodeSchema`. */
+export const SetNodeSchema = z
+  .object({
+    id: z.string().min(1),
+    kind: z.literal("set"),
+    update: z.record(z.string(), z.unknown()),
+  })
+  .strict();
 export type SetNode = z.infer<typeof SetNodeSchema>;
 
 export const NodeSchema = z.discriminatedUnion("kind", [
@@ -140,5 +182,7 @@ export const TopologySchema = z.object({
   max_steps: z.number().int().positive(),
   /** Per-topology override of the bounded fan-out pool's width (ADR-0011); defaults to the engine's K=5 if omitted. */
   max_concurrency: z.number().int().positive().optional(),
+  /** R14: the committed ref the run's workspace is created from; defaults to the current branch's tip (resolved at `start`, not here). */
+  base_ref: z.string().min(1).optional(),
 });
 export type Topology = z.infer<typeof TopologySchema>;

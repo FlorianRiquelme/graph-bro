@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compile } from "../../src/topology/compile.js";
 import { readNodeTraceMeta } from "../../src/engine/loop.js";
-import { buildNodeFns } from "../../src/runtime/run.js";
+import { buildNodeFns, mapStatusToExitCode } from "../../src/runtime/run.js";
 import { StubExecutor } from "../fixtures/stub-executor.js";
 
 function singleAgentTopology(prompt: string) {
@@ -71,5 +71,14 @@ describe("runtime/run: buildNodeFns wires prompt templating into the agent node 
     const update = await nodeFns.reader({ item: "one" });
 
     expect(readNodeTraceMeta(update)?.resolvedPrompt).toBe("read one");
+  });
+});
+
+describe("runtime/run: mapStatusToExitCode (U4, R7)", () => {
+  it("Covers R7: not_converged is distinct from both completed and a generic failure", () => {
+    expect(mapStatusToExitCode("completed")).toBe(0);
+    expect(mapStatusToExitCode("not_converged")).toBe(2);
+    expect(mapStatusToExitCode("failed")).toBe(1);
+    expect(mapStatusToExitCode("dead_end")).toBe(1);
   });
 });

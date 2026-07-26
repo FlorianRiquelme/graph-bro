@@ -209,7 +209,7 @@ describe("store: pending-writes crash core", () => {
 
     const result = resume(db, "run-never-checkpointed");
 
-    expect(result).toEqual({ step: 0, state: {}, frontier: [], completedInstanceIds: new Set() });
+    expect(result).toEqual({ step: 0, state: {}, frontier: [], completedInstanceIds: new Set(), attempts: {} });
   });
 
   it("two concurrent writer connections against one DB serialize under WAL + busy_timeout without SQLITE_BUSY", async () => {

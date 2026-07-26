@@ -23,10 +23,37 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
 - **Reducer** — the merge policy resolving concurrent/repeated writes to one state key. Built-ins:
   `append`, `merge`, `sum`, `dedup`. Unregistered write conflicts **fail loudly** (R5, §16).
 - **Read-only node** — a node declared `read_only: true`: it reads and proposes, never mutates the
-  consumer repo (R7). Read-only is what lets fan-out branches run in parallel without a sandbox.
+  consumer repo (R7). Read-only is what lets fan-out branches run in parallel without an isolated
+  workspace each.
+- **Write-capable node** — a node permitted to mutate files. The inverse of a read-only node in both
+  directions: its tool policy allows mutation, and its backstop asserts confinement rather than
+  cleanliness. Always paired with a **workspace** and a **sandbox**; never runs against the consumer's
+  checkout.
+- **Workspace** — the single isolated, run-owned checkout that **every** node of a run executes in,
+  created from the **base ref**. The unit of blast-radius containment and the reason the consumer's
+  working tree is untouched by construction rather than by policy. _Not:_ "sandbox" (a different,
+  narrower boundary — see below), and not "worktree" (a mechanism that might implement it).
+- **Base ref** — the committed ref a run's workspace is created from; defaults to the current
+  branch's tip and is reported by `start`. Makes a run a function of committed state, never of the
+  operator's in-flight edits, so two runs from the same base see the same code.
+- **Sandbox** — the OS-level boundary confining what a node's *shell commands* may write and reach.
+  Narrower than a workspace in scope and lower in the stack: the workspace says *where the run lives*,
+  the sandbox says *what the OS will refuse*. Tool policy covers the tools the sandbox does not.
+  _Not:_ a synonym for workspace, isolation, or containerization.
 - **Super-step** — one iteration of the execution loop: snapshot state, run the ready frontier, merge
   updates through reducers, recompute the next frontier, checkpoint. Nodes never see each other's
   mid-step writes.
+- **Attempt** — one activation of the node a loop re-enters. The single identifier shared by the loop
+  bound, the commit the engine makes, and the trace — so "attempt 3" names the same thing in `git log`
+  and in the trace. Counted per activation, so a run that never loops has exactly one.
+- **Attempt bound** — the per-node cap on how many times a loop's re-entered node may activate.
+  Semantically distinct from `max_steps`, which is a runaway backstop a graph can exhaust for reasons
+  unrelated to a loop failing to converge. Exhausting it is **not_converged** — a terminal state
+  meaning the run did its work and the reviewer still objects, which is a different thing from a
+  failure and calls for a different response.
+- **Routing decision** — the trace record of one `when` evaluation: the edge, the rule, the values
+  read, and the boolean. What makes the trace answer *why* a branch was taken, not only which. A node
+  whose every guard evaluated false fails loudly rather than silently draining the frontier.
 - **Checkpoint** — the durable per-super-step state snapshot: `{state, frontier, barrier state, step,
   history}`. The whole resumability contract; resume loads one snapshot and skips completed nodes (R9).
 - **Pending writes** — per-task durable writes keyed by the deterministic `(run_id, node, step,
@@ -66,6 +93,13 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
 - **Resolved prompt** — the concrete instruction a branch actually ran with, after its template's tokens
   were substituted. This — not the template — is what the trace records (R6), so per-branch
   differentiation is observable after the fact.
+- **Output schema** — a contract an `agent` node declares for its own response. The engine validates
+  against it and puts the **parsed value** — not the raw text — at the node's `output_key`, which is
+  what makes a node's output addressable by dotted path from a `when` rule or a prompt token. Always
+  authored by the consumer's topology: graph-bro ships no domain-shaped schema of its own, because an
+  engine with a built-in verdict type would know that its consumers do code review (boundary
+  invariant, ADR-0014). A non-conforming response fails loudly (R5). _Not:_ a retry mechanism, and not
+  a guarantee — structured output is a tool call the model can fail to make.
 
 ## Settled decisions (see `docs/adr/`)
 
@@ -80,3 +114,6 @@ avoid the listed synonyms. Decisions that shaped these terms live in `docs/adr/`
 - ADR-0009 — Capture per-node cost data (raw tokens + reported cost) from inception.
 - ADR-0010 — One Claude Code backend behind a narrow executor seam, no registry.
 - ADR-0011 — Bounded fan-out concurrency (default K=5) + per-node model selection.
+- ADR-0012 — Write-node blast radius enforced by an OS-level sandbox, tool policy layered above it.
+- ADR-0013 — The engine owns commit granularity; every attempt is committed, including failures.
+- ADR-0014 — Node output schemas are declared by the topology; the engine ships none.

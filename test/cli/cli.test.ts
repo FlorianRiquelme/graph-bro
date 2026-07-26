@@ -1,12 +1,18 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
-import { commitPendingWrite, createRun } from "../../src/store/pending-writes.js";
-import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { appendEvent } from "../../src/store/trace.js";
+import { commitPendingWrite, createRun, getRunOwnerPid } from "../../src/store/pending-writes.js";
+import { ATTEMPT_BOUNDARY_EVENT_TYPE } from "../../src/workspace/commit.js";
+import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
+const FAKE_CLAUDE_FIX_REVIEW = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -83,6 +89,7 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     return {
       ...process.env,
       GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
       GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
       FAKE_CLAUDE_MODE: mode,
     };
@@ -185,8 +192,9 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       });
       const env = baseEnv("success");
 
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
       const db = openDb({ baseDir: home });
-      createRun(db, runId, 999_999, topologyPath); // a dead owner pid, so resume self-heals
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
       writeCheckpoint(db, runId, {
         state: {},
         frontier: [{ nodeId: "reader", instanceId: "reader" }],
@@ -215,6 +223,66 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/no such run/);
+  });
+
+  it(
+    "Covers R18 (KTD-14): resume refuses a pre-workspace-migration run row (null workspace columns) without claiming ownership, and a later resume of the repaired row still works",
+    () => {
+      const runId = "pre-upgrade-run";
+      const topologyPath = writeTopology(cwdA, singleNodeTopology());
+      const env = baseEnv("success");
+      const deadPid = 999_999;
+
+      const db = openDb({ baseDir: home });
+      // No workspace fields: mirrors a run row written before the workspace
+      // migration ever ran (or one migrated with a still-null legacy row).
+      createRun(db, runId, deadPid, topologyPath);
+      db.close();
+
+      const refusal = runCliSync(["resume", runId], { cwd: cwdA, env });
+      expect(refusal.status).not.toBe(0);
+      expect(refusal.stderr).toMatch(/no recorded workspace/);
+
+      // The refusal happened before the ownership CAS: the dead owner pid is
+      // untouched, not left claimed by this (now-exited) resume invocation.
+      const dbCheck = openDb({ baseDir: home });
+      expect(getRunOwnerPid(dbCheck, runId)).toBe(deadPid);
+      dbCheck.close();
+
+      // Once the row is repaired (as a real migration/backfill would do),
+      // resume works normally.
+      const dbRepair = openDb({ baseDir: home });
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
+      createRun(dbRepair, runId, deadPid, topologyPath, workspace);
+      dbRepair.close();
+
+      const heal = runCliSync(["resume", runId], { cwd: cwdA, env });
+      expect(heal.status).toBe(0);
+      expect(heal.stdout.trim()).toBe(runId);
+    },
+    10_000,
+  );
+
+  it("Covers R18: the missing-workspace error is distinguishable from the missing-topology-path error", () => {
+    const noTopologyRunId = "no-topology-run";
+    const noWorkspaceRunId = "no-workspace-run";
+    const topologyPath = writeTopology(cwdA, singleNodeTopology());
+    const env = baseEnv("success");
+
+    const db = openDb({ baseDir: home });
+    createRun(db, noTopologyRunId, 999_999); // no topology path, no workspace
+    createRun(db, noWorkspaceRunId, 999_999, topologyPath); // topology path present, workspace absent
+    db.close();
+
+    const noTopology = runCliSync(["resume", noTopologyRunId], { cwd: cwdA, env });
+    expect(noTopology.status).not.toBe(0);
+    expect(noTopology.stderr).toMatch(/no recorded topology path/);
+    expect(noTopology.stderr).not.toMatch(/no recorded workspace/);
+
+    const noWorkspace = runCliSync(["resume", noWorkspaceRunId], { cwd: cwdA, env });
+    expect(noWorkspace.status).not.toBe(0);
+    expect(noWorkspace.stderr).toMatch(/no recorded workspace/);
+    expect(noWorkspace.stderr).not.toMatch(/no recorded topology path/);
   });
 
   it("Covers AE5: start returns promptly with a run id while the engine continues detached", async () => {
@@ -296,8 +364,9 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
 
       // Simulate a crash: 2 of the 4 fan-out branches already committed their
       // pending write; the checkpoint's frontier still lists all 4.
+      const workspace = seedWorkspaceForRun(cwdA, runId, join(home, "workspaces"));
       const db = openDb({ baseDir: home });
-      createRun(db, runId, 999_999, topologyPath); // a dead owner pid
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid
       // items are plain strings (no `id` field), so deriveItemKey derives
       // "idx:${i}" for each — must match here for resume() to line up.
       writeCheckpoint(db, runId, {
@@ -368,6 +437,23 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
       expect(refusal.status).not.toBe(0);
       expect(refusal.stderr).toMatch(/still owned by live process/);
 
+      // Wait for the node to actually be in flight (its pre-dispatch checkpoint
+      // written) before killing — otherwise this races the engine's own
+      // start-up work (workspace creation, U6's consumer-baseline capture)
+      // against the kill, and a crash landing before the *first* checkpoint
+      // ever exists resumes with an empty frontier instead of a genuine
+      // mid-attempt crash (the scenario this test simulates). Mirrors
+      // kill-reaping.test.ts's precedent of synchronizing on the node being
+      // in flight rather than firing the kill on a fixed timing assumption.
+      await waitFor(() => {
+        const db = openDb({ baseDir: home });
+        try {
+          return db.prepare("select 1 from checkpoints where run_id = ?").get(runId) !== undefined;
+        } finally {
+          db.close();
+        }
+      }, 3000);
+
       // Simulate a hard crash (bypasses graceful shutdown/kill cascade entirely).
       process.kill(ownerPid, "SIGKILL");
       await waitFor(() => !isAlive(ownerPid), 3000);
@@ -414,4 +500,263 @@ describe("cli: graph-bro (five verbs + detached process model)", () => {
     },
     15_000,
   );
+});
+
+describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)", () => {
+  let home: string;
+  let cwd: string;
+  let counterDir: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "graph-bro-trace-home-"));
+    cwd = gitRepo();
+    counterDir = mkdtempSync(join(tmpdir(), "graph-bro-trace-counter-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(counterDir, { recursive: true, force: true });
+  });
+
+  function fixReviewEnv(passOnAttempt: number): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
+      GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE_FIX_REVIEW,
+      FAKE_CLAUDE_COUNTER_DIR: counterDir,
+      FAKE_CLAUDE_PASS_ON_ATTEMPT: String(passOnAttempt),
+    };
+  }
+
+  function fixReviewLoopTopology(maxAttempts: number) {
+    return {
+      nodes: [
+        {
+          id: "writer",
+          kind: "agent",
+          read_only: false,
+          model: "claude-haiku-4-5",
+          prompt: JSON.stringify({ write: { path: "work.txt", content: "attempt" } }),
+          output_key: "written",
+        },
+        {
+          id: "review",
+          kind: "agent",
+          read_only: true,
+          model: "claude-haiku-4-5",
+          prompt: "review the work",
+          output_key: "verdict",
+          output_schema: { type: "object", properties: { verdict: { type: "string" } }, required: ["verdict"] },
+          max_attempts: maxAttempts,
+        },
+      ],
+      edges: [
+        { from: "START", to: "writer" },
+        { from: "writer", to: "review" },
+        { from: "review", to: "writer", when: { key: "verdict.verdict", equals: "fail" } },
+        { from: "review", to: "END", when: { key: "verdict.verdict", equals: "pass" } },
+      ],
+      max_steps: 20,
+    };
+  }
+
+  /** Every `node_complete` event's cost, straight off the trace — independent of `aggregateAttempts`'s own grouping, so it's a fair thing to compare the per-attempt sum against (U12/R20). */
+  function totalNodeCompleteCost(runId: string, env: NodeJS.ProcessEnv): number {
+    const events = runCliSync(["tail", runId], { cwd, env })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    return events
+      .filter((e) => e.payload?.type === "node_complete")
+      .reduce((sum: number, e: { costUsd?: number }) => sum + (e.costUsd ?? 0), 0);
+  }
+
+  it("Covers R26: a four-attempt run's result shows exactly four per-attempt attributions, each with tokens and USD", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(4) });
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env: fixReviewEnv(4) }).stdout);
+    expect(result.status).toBe("completed");
+    expect(result.attempts).toHaveLength(4);
+    expect(result.attempts.map((a: { attempt: number }) => a.attempt)).toEqual([1, 2, 3, 4]);
+    for (const attempt of result.attempts) {
+      expect(attempt.inputTokens).toBeGreaterThan(0);
+      expect(attempt.outputTokens).toBeGreaterThan(0);
+      expect(attempt.costUsd).toBeGreaterThan(0);
+    }
+    // U12/R20: the assertion that would have caught the dropped-attempt-zero
+    // bucket — every node_complete's cost must land in some attempt, so the
+    // per-attempt sum must equal the run's real total.
+    const attemptedCost = result.attempts.reduce((sum: number, a: { costUsd: number }) => sum + a.costUsd, 0);
+    expect(attemptedCost).toBeCloseTo(totalNodeCompleteCost(runId, fixReviewEnv(4)), 5);
+  }, 20_000);
+
+  it("Covers R20: a three-attempt loop's per-attempt costs sum to the run's total node-completion cost, with no invocation unattributed", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(3) });
+    const runId = start.stdout.trim();
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env: fixReviewEnv(3) }).stdout);
+    expect(result.status).toBe("completed");
+
+    const attemptedCost = result.attempts.reduce((sum: number, a: { costUsd: number }) => sum + a.costUsd, 0);
+    expect(attemptedCost).toBeCloseTo(totalNodeCompleteCost(runId, fixReviewEnv(3)), 5);
+
+    // The dropped bucket was always the write node's *first* invocation,
+    // stamped attempt 0 before the bounded node's own hook ever advanced the
+    // shared counter. It must land in attempt one instead.
+    const events = runCliSync(["tail", runId], { cwd, env: fixReviewEnv(3) })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const writerFirstComplete = events.find((e) => e.node === "writer" && e.payload?.type === "node_complete");
+    expect(writerFirstComplete.step).toBe(1);
+  }, 20_000);
+
+  it(
+    "Covers R20: a resumed run's attempt attribution continues from the recorded counts rather than restarting",
+    async () => {
+      const runId = "resume-attempt-attribution-run";
+      const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+      const env = fixReviewEnv(1); // the resumed review call is its counter's first real call — pass immediately
+
+      // Simulate a crash after 2 attempts already completed (review's own
+      // hook committed attempt 2), with the frontier back at the write node
+      // for what would be attempt 3.
+      const workspace = seedWorkspaceForRun(cwd, runId, join(home, "workspaces"));
+      // R15/KTD-11/KTD-16: resume reconciles the seeded checkpoint's
+      // `attempts.review: 2` against the attempt-boundary events actually
+      // recorded in the trace — seed two real commits plus their boundary
+      // events so that reconciliation (a concern orthogonal to what this
+      // test targets) sees a consistent history rather than refusing.
+      for (const n of [1, 2]) {
+        writeFileSync(join(workspace.workspacePath, "seed.txt"), String(n));
+        execFileSync("git", ["-C", workspace.workspacePath, "add", "-A"]);
+        execFileSync("git", ["-C", workspace.workspacePath, "commit", "-q", "-m", `graph-bro: attempt ${n} (review)`]);
+      }
+      const db = openDb({ baseDir: home });
+      for (const n of [1, 2]) {
+        appendEvent(db, {
+          runId,
+          node: "review",
+          step: n,
+          payload: { type: ATTEMPT_BOUNDARY_EVENT_TYPE, nodeId: "review", attemptNumber: n, committed: true },
+        });
+      }
+      createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
+      writeCheckpoint(db, runId, {
+        state: {},
+        frontier: [{ nodeId: "writer", instanceId: "writer" }],
+        barrier: {},
+        step: 2,
+        attempts: { review: 2 },
+      });
+      db.close();
+
+      const resume = runCliSync(["resume", runId], { cwd, env });
+      expect(resume.status).toBe(0);
+
+      await waitForRunStatus(home, runId, "completed", 10_000);
+
+      const events = runCliSync(["tail", runId], { cwd, env })
+        .stdout.trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+      // Continuing from the recorded count of 2, not restarting at 0 or 1:
+      // the resumed writer picks up the seeded counter (attempt 2), and
+      // review's own hook then advances it to 3.
+      const writerComplete = events.find((e) => e.node === "writer" && e.payload?.type === "node_complete");
+      const reviewComplete = events.find((e) => e.node === "review" && e.payload?.type === "node_complete");
+      expect(writerComplete.step).toBe(2);
+      expect(reviewComplete.step).toBe(3);
+    },
+    15_000,
+  );
+
+  it("Covers R25: the three stop reasons are distinguishable in result's output — converged, bound hit, and failed", async () => {
+    const convergedCwd = gitRepo();
+    const failedCwd = gitRepo();
+    try {
+      const convergedTopologyPath = writeTopology(convergedCwd, fixReviewLoopTopology(5));
+      const convergedStart = runCliSync(["start", convergedTopologyPath], { cwd: convergedCwd, env: fixReviewEnv(1) });
+      const convergedRunId = convergedStart.stdout.trim();
+      await waitForRunStatus(home, convergedRunId, "completed", 10_000);
+      const convergedResult = JSON.parse(runCliSync(["result", convergedRunId], { cwd: convergedCwd, env: fixReviewEnv(1) }).stdout);
+      expect(convergedResult.status).toBe("completed");
+      expect(convergedResult.error).toBeUndefined();
+
+      const boundTopologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+      const boundStart = runCliSync(["start", boundTopologyPath], { cwd, env: fixReviewEnv(99) });
+      const boundRunId = boundStart.stdout.trim();
+      await waitForRunStatus(home, boundRunId, "not_converged", 10_000);
+      const boundResult = JSON.parse(runCliSync(["result", boundRunId], { cwd, env: fixReviewEnv(99) }).stdout);
+      expect(boundResult.status).toBe("not_converged");
+      expect(boundResult.error).toBeUndefined(); // not a failure — distinct from it
+
+      // A real runtime failure (not the CLI's own start-time validation
+      // gate): max_steps exceeded before the never-converging loop ever
+      // reaches its attempt bound, so `result.error` carries a real message.
+      const failedTopologyPath = writeTopology(failedCwd, { ...fixReviewLoopTopology(99), max_steps: 2 });
+      const failedStart = runCliSync(["start", failedTopologyPath], { cwd: failedCwd, env: fixReviewEnv(99) });
+      const failedRunId = failedStart.stdout.trim();
+      await waitForRunStatus(home, failedRunId, "failed", 10_000);
+      const failedResult = JSON.parse(runCliSync(["result", failedRunId], { cwd: failedCwd, env: fixReviewEnv(99) }).stdout);
+      expect(failedResult.status).toBe("failed");
+      expect(failedResult.error).toBeTruthy();
+    } finally {
+      rmSync(convergedCwd, { recursive: true, force: true });
+      rmSync(failedCwd, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("a slice-1-shaped read-only run's result/status output is unchanged — no attempts or error keys appear", async () => {
+    const topologyPath = writeTopology(cwd, singleNodeTopology());
+    const env = {
+      ...process.env,
+      GRAPH_BRO_HOME: home,
+      GRAPH_BRO_WORKSPACES: join(home, "workspaces"),
+      GRAPH_BRO_CLAUDE_BINARY: FAKE_CLAUDE,
+      FAKE_CLAUDE_MODE: "success",
+    };
+    const start = runCliSync(["start", topologyPath], { cwd, env });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const result = JSON.parse(runCliSync(["result", runId], { cwd, env }).stdout);
+    expect(Object.keys(result).sort()).toEqual(["output", "runId", "status"]);
+
+    const status = JSON.parse(runCliSync(["status", runId], { cwd, env }).stdout);
+    expect(Object.keys(status).sort()).toEqual(["createdAt", "ownerPid", "runId", "status"]);
+  }, 15_000);
+
+  it("Covers R24: a routing decision (rule, values read) and a node's structured output are both readable from the trace", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const start = runCliSync(["start", topologyPath], { cwd, env: fixReviewEnv(1) });
+    const runId = start.stdout.trim();
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    const events = runCliSync(["tail", runId], { cwd, env: fixReviewEnv(1) })
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+
+    const routing = events.find((e) => e.payload.type === "routing_decision" && e.payload.result === true);
+    expect(routing).toBeDefined();
+    expect(routing.payload.rule).toEqual({ key: "verdict.verdict", equals: "pass" });
+    expect(routing.payload.reads).toBeDefined();
+
+    const reviewComplete = events.find((e) => e.node === "review" && e.payload.type === "node_complete");
+    expect(reviewComplete.payload.update.verdict).toEqual({ verdict: "pass" });
+  }, 15_000);
 });
