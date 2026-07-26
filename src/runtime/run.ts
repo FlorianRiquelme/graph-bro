@@ -25,7 +25,7 @@ import { InMemoryNodeRegistry, type Executor } from "../executor/executor.js";
 import { signalProcessGroup } from "../executor/subprocess.js";
 import { createWorkspace, finalizeWorkspace, reattachToRunBranch, reuseWorkspace } from "../workspace/lifecycle.js";
 import { assertConsumerBaseline, captureConsumerBaseline, type ConsumerBaseline } from "../workspace/baseline.js";
-import { commitAttempt, committedAttemptCounts, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
+import { ATTEMPT_BOUNDARY_EVENT_TYPE, attemptBoundaryCounts, commitAttempt, preserveInterruptedAttempt, readHead } from "../workspace/commit.js";
 import {
   assertWorkspaceIntegrity,
   captureWorkspaceIntegrityManifest,
@@ -177,6 +177,20 @@ function withAttemptCommit(
     attemptState.current = attemptNumber; // U9: the shared counter withTracing stamps onto every event
     const result = commitAttempt({ consumerRepoPath, workspacePath, priorHead: headState.current, attemptNumber, nodeId });
     headState.current = result.head;
+    // U5/KTD-16: appended only after `commitAttempt` returns — never at the
+    // counter increment above. A kill in that three-git-subprocess window
+    // would otherwise let the trace claim an attempt git never actually
+    // reached; this ordering keeps the event atomic with the thing it
+    // records. `committed: false` still reaches here (an attempt that
+    // changed nothing creates no commit), which is exactly the case
+    // resume's reconciliation below needs to see and a commit-message parse
+    // could not.
+    appendEvent(db, {
+      runId,
+      node: nodeId,
+      step: attemptNumber,
+      payload: { type: ATTEMPT_BOUNDARY_EVENT_TYPE, nodeId, attemptNumber, committed: result.committed },
+    });
     if (result.quiescenceWarning) {
       appendEvent(db, { runId, node: nodeId, step: attemptNumber, payload: { type: "workspace_not_quiescent", warning: result.quiescenceWarning } });
     }
@@ -420,24 +434,28 @@ async function main(): Promise<void> {
   const reducerForKey = (key: string) => graph.joinBarriers.find((barrier) => barrier.into === key)?.reducer;
   const resumed = mode === "resume" ? resumeRun(db, runId, { reducerForKey }) : undefined;
 
-  // R15/KTD-11: reconcile the resumed checkpoint's per-node attempt counts
-  // against the attempt commits actually present, now that
-  // `preserveInterruptedAttempt` above has already hard-reset the workspace
-  // to its last actually committed attempt. A checkpoint can promise more
-  // attempts than git holds committed — a kill between the checkpoint write
-  // and the attempt commit that was about to fold the prior round's edits,
-  // which the hard reset just discarded — and re-entering the bounded node
-  // on that mismatch would run it against a workspace that no longer
-  // reflects what the checkpoint claims (KTD-11 explicitly rejects rolling
-  // the frontier back to re-run the predecessor instead: surface, don't
-  // guess). The workspace is left in place, not disposed, for inspection —
-  // the same convention every other halted-run status keeps.
+  // R15/KTD-11/KTD-16: reconcile the resumed checkpoint's per-node attempt
+  // counts against the attempt-boundary events actually recorded in the
+  // run's own trace, now that `preserveInterruptedAttempt` above has already
+  // hard-reset the workspace to its last actually committed attempt. A
+  // checkpoint can promise more attempts than the trace recorded — a kill
+  // between the counter's own increment and the `commitAttempt` call whose
+  // boundary event is appended only after it returns — and re-entering the
+  // bounded node on that mismatch would run it against a workspace that no
+  // longer reflects what the checkpoint claims (KTD-11 explicitly rejects
+  // rolling the frontier back to re-run the predecessor instead: surface,
+  // don't guess). Reading the trace rather than git's commit messages also
+  // means an attempt that committed nothing (no diff to fold) is still
+  // visible here, so a healthy resume past exactly that attempt no longer
+  // misreads it as the mismatch this check exists to catch. The workspace is
+  // left in place, not disposed, for inspection — the same convention every
+  // other halted-run status keeps.
   if (mode === "resume" && resumed) {
-    const committed = committedAttemptCounts(consumerRepoPath, workspacePath, baseRefSha);
-    const mismatches = Object.entries(resumed.attempts).filter(([nodeId, count]) => count > (committed[nodeId] ?? 0));
+    const recorded = attemptBoundaryCounts(listEvents(db, runId));
+    const mismatches = Object.entries(resumed.attempts).filter(([nodeId, count]) => count > (recorded[nodeId] ?? 0));
     if (mismatches.length > 0) {
       const detail = mismatches
-        .map(([nodeId, count]) => `'${nodeId}': checkpoint records ${count} attempt(s), ${committed[nodeId] ?? 0} committed`)
+        .map(([nodeId, count]) => `'${nodeId}': checkpoint records ${count} attempt(s), ${recorded[nodeId] ?? 0} recorded in the trace`)
         .join("; ");
       const error = `resume attempt-count mismatch (R15/KTD-11): ${detail} — refusing to resume rather than re-enter the bounded node against a workspace that no longer reflects what the checkpoint claims`;
       appendEvent(db, { runId, payload: { type: "run_error", error } });

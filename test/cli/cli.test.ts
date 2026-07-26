@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { writeCheckpoint } from "../../src/store/checkpoints.js";
+import { appendEvent } from "../../src/store/trace.js";
 import { commitPendingWrite, createRun, getRunOwnerPid } from "../../src/store/pending-writes.js";
+import { ATTEMPT_BOUNDARY_EVENT_TYPE } from "../../src/workspace/commit.js";
 import { FAKE_CLAUDE, gitRepo, isAlive, runCliSync, seedWorkspaceForRun, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
@@ -631,16 +633,25 @@ describe("cli: graph-bro result/status — trace and reporting (U9, R24/R25/R26)
       // hook committed attempt 2), with the frontier back at the write node
       // for what would be attempt 3.
       const workspace = seedWorkspaceForRun(cwd, runId, join(home, "workspaces"));
-      // R15/KTD-11: resume reconciles the seeded checkpoint's `attempts.review:
-      // 2` against attempt commits actually present in the workspace — seed
-      // two real ones so that reconciliation (a concern orthogonal to what
-      // this test targets) sees a consistent history rather than refusing.
+      // R15/KTD-11/KTD-16: resume reconciles the seeded checkpoint's
+      // `attempts.review: 2` against the attempt-boundary events actually
+      // recorded in the trace — seed two real commits plus their boundary
+      // events so that reconciliation (a concern orthogonal to what this
+      // test targets) sees a consistent history rather than refusing.
       for (const n of [1, 2]) {
         writeFileSync(join(workspace.workspacePath, "seed.txt"), String(n));
         execFileSync("git", ["-C", workspace.workspacePath, "add", "-A"]);
         execFileSync("git", ["-C", workspace.workspacePath, "commit", "-q", "-m", `graph-bro: attempt ${n} (review)`]);
       }
       const db = openDb({ baseDir: home });
+      for (const n of [1, 2]) {
+        appendEvent(db, {
+          runId,
+          node: "review",
+          step: n,
+          payload: { type: ATTEMPT_BOUNDARY_EVENT_TYPE, nodeId: "review", attemptNumber: n, committed: true },
+        });
+      }
       createRun(db, runId, 999_999, topologyPath, workspace); // a dead owner pid, so resume self-heals
       writeCheckpoint(db, runId, {
         state: {},

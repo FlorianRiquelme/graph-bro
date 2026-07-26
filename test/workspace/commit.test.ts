@@ -3,7 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt, quiescenceWarningFor } from "../../src/workspace/commit.js";
+import {
+  ATTEMPT_BOUNDARY_EVENT_TYPE,
+  attemptBoundaryCounts,
+  commitAttempt,
+  partialAttemptRef,
+  preserveInterruptedAttempt,
+  quiescenceWarningFor,
+} from "../../src/workspace/commit.js";
+import type { EventRow } from "../../src/store/trace.js";
 import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
 
 /** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
@@ -458,6 +466,50 @@ describe("workspace/lifecycle: reattachToRunBranch (U8, KTD-9, real git)", () =>
     const adminDir = join(gitCommonDirAbs, "worktrees", "ws");
     const head = execFileSync("git", ["--git-dir", adminDir, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).trim();
     expect(head).toBe(`refs/heads/${runBranch}`);
+  });
+});
+
+/** A bare-bones `EventRow` for `attemptBoundaryCounts`, which only reads `payload` — the rest is filler to satisfy the type. */
+function boundaryEvent(nodeId: string, attemptNumber: number, committed: boolean, id = 1): EventRow {
+  return {
+    id,
+    runId: "run-x",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    node: nodeId,
+    payload: { type: ATTEMPT_BOUNDARY_EVENT_TYPE, nodeId, attemptNumber, committed },
+  };
+}
+
+describe("workspace/commit: attemptBoundaryCounts (U5/R6/KTD-16)", () => {
+  it("is empty for a run with no boundary events (no bounded node re-entered it)", () => {
+    expect(attemptBoundaryCounts([])).toEqual({});
+  });
+
+  it("counts an attempt whose commitAttempt returned committed: false the same as one that committed", () => {
+    const counts = attemptBoundaryCounts([boundaryEvent("review", 1, true, 1), boundaryEvent("review", 2, false, 2)]);
+    expect(counts).toEqual({ review: 2 });
+  });
+
+  it("takes the maximum attempt number per node across a run resumed more than once, not only the latest cycle", () => {
+    const events = [
+      boundaryEvent("review", 1, true, 1),
+      boundaryEvent("review", 2, false, 2),
+      // A resumed cycle's own boundary events start again from a lower
+      // number only if this were a distinct node — same node here, so its
+      // count only ever grows across cycles.
+      boundaryEvent("review", 3, true, 3),
+    ];
+    expect(attemptBoundaryCounts(events)).toEqual({ review: 3 });
+  });
+
+  it("ignores events of other payload shapes and tracks multiple nodes independently", () => {
+    const events: EventRow[] = [
+      { id: 1, runId: "run-x", createdAt: "2026-01-01T00:00:00.000Z", payload: { type: "node_start" } },
+      boundaryEvent("writer", 1, true, 2),
+      boundaryEvent("review", 1, true, 3),
+      boundaryEvent("writer", 2, true, 4),
+    ];
+    expect(attemptBoundaryCounts(events)).toEqual({ writer: 2, review: 1 });
   });
 });
 

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import type { EventRow } from "../store/trace.js";
 
 /**
  * Mirrors `lifecycle.ts`'s `defaultWorkspacesRoot` — graph-bro's own state
@@ -331,8 +332,8 @@ const ATTEMPT_COMMIT_PATTERN = /^graph-bro: attempt (\d+) \((.+)\)$/;
  * Walks the run's own history (never past `baseRefSha`, which is shared
  * consumer history, not this run's) and parses every `commitAttempt`/teardown
  * commit's `graph-bro: attempt N (nodeId)` message. Newest first (git log's
- * own order) — both `findLastCommittedAttempt` and `committedAttemptCounts`
- * read off this one walk rather than each parsing commit messages themselves.
+ * own order) — `findLastCommittedAttempt` reads off this one walk rather than
+ * parsing commit messages itself.
  */
 function parseAttemptCommits(target: WorkspaceGitTarget, baseRefSha: string): AttemptCommitInfo[] {
   const log = runWorkspaceGit(target, ["log", "--format=%H %s", `${baseRefSha}..HEAD`]);
@@ -363,26 +364,44 @@ function findLastCommittedAttempt(target: WorkspaceGitTarget, baseRefSha: string
 }
 
 /**
- * R15/KTD-11: nodeId -> the highest attempt number actually committed to the
- * workspace's history, for reconciling against a resumed checkpoint's own
- * per-node attempt counts. A resumed checkpoint can *promise* more attempts
- * than git actually holds — a kill between the checkpoint write and the
- * attempt commit that was about to fold the prior round's edits, discarded by
+ * KTD-16: the trace payload `type` an attempt-boundary event carries — one
+ * appended by `withAttemptCommit` every time it fires, strictly after
+ * `commitAttempt` returns (never at the counter increment that precedes it).
+ * Carries `committed: false` when that call folded no diff, which a
+ * commit-message parse (this event type replaces as resume's reconciliation
+ * signal) cannot represent — an attempt that changed nothing creates no
+ * commit at all.
+ */
+export const ATTEMPT_BOUNDARY_EVENT_TYPE = "attempt_boundary";
+
+export interface AttemptBoundaryPayload {
+  type: typeof ATTEMPT_BOUNDARY_EVENT_TYPE;
+  nodeId: string;
+  attemptNumber: number;
+  committed: boolean;
+}
+
+/**
+ * U5/R15/KTD-11/KTD-16: nodeId -> the highest attempt number recorded in the
+ * run's own durable trace, for reconciling against a resumed checkpoint's own
+ * per-node attempt counts. This is the *maximum over every matching event*,
+ * not the first (unlike `findRecordedManifest` in `integrity.ts`, whose
+ * shape this mirrors): a run resumed more than once must reconcile against
+ * its whole boundary history, not only the latest cycle's. A resumed
+ * checkpoint can still *promise* more attempts than any boundary event
+ * recorded — a kill between the counter's own increment and the
+ * `commitAttempt` call that boundary event is appended after, discarded by
  * `preserveInterruptedAttempt`'s hard reset — and that gap is exactly what
  * `resume` must refuse loudly on rather than silently re-enter the bounded
  * node against a workspace that no longer reflects what the checkpoint
- * claims. Extends `parseAttemptCommits` rather than a second parser of the
- * commit message shape.
+ * claims.
  */
-export function committedAttemptCounts(
-  consumerRepoPath: string,
-  workspacePath: string,
-  baseRefSha: string,
-): Record<string, number> {
-  const target = resolveWorkspaceGitTarget(consumerRepoPath, workspacePath);
+export function attemptBoundaryCounts(events: EventRow[]): Record<string, number> {
   const counts: Record<string, number> = {};
-  for (const commit of parseAttemptCommits(target, baseRefSha)) {
-    if ((counts[commit.nodeId] ?? 0) < commit.attemptNumber) counts[commit.nodeId] = commit.attemptNumber;
+  for (const event of events) {
+    const payload = event.payload as Partial<AttemptBoundaryPayload> | undefined;
+    if (payload?.type !== ATTEMPT_BOUNDARY_EVENT_TYPE || !payload.nodeId || payload.attemptNumber === undefined) continue;
+    if ((counts[payload.nodeId] ?? 0) < payload.attemptNumber) counts[payload.nodeId] = payload.attemptNumber;
   }
   return counts;
 }

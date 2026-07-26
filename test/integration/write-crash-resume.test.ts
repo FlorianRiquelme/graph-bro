@@ -6,12 +6,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDb } from "../../src/store/db.js";
 import { readLatestCheckpoint, writeCheckpoint } from "../../src/store/checkpoints.js";
-import { partialAttemptRef } from "../../src/workspace/commit.js";
+import { listEvents } from "../../src/store/trace.js";
+import { ATTEMPT_BOUNDARY_EVENT_TYPE, partialAttemptRef } from "../../src/workspace/commit.js";
 import { gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const FAKE_CLAUDE_WRITE_THEN_HANG = join(FIXTURES_DIR, "fake-claude-write-then-hang.mjs");
 const FAKE_CLAUDE_FIX_REVIEW = join(FIXTURES_DIR, "fake-claude-fix-review.mjs");
+const FAKE_CLAUDE_STATIC_REVIEW_HANG = join(FIXTURES_DIR, "fake-claude-static-review-hang.mjs");
 
 function writeTopology(cwd: string, topology: unknown): string {
   const path = join(cwd, "topology.json");
@@ -242,6 +244,136 @@ describe("integration/write-crash-resume: a killed write run resumes from its la
       verifyDb.close();
     }
   }, 15_000);
+
+  /** Waits for the review fake CLI's own invocation counter (persisted under `counterDir`) to reach `count` — proof that the bounded node's `withAttemptCommit` hook (and its boundary-event append) already ran for that attempt, since the hook fires strictly before the node's own process is ever spawned. */
+  function waitForReviewInvocation(count: number): Promise<void> {
+    return waitFor(() => {
+      try {
+        return Number(readFileSync(join(counterDir, "fake-claude-review-count"), "utf8")) >= count;
+      } catch {
+        return false;
+      }
+    }, 5000);
+  }
+
+  function boundaryEventsFor(runId: string, nodeId: string): { attemptNumber: number; committed: boolean }[] {
+    const db = openDb({ baseDir: home });
+    try {
+      return listEvents(db, runId)
+        .map((event) => event.payload as { type?: string; nodeId?: string; attemptNumber?: number; committed?: boolean })
+        .filter((payload) => payload?.type === ATTEMPT_BOUNDARY_EVENT_TYPE && payload.nodeId === nodeId)
+        .map((payload) => ({ attemptNumber: payload.attemptNumber!, committed: payload.committed! }));
+    } finally {
+      db.close();
+    }
+  }
+
+  it("Covers U5/R6/KTD-16: a bounded node whose attempt commits nothing (no diff to fold) still resumes cleanly, reconciling against the trace rather than git's commit messages", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+    const baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+
+    // FAKE_CLAUDE_STATIC_REVIEW_HANG's write half emits byte-identical content
+    // every attempt (unlike fake-claude-fix-review.mjs's counter-suffixed
+    // one) — so `review`'s SECOND boundary hook, folding writer's second
+    // (identical) write, finds nothing to commit. Its review half hangs on
+    // its second invocation, standing in for "review is still working" right
+    // after that diff-free boundary commit already landed.
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG), FAKE_CLAUDE_HANG_ON_ATTEMPT: "2", FAKE_CLAUDE_PASS_ON_ATTEMPT: "3" },
+    });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForReviewInvocation(2);
+
+    const statusJson = JSON.parse(runCliSync(["status", runId], { cwd, env: baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG) }).stdout);
+    process.kill(statusJson.ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(statusJson.ownerPid), 3000);
+
+    // The boundary trace already shows both attempts, the second with no commit.
+    const boundaryEvents = boundaryEventsFor(runId, "review");
+    expect(boundaryEvents).toEqual([
+      { attemptNumber: 1, committed: true },
+      { attemptNumber: 2, committed: false },
+    ]);
+
+    const runBranch = `graph-bro/run-${runId}`;
+    const commitsBeforeResume = execFileSync("git", ["rev-list", "--count", `${baseRef}..${runBranch}`], { cwd, encoding: "utf8" }).trim();
+    expect(commitsBeforeResume).toBe("1"); // only attempt 1's diff ever landed a commit
+
+    const resume = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "3" },
+    });
+    expect(resume.status).toBe(0);
+
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    // Resumed cleanly rather than refusing on an attempt-count mismatch —
+    // the reconciliation read the boundary event for attempt 2, not git's
+    // (empty) commit history for it.
+    const db = openDb({ baseDir: home });
+    try {
+      const errorEvents = listEvents(db, runId).filter((event) => (event.payload as { type?: string })?.type === "run_error");
+      expect(errorEvents).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  }, 20_000);
+
+  it("Covers U5/R6: a run resumed twice, whose middle cycle committed nothing, still reconciles against the full boundary-event history", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
+
+    const start = runCliSync(["start", topologyPath], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG), FAKE_CLAUDE_HANG_ON_ATTEMPT: "2", FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    const runId = start.stdout.trim();
+    await waitForReviewInvocation(2);
+    const status1 = JSON.parse(runCliSync(["status", runId], { cwd, env: baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG) }).stdout);
+    process.kill(status1.ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(status1.ownerPid), 3000);
+
+    // First resume: re-enters at review's attempt 3 (still no diff since
+    // writer's content is still static), hangs on invocation 3, killed again.
+    const resume1 = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG), FAKE_CLAUDE_HANG_ON_ATTEMPT: "3", FAKE_CLAUDE_PASS_ON_ATTEMPT: "99" },
+    });
+    expect(resume1.status).toBe(0);
+    await waitForReviewInvocation(3);
+    const status2 = JSON.parse(runCliSync(["status", runId], { cwd, env: baseEnv(FAKE_CLAUDE_STATIC_REVIEW_HANG) }).stdout);
+    process.kill(status2.ownerPid, "SIGKILL");
+    await waitFor(() => !isAlive(status2.ownerPid), 3000);
+
+    // Both cycles' boundary events are present, both attempts 2 and 3 diff-free.
+    const boundaryEvents = boundaryEventsFor(runId, "review");
+    expect(boundaryEvents).toEqual([
+      { attemptNumber: 1, committed: true },
+      { attemptNumber: 2, committed: false },
+      { attemptNumber: 3, committed: false },
+    ]);
+
+    // Second resume: switches to a normal-completing binary and converges.
+    const resume2 = runCliSync(["resume", runId], {
+      cwd,
+      env: { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "4" },
+    });
+    expect(resume2.status).toBe(0);
+    await waitForRunStatus(home, runId, "completed", 10_000);
+
+    // Neither resume refused on a mismatch — the reconciliation reads the
+    // trace's whole history (the maximum per node across both cycles), not
+    // only the latest cycle's boundary events.
+    const db = openDb({ baseDir: home });
+    try {
+      const errorEvents = listEvents(db, runId).filter((event) => (event.payload as { type?: string })?.type === "run_error");
+      expect(errorEvents).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  }, 25_000);
 
   it("resuming a run whose workspace was removed by hand fails with a clear message, rather than re-running from scratch", async () => {
     const topologyPath = writeTopology(cwd, fixReviewLoopTopology(5));
