@@ -8,7 +8,7 @@ import { openDb } from "../../src/store/db.js";
 import { readLatestCheckpoint, writeCheckpoint } from "../../src/store/checkpoints.js";
 import { listEvents } from "../../src/store/trace.js";
 import { ATTEMPT_BOUNDARY_EVENT_TYPE, partialAttemptRef } from "../../src/workspace/commit.js";
-import { gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
+import { createGitShim, gitRepo, isAlive, runCliSync, waitFor, waitForRunStatus } from "../fixtures/cli-harness.js";
 
 const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const FAKE_CLAUDE_WRITE_THEN_HANG = join(FIXTURES_DIR, "fake-claude-write-then-hang.mjs");
@@ -244,6 +244,73 @@ describe("integration/write-crash-resume: a killed write run resumes from its la
       verifyDb.close();
     }
   }, 15_000);
+
+  it("Covers U5/KTD-16: a bounded node's checkpoint runs ahead of its trace when its attempt commit itself fails mid-boundary, and resume refuses on the gap rather than silently re-entering", async () => {
+    const topologyPath = writeTopology(cwd, fixReviewLoopTopology(2));
+
+    // Targets the exact `commit -m` call `withAttemptCommit` makes for
+    // review's SECOND activation only: never its first (a real boundary
+    // event 1 must land first, so this is a gap, not an empty trace), and
+    // never `commitFinalAttempt`'s own teardown commit (a distinct trailing
+    // message, "... (run-teardown)") — matching on the full commit message,
+    // not just the subcommand, is what pins the interception to this one
+    // boundary rather than some other `commit -m` in the same run.
+    const shim = createGitShim({
+      match: ["commit", "-m", "graph-bro: attempt 2 (review)"],
+      stderr: "simulated failure inside the attempt-commit boundary\n",
+      times: 1,
+    });
+
+    try {
+      const env = { ...baseEnv(FAKE_CLAUDE_FIX_REVIEW), FAKE_CLAUDE_PASS_ON_ATTEMPT: "99", PATH: `${shim.dir}:${process.env.PATH}` };
+
+      const start = runCliSync(["start", topologyPath], { cwd, env });
+      const runId = start.stdout.trim();
+      expect(runId).not.toBe("");
+
+      // engine/loop.ts advances its own attempt counter and checkpoints the
+      // frontier BEFORE dispatch, so the checkpoint already claims attempt 2
+      // by the time `withAttemptCommit`'s `commitAttempt` call dies on the
+      // shimmed `commit`. The thrown error propagates as this activation's
+      // own failure (`runBoundedPool`'s per-task rejection), so the run ends
+      // "failed" on its own — no SIGKILL needed to reach this window.
+      await waitForRunStatus(home, runId, "failed", 10_000);
+
+      const db = openDb({ baseDir: home });
+      const checkpoint = readLatestCheckpoint(db, runId)!;
+      db.close();
+      expect(checkpoint.attempts?.review).toBe(2); // the checkpoint already claims attempt 2...
+
+      const boundaryEventsBeforeResume = boundaryEventsFor(runId, "review");
+      expect(boundaryEventsBeforeResume).toEqual([{ attemptNumber: 1, committed: true }]); // ...but the trace only ever recorded attempt 1 — the append for 2 never ran
+
+      const resume = runCliSync(["resume", runId], { cwd, env });
+      expect(resume.status).toBe(0); // `resume` itself only spawns the engine — the refusal is inside it
+
+      await waitForRunStatus(home, runId, "failed", 5000);
+
+      const verifyDb = openDb({ baseDir: home });
+      try {
+        const row = verifyDb.prepare("select payload from events where run_id = ? order by id desc limit 1").get(runId) as
+          | { payload: string }
+          | undefined;
+        expect(row).toBeDefined();
+        const payload = JSON.parse(row!.payload);
+        expect(payload.error).toMatch(/attempt-count mismatch/);
+        expect(payload.error).toMatch(/'review'/);
+        expect(payload.error).toMatch(/checkpoint records 2 attempt/);
+        expect(payload.error).toMatch(/1 recorded in the trace/);
+      } finally {
+        verifyDb.close();
+      }
+
+      // Not silently advanced: no new boundary event for attempt 2 appeared —
+      // resume refused before ever re-entering the bounded node.
+      expect(boundaryEventsFor(runId, "review")).toEqual([{ attemptNumber: 1, committed: true }]);
+    } finally {
+      shim.cleanup();
+    }
+  }, 20_000);
 
   /** Waits for the review fake CLI's own invocation counter (persisted under `counterDir`) to reach `count` — proof that the bounded node's `withAttemptCommit` hook (and its boundary-event append) already ran for that attempt, since the hook fires strictly before the node's own process is ever spawned. */
   function waitForReviewInvocation(count: number): Promise<void> {
