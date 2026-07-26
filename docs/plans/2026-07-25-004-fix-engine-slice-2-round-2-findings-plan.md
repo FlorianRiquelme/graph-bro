@@ -13,7 +13,7 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** close the twelve round-2 review findings against `bb6fba1..aa277ce`, plus six residual risks promoted to defects, so PR #15 describes work whose shipped controls actually cover what they claim.
+- **Objective:** close the twelve round-2 review findings against `bb6fba1..aa277ce`, plus six residual risks and one containment gap promoted to defects, so PR #15 describes work whose shipped controls actually cover what they claim.
 - **Authority hierarchy:** this plan > the findings doc (`docs/plans/2026-07-25-003-engine-slice-2-round-2-review-findings.md`) > the slice-2 fix plan (`docs/plans/2026-07-25-002-fix-engine-slice-2-review-findings-plan.md`). KTD-1 through KTD-14 in the slice-2 fix plan are settled and are not reopened by this plan; where a unit sharpens one, it cites it.
 - **Execution profile:** every finding is latent — `npm test` is green (36 files, 376 passed, 11 skipped) and CI is green. There is no red to chase, so each unit starts by making its own red. A test that passes before the fix has not reproduced the finding.
 - **Stop conditions:** U1's probe outcome decides U3's and U4's shape; do not implement either before the probe has run. Surface a blocker rather than guessing if the probe shows a third behavior neither arm anticipates.
@@ -39,6 +39,8 @@ Nothing here is broken at the gate. Every finding is latent, which is why the te
 
 ### Requirements
 
+R-IDs here are plan-local and do not correspond to the R-IDs in the source comments, which are inherited from the slice-2 plan. The code's `R8`, `R21`, and others mean different things than this plan's; cite by the text, not the number, when writing a commit message.
+
 **Backstop coverage**
 
 - R1. The integrity manifest sees a symlink placed anywhere under the tracked configuration surface.
@@ -46,6 +48,7 @@ Nothing here is broken at the gate. Every finding is latent, which is why the te
 - R3. The read-only backstop's porcelain read sees writes to paths the engine's commit path excludes.
 - R4. The tracked configuration surface is known to be compatible with a real `claude` invocation against a workspace.
 - R5. The engine's excludes pin does not silently drop the operator's own global exclude rules from attempt commits.
+- R21. A detected tamper is not folded into the run branch by the teardown commit.
 
 **Resume and commit correctness**
 
@@ -159,7 +162,7 @@ U5 replaces the git-log parse with a per-boundary trace event written after the 
 
 ### Sequencing
 
-U1 first and alone — its outcome is an input to U3 and U4. U5 and U6 next: both reject or endanger correct runs today and neither depends on the probe. U2, U3, U4 then land as the backstop-coverage group. The remaining units are independent of each other and can land in any order, though U13's hermetic-git change touches the suite's setup and is easier to land before the units that add tests.
+U1 first and alone — its outcome is an input to U3 and U4. U5 and U6 next: both reject or endanger correct runs today and neither depends on the probe. U2, U3, U4, U16 then land as the backstop-coverage group, with U16 after U3 since both edit the terminal block and U16 closes the containment half of the coverage U3 widens. The remaining units are independent of each other and can land in any order, though U13's hermetic-git change touches the suite's setup and is easier to land before the units that add tests.
 
 ### Risks and Dependencies
 
@@ -181,7 +184,6 @@ U1 first and alone — its outcome is an input to U3 and U4. U5 and U6 next: bot
 
 Both defect questions below were found while reviewing this plan, not by the round-2 review. Neither blocks implementation, and neither is in the scope this plan was confirmed against — so each is recorded as a decision rather than silently promoted to a unit.
 
-- **The final attempt commit folds a planted file even when the terminal assertion already failed — deferred, but this one undercuts U3.** The terminal block asserts integrity, sets the run failed, and then commits the final attempt unconditionally, so the operator's handback artifact carries agent-authored CLI config on a *detected* tamper. Skipping that commit when the assertion failed is roughly a one-line fix, and it is the same defect class this plan owns: a control that detects but does not contain. Candidate sixteenth unit if you want it in this set.
 - **Two read-only nodes can share a frontier, and the violation names the innocent one — deferred.** The runtime single-track assertion fires only when the frontier holds a write-capable activation, but an empty sandbox write scope still permits writes to the node's own cwd. So one read-only node's plant trips the *other* node's cleanliness assertion, which names itself. U4's widened porcelain read extends that misattribution to `.claude` paths. The existing concurrent-write error already names every agent node sharing the frontier; the read-only violation could do the same.
 - **Cross-model adversarial second opinion before merge — deferred, needs a decision before PR #15 merges.** The round-2 adversarial lens ran in-process, and this plan's own review was in-process too, so the independent-model perspective is still missing. Re-running that lens against a peer provider egresses repo code, and note the scope question: this plan and the findings doc quote source paths, control internals, and exact bypass conditions, so the planning corpus is a larger exposure than the diff alone. Not a planning blocker; it gates the merge.
 
@@ -208,6 +210,7 @@ Both defect questions below were found while reviewing this plan, not by the rou
 | U13 | Unit suite stops writing to the operator's home | `test/setup/hermetic-git.ts` | — |
 | U14 | Regression test for resume's pre-terminal status write | `test/cli/cli.test.ts` | — |
 | U15 | CI proves the sandbox functions; doc corrections | `.github/workflows/`, `docs/adr/0012-sandbox-enforced-write-isolation.md` | — |
+| U16 | Detected tamper is not committed to the run branch | `src/runtime/run.ts` | U3 |
 
 ---
 
@@ -294,6 +297,24 @@ Both defect questions below were found while reviewing this plan, not by the rou
   - With a real global `core.excludesFile` containing `/.claude/` — overriding the hermetic default, so the test exercises production resolution — a planted `.claude/settings.local.json` still appears in porcelain.
   - The unpinned fallback for callers with no consumer repo is unchanged.
 - **Verification:** the planted-config case is caught, and the attempt-commit path's behavior is byte-identical to before.
+
+### U16. Detected tamper is not committed to the run branch
+
+- **Goal:** a run whose terminal integrity assertion failed does not fold the tampered workspace into the run branch.
+- **Requirements:** R21
+- **Dependencies:** U3 — U16 closes the containment half of the coverage U3 widens, and both edit the same terminal block.
+- **Files:** `src/runtime/run.ts`, `test/integration/workspace-isolation.test.ts`
+- **Approach:** the terminal block already asserts *before* `commitFinalAttempt`, deliberately, so that a violation names a node rather than the teardown commit. But it catches the violation into `status = "failed"` and then commits unconditionally, so the planted file still lands on the run branch — the branch is the handback artifact, so a detected tamper ships in it. Skip `commitFinalAttempt` when the terminal assertion failed, and trace why it was skipped.
+- **The boundary hook is the shape to match.** There the assertion throws and the commit below it never runs, so the boundary path already contains the tamper. Only the terminal path swallows the error to keep writing a status, which is correct for the status and wrong for the commit. This unit makes the two paths agree.
+- **The withheld work is not lost.** A `failed` run keeps its workspace, so the last uncommitted attempt stays on disk for inspection. Earlier attempt commits remain on the branch and are not retroactively removable — each was asserted before its own fold, so this is the right scope: stop adding to history, don't try to rewrite it.
+- **Patterns to follow:** the existing isolation convention in the same block — a skipped or failed teardown step adds a trace event and never revisits the status this process already decided.
+- **Test scenarios:**
+  - Covers R21. A run whose last node plants `.mcp.json` ends `failed` and the run branch has no commit containing the planted file. Fails before the fix.
+  - The trace records both the violation naming the node and the reason the final commit was skipped.
+  - A clean run still commits its final attempt exactly as today — the skip is conditional, and this is the regression to guard.
+  - A terminal assertion failure still writes the `failed` status and still disposes per the halted-run convention, keeping the workspace.
+  - A run whose teardown commit fails for an unrelated reason (not tamper) still traces the error and still writes its status, unchanged.
+- **Verification:** on a detected tamper the run branch's tip is the last asserted-clean attempt commit, and the workspace holding the tamper is retained.
 
 ---
 
@@ -509,7 +530,7 @@ Per-unit reproduction is the binding gate: each unit's first test must fail befo
 
 **Global**
 
-- All 20 requirements are met or explicitly deferred in Scope Boundaries.
+- All 21 requirements are met or explicitly deferred in Scope Boundaries.
 - `npm run build` and `npm test` are green, and CI is green on PR #15.
 - No unit's test passes against its own unfixed code.
 - The five deferred residual risks are filed as issues, each naming the file and the reading that makes it a risk. Issue #17 is already tracked and needs no new filing.
@@ -536,3 +557,4 @@ Per-unit reproduction is the binding gate: each unit's first test must fail befo
 | U13 | The suite leaves the real home directory untouched. |
 | U14 | Removing resume's status write turns a test red. |
 | U15 | The `bwrap` probe gates CI; both documents state the corrected facts. |
+| U16 | A detected tamper leaves no commit containing it on the run branch. |
