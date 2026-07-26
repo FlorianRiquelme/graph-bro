@@ -627,11 +627,13 @@ async function main(): Promise<void> {
     // whatever status the loop decided — unlike the isolated failures below,
     // this is a genuine tamper, not a teardown mechanic, so R8 wins over
     // "never downgrade" here.
+    let integrityViolated = false;
     try {
       assertWorkspaceIntegrity(workspacePath, integrityManifest, "run-teardown");
     } catch (err) {
       appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
       status = "failed";
+      integrityViolated = true;
     }
 
     // R21/U7: every terminal path commits whatever attempt is left, even one
@@ -642,10 +644,22 @@ async function main(): Promise<void> {
     // the historical bug re-ran this same call from a second, now-removed
     // catch branch, and a second throw there left the run's status unwritten
     // forever.
-    try {
-      commitFinalAttempt(consumerRepoPath, workspacePath, commitAttemptCounts, headState, db, runId);
-    } catch (err) {
-      appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+    //
+    // U16: skipped entirely when the assertion just above tripped — the run
+    // branch is the handback artifact, so folding a detected tamper into it
+    // here would ship exactly what the assertion exists to withhold. The
+    // withheld attempt isn't lost: a `failed` run keeps its workspace
+    // (`disposeWorkspace` below), and every earlier attempt already landed
+    // via its own boundary-checked commit, so history before this point is
+    // untouched.
+    if (integrityViolated) {
+      appendEvent(db, { runId, payload: { type: "run_error", error: "run-teardown commit skipped: workspace integrity violation detected" } });
+    } else {
+      try {
+        commitFinalAttempt(consumerRepoPath, workspacePath, commitAttemptCounts, headState, db, runId);
+      } catch (err) {
+        appendEvent(db, { runId, payload: { type: "run_error", error: err instanceof Error ? err.message : String(err) } });
+      }
     }
 
     // R11: the status write is unconditional from here — decided above by

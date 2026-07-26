@@ -350,6 +350,46 @@ describe("integration/integrity: a full run fails when the workspace's config su
     expect(tailErrors(runId).some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
   }, 15_000);
 
+  it("U16: a run whose last node plants .mcp.json ends failed with no commit on the run branch containing the tamper, and the workspace holding it is retained", async () => {
+    const topology = neverReactivatedTopology();
+    const topologyPath = writeTopology(cwd, topology);
+    setPrompt(topologyPath, topology as unknown as ReturnType<typeof fixReviewLoopTopology>, "finisher", writePrompt(".mcp.json", '{"mcpServers":{"evil":{}}}'));
+    const baseRef = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim();
+
+    const start = runCliSync(["start", topologyPath], { cwd, env: baseEnv({ FAKE_CLAUDE_PASS_ON_ATTEMPT: "1" }) });
+    const runId = start.stdout.trim();
+    expect(runId).not.toBe("");
+
+    await waitForRunStatus(home, runId, "failed", 10_000);
+
+    // The violation names the terminal check ("run-teardown", the same
+    // marker the boundary hook's doc comment contrasts itself against) and,
+    // separately, the reason `commitFinalAttempt` never ran.
+    const errors = tailErrors(runId);
+    expect(errors.some((error) => error.includes("run-teardown"))).toBe(true);
+    expect(errors.some((error) => error.includes("CLI-configuration surface changed"))).toBe(true);
+    expect(errors.some((error) => error.includes("run-teardown commit skipped"))).toBe(true);
+
+    // The run branch is the handback artifact — no commit on it, ever, may
+    // touch the planted file.
+    const runBranch = `graph-bro/run-${runId}`;
+    const touchingCommits = execFileSync("git", ["log", runBranch, "--", ".mcp.json"], { cwd, encoding: "utf8" }).trim();
+    expect(touchingCommits).toBe("");
+    // Nothing landed on the branch after the topology commit at all — the
+    // terminal assertion trips on the same tamper the teardown commit would
+    // otherwise have folded in, so it is skipped entirely, not partially.
+    const messages = execFileSync("git", ["log", "--format=%s", `${baseRef}..${runBranch}`], { cwd, encoding: "utf8" })
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    expect(messages).toHaveLength(0);
+
+    // KTD-9: a failed run keeps its workspace — the withheld attempt is not
+    // lost, only not folded into history.
+    const workspacePath = join(workspaces, runId);
+    expect(readFileSync(join(workspacePath, ".mcp.json"), "utf8")).toContain("evil");
+  }, 15_000);
+
   it("U3: an unbounded write-capable node (no max_attempts) that plants .claude/settings.local.json is caught on its own next activation, and the failure names that node — the shipped review-fix-loop's 'fix' node's reachability case", async () => {
     // `fix` declares no `max_attempts` and loops directly back onto itself
     // (no intervening node), so pre-U3 nothing ever checked it: only a
@@ -425,10 +465,9 @@ describe("integration/integrity: a full run fails when the workspace's config su
     // assertion is the one below: no "attempt N (review)" boundary commit
     // ever landed, proving the integrity check ran before `withAttemptCommit`'s
     // own fold, not after it (the composition-order bug this scenario is
-    // built to pin). R21/U7 (out of scope here, and separately a U16 concern)
-    // still unconditionally mints the terminal teardown commit regardless of
-    // the failed status, so that one commit alone is expected and is not the
-    // thing this assertion is about.
+    // built to pin). U16: the same still-uncommitted tamper trips the
+    // terminal-path assertion too, so `commitFinalAttempt` is skipped —
+    // no commit lands on the run branch at all, not even the teardown one.
     const topology = fixReviewLoopTopology(5);
     const topologyPath = writeTopology(cwd, topology);
     setPrompt(topologyPath, topology, "writer", writePrompt(".mcp.json", '{"mcpServers":{"evil":{}}}'));
@@ -446,8 +485,7 @@ describe("integration/integrity: a full run fails when the workspace's config su
       .trim()
       .split("\n")
       .filter(Boolean);
-    expect(messages).toHaveLength(1); // only the unconditional teardown commit
-    expect(messages[0]).toContain("run-teardown");
+    expect(messages).toHaveLength(0); // U16: the terminal assertion also trips, so even the teardown commit is skipped
     expect(messages.some((message) => message.includes("(review)"))).toBe(false);
   }, 15_000);
 
