@@ -71,6 +71,22 @@ export interface WorkspaceGitTarget {
   workTree: string;
 }
 
+export interface RunWorkspaceGitOptions {
+  /**
+   * U4: `capturePorcelain` (the read-only backstop's porcelain read) needs the
+   * *opposite* of every other caller — it must see a write under `.claude`,
+   * since that is precisely what a read-only node planting
+   * `.claude/settings.local.json` looks like. Pinning the excludes file to
+   * `/dev/null` (not just omitting the `-c`) is deliberate: omitting it hands
+   * resolution back to the operator's own `core.excludesFile` (or git's XDG
+   * `~/.config/git/ignore` fallback when that is unset), either of which can
+   * independently make the same path invisible on the operator's machine —
+   * measured, not theoretical, against a real `core.excludesFile` (see U4).
+   * Defaults to `true` so `add`/`commit`/every other caller is unaffected.
+   */
+  honourExcludes?: boolean;
+}
+
 /**
  * KTD-6: the one helper every engine git invocation against a workspace goes
  * through. `--git-dir`/`--work-tree` are pinned to a target resolved by
@@ -87,9 +103,12 @@ export interface WorkspaceGitTarget {
  * the way hooks/filters can. `core.excludesFile` pins a graph-bro-owned
  * excludes file (U5/R10) so the CLI's scratch directory stays out of every
  * attempt commit without ever writing anything inside the workspace or the
- * consumer's shared `.git/info/exclude`.
+ * consumer's shared `.git/info/exclude`. `options.honourExcludes` (U4)
+ * overrides that pin to `/dev/null` for the one caller that needs excludes
+ * neutralized rather than applied — see the option's own doc comment.
  */
-export function runWorkspaceGit(target: WorkspaceGitTarget, args: string[]): string {
+export function runWorkspaceGit(target: WorkspaceGitTarget, args: string[], options: RunWorkspaceGitOptions = {}): string {
+  const { honourExcludes = true } = options;
   return execFileSync(
     "git",
     [
@@ -106,7 +125,7 @@ export function runWorkspaceGit(target: WorkspaceGitTarget, args: string[]): str
       "-c",
       "tag.gpgsign=false",
       "-c",
-      `core.excludesFile=${resolveExcludesFilePath()}`,
+      `core.excludesFile=${honourExcludes ? resolveExcludesFilePath() : "/dev/null"}`,
       ...args,
     ],
     { encoding: "utf8", stdio: GIT_STDIO },
