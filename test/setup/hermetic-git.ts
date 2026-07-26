@@ -25,8 +25,26 @@
  * `GIT_CONFIG_COUNT`/`KEY`/`VALUE` inject the setting with `-c` precedence,
  * which is the only way to force the fallback off as well.
  */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 process.env.GIT_CONFIG_SYSTEM = "/dev/null";
 process.env.GIT_CONFIG_COUNT = "1";
 process.env.GIT_CONFIG_KEY_0 = "core.excludesFile";
 process.env.GIT_CONFIG_VALUE_0 = "/dev/null";
+
+/**
+ * R17: `commit.ts`'s `resolveExcludesFilePath` falls back to
+ * `~/.graph-bro-workspaces/.git-excludes` whenever `GRAPH_BRO_WORKSPACES` is
+ * unset. The CLI-subprocess tests already set it themselves per test, but
+ * any in-process unit test that calls `commitAttempt` directly — no spawned
+ * CLI in between — never sets it at all, so every such test wrote straight
+ * into the operator's real home directory. Set here, at setup-file scope,
+ * for the same reason as the git config above: it needs to be in place
+ * before the very first resolution in the process, and it must cover every
+ * test file, not just the ones that happen to spawn a CLI subprocess of
+ * their own.
+ */
+process.env.GRAPH_BRO_WORKSPACES = mkdtempSync(join(tmpdir(), "graph-bro-unit-workspaces-"));

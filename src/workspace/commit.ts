@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -28,13 +28,28 @@ function defaultWorkspacesRoot(): string {
  * reading-then-appending; memoized per process since every engine git call
  * needs it.
  */
+const EXCLUDES_CONTENT = "/.claude/\n";
+
 let excludesFilePath: string | undefined;
-function resolveExcludesFilePath(): string {
+export function resolveExcludesFilePath(): string {
   if (excludesFilePath) return excludesFilePath;
   const root = defaultWorkspacesRoot();
   mkdirSync(root, { recursive: true });
   const path = join(root, ".git-excludes");
-  writeFileSync(path, "/.claude/\n");
+  // Conditional (R17): a fresh process (a new engine invocation, a fresh
+  // test module) has no in-memory cache, so this line runs again on every
+  // such process's very first git call — skip the write entirely once the
+  // file already holds the right content, rather than rewriting a static
+  // file on every single one of them. Atomic: written to a sibling temp file
+  // and renamed into place rather than truncated in place, so a concurrent
+  // reader (another process's `git` invocation reading `-c
+  // core.excludesFile=<path>` at the same moment) can never observe a
+  // partially-written file.
+  if (!existsSync(path) || readFileSync(path, "utf8") !== EXCLUDES_CONTENT) {
+    const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    writeFileSync(tmpPath, EXCLUDES_CONTENT);
+    renameSync(tmpPath, path);
+  }
   excludesFilePath = path;
   return path;
 }

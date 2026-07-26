@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commitAttempt, partialAttemptRef, preserveInterruptedAttempt, quiescenceWarningFor } from "../../src/workspace/commit.js";
 import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
 
@@ -458,5 +458,87 @@ describe("workspace/lifecycle: reattachToRunBranch (U8, KTD-9, real git)", () =>
     const adminDir = join(gitCommonDirAbs, "worktrees", "ws");
     const head = execFileSync("git", ["--git-dir", adminDir, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).trim();
     expect(head).toBe(`refs/heads/${runBranch}`);
+  });
+});
+
+describe("workspace/commit: resolveExcludesFilePath (U13, R17)", () => {
+  it("Covers R17: resolves under GRAPH_BRO_WORKSPACES (set by the hermetic setup file), never the operator's real home directory", async () => {
+    // No per-test override here, deliberately: this exercises exactly what
+    // every other in-process test in this file already relies on —
+    // test/setup/hermetic-git.ts's setupFiles-scope GRAPH_BRO_WORKSPACES. If
+    // that redirect regresses, this is what goes red.
+    const { resolveExcludesFilePath } = await import("../../src/workspace/commit.js");
+    const path = resolveExcludesFilePath();
+
+    expect(process.env.GRAPH_BRO_WORKSPACES).toBeTruthy();
+    expect(path.startsWith(process.env.GRAPH_BRO_WORKSPACES as string)).toBe(true);
+    expect(path.startsWith(homedir())).toBe(false);
+  });
+
+  describe("against a scratch GRAPH_BRO_WORKSPACES (isolated from the shared hermetic one)", () => {
+    let scratchRoot: string;
+    let priorWorkspaces: string | undefined;
+
+    beforeEach(() => {
+      scratchRoot = mkdtempSync(join(tmpdir(), "graph-bro-excludes-test-"));
+      priorWorkspaces = process.env.GRAPH_BRO_WORKSPACES;
+      process.env.GRAPH_BRO_WORKSPACES = scratchRoot;
+    });
+
+    afterEach(() => {
+      process.env.GRAPH_BRO_WORKSPACES = priorWorkspaces;
+      rmSync(scratchRoot, { recursive: true, force: true });
+    });
+
+    it("resolving twice — once per fresh module instance, mirroring two separate process invocations — writes the excludes file only once", async () => {
+      vi.resetModules();
+      const first = await import("../../src/workspace/commit.js");
+      const path = first.resolveExcludesFilePath();
+      const mtimeAfterFirst = statSync(path).mtimeMs;
+
+      vi.resetModules();
+      const second = await import("../../src/workspace/commit.js");
+      const resolvedAgain = second.resolveExcludesFilePath();
+      const mtimeAfterSecond = statSync(resolvedAgain).mtimeMs;
+
+      expect(resolvedAgain).toBe(path);
+      expect(mtimeAfterSecond).toBe(mtimeAfterFirst); // content already matched — no rewrite
+      expect(readFileSync(path, "utf8")).toBe("/.claude/\n");
+    });
+
+    it("the write is atomic: the destination path is never truncated in place, only published via rename from a sibling temp file", async () => {
+      vi.resetModules();
+      // node:fs's named exports are non-configurable in vitest's ESM
+      // interop, so `vi.spyOn` on the imported namespace can't redefine
+      // them — `vi.doMock` swaps the module itself before `commit.js`'s own
+      // import binds to it.
+      const writeFileSync = vi.fn<typeof import("node:fs").writeFileSync>();
+      const renameSync = vi.fn<typeof import("node:fs").renameSync>();
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs")>();
+        writeFileSync.mockImplementation(actual.writeFileSync);
+        renameSync.mockImplementation(actual.renameSync);
+        return { ...actual, writeFileSync, renameSync };
+      });
+
+      const { resolveExcludesFilePath } = await import("../../src/workspace/commit.js");
+      const path = resolveExcludesFilePath();
+
+      expect(writeFileSync).toHaveBeenCalled();
+      // Every writeFileSync call landed on some OTHER path than the final
+      // destination — a concurrent reader opening the destination mid-write
+      // can therefore never observe partial content, only the old file or the
+      // fully-written new one after the rename.
+      for (const call of writeFileSync.mock.calls) {
+        expect(call[0]).not.toBe(path);
+      }
+      expect(renameSync).toHaveBeenCalledWith(expect.not.stringMatching(new RegExp(`^${path}$`)), path);
+
+      // No leftover temp file after the rename.
+      const leftovers = readdirSync(scratchRoot).filter((name) => name !== ".git-excludes");
+      expect(leftovers).toHaveLength(0);
+
+      vi.doUnmock("node:fs");
+    });
   });
 });
