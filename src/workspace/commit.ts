@@ -336,9 +336,60 @@ export function partialAttemptRef(runId: string): string {
   return `refs/graph-bro/partial-attempt/${runId}`;
 }
 
+/**
+ * U8/KTD-13: migrates a pre-namespace ref — one written straight at
+ * `partialAttemptRef(runId)`, as the code before the namespace change did —
+ * to `<namespace>/1`, so `nextPartialAttemptRefName`'s `for-each-ref
+ * <namespace>/*` enumeration (which does not match the bare path) sees it
+ * and allocates above it instead of colliding with it. Git refuses to hold
+ * both a ref AT `<namespace>` and a ref namespace directory THERE at once,
+ * so `update-ref` on the first preserved attempt of such a run fails with a
+ * directory/file conflict without this. A no-op when no bare ref exists, or
+ * when the run already uses the namespaced shape.
+ *
+ * The rename can't be one atomic step — git refuses to create `<namespace>/1`
+ * while `<namespace>` still exists as a ref, even inside one `update-ref
+ * --stdin` transaction — so the delete has to precede the create. That
+ * leaves a window with no ref on the commit at all, and
+ * `refs/graph-bro/partial-attempt/*` keeps no reflog (same reason
+ * `nextPartialAttemptRefName` cites below), so a crash in that window would
+ * make the preserved commit immediately gc-eligible — exactly the loss this
+ * unit exists to prevent. Parking the sha on a holding ref outside the
+ * namespace first closes that window: the commit stays reachable from the
+ * holding ref for the whole delete-then-create, and the holding ref is
+ * cleaned up only once the namespaced ref already holds it.
+ *
+ * The holding ref is keyed on the run id, not a single fixed name. Refs live
+ * in the consumer repo's shared ref store, so two detached engine processes
+ * resuming two different pre-namespace runs against the same repo would
+ * otherwise park on the same ref and overwrite each other: the second park
+ * displaces the first's sha, and if the first has already deleted its bare
+ * ref by then its commit is unreferenced and immediately gc-eligible — the
+ * precise loss the holding ref exists to prevent, reintroduced by sharing
+ * it. Same reasoning KTD-19 applies to the excludes file: a fixed name with
+ * per-run content is a cross-run race.
+ */
+function migrateBarePartialAttemptRef(target: WorkspaceGitTarget, runId: string): void {
+  const namespace = partialAttemptRef(runId);
+  let sha: string;
+  try {
+    sha = runWorkspaceGit(target, ["rev-parse", "--verify", "--quiet", namespace]).trim();
+  } catch {
+    return; // no bare ref to migrate
+  }
+  if (!sha) return;
+
+  const holdingRef = `refs/graph-bro/partial-attempt-migration/${runId}`;
+  runWorkspaceGit(target, ["update-ref", holdingRef, sha]);
+  runWorkspaceGit(target, ["update-ref", "-d", namespace]);
+  runWorkspaceGit(target, ["update-ref", `${namespace}/1`, sha]);
+  runWorkspaceGit(target, ["update-ref", "-d", holdingRef]);
+}
+
 /** The next unused ref under `partialAttemptRef`'s namespace for this run — one per preserved cycle, so a second kill-and-resume never displaces the first's commit (KTD-13). `refs/graph-bro/partial-attempt/*` sits outside `refs/heads/`, so git keeps no reflog and a displaced commit would be immediately gc-eligible. */
 function nextPartialAttemptRefName(target: WorkspaceGitTarget, runId: string): string {
   const namespace = partialAttemptRef(runId);
+  migrateBarePartialAttemptRef(target, runId);
   const existing = runWorkspaceGit(target, ["for-each-ref", "--format=%(refname)", `${namespace}/*`]).trim();
   // Highest existing suffix + 1, not a count: counting reuses a suffix as soon
   // as any earlier ref in the namespace is gone, which would overwrite a

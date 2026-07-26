@@ -402,6 +402,125 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     expect(git(workspace, ["show", `${second.sha}:cycle-two.txt`])).toBe("second interrupted attempt\n");
   });
 
+  it("Covers U8/KTD-13: a pre-namespace bare ref (from before the namespace change) migrates to suffix 1 and the new preservation lands at suffix 2, without a git D/F conflict", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "pre-namespace.txt"), "preserved before the namespace change\n");
+    git(workspace, ["add", "-A"]);
+    const treeSha = git(workspace, ["write-tree"]).trim();
+    const bareSha = git(workspace, ["commit-tree", treeSha, "-p", headBefore, "-m", "old-style preserved commit"]).trim();
+    // Seeds the bare namespace ref exactly as the pre-namespace code wrote it
+    // — a ref AT the namespace path, not beneath it.
+    git(workspace, ["update-ref", partialAttemptRef("run-legacy"), bareSha]);
+
+    writeFileSync(join(workspace, "new-interrupted.txt"), "the newly interrupted attempt\n");
+    const result = preserveInterruptedAttempt(consumer, workspace, "run-legacy", headBefore);
+
+    expect(result.preserved).toBe(true);
+    const refs = partialAttemptRefs(workspace, "run-legacy").sort((a, b) => a.refname.localeCompare(b.refname));
+    expect(refs.map((r) => r.refname)).toEqual([`${partialAttemptRef("run-legacy")}/1`, `${partialAttemptRef("run-legacy")}/2`]);
+    expect(refs[0].sha).toBe(bareSha); // migrated commit, unmoved and undisplaced
+    expect(refs[1].sha).toBe(result.sha);
+    expect(git(workspace, ["show", `${bareSha}:pre-namespace.txt`])).toBe("preserved before the namespace change\n");
+    expect(git(workspace, ["show", `${result.sha}:new-interrupted.txt`])).toBe("the newly interrupted attempt\n");
+  });
+
+  it("a run with no pre-existing ref is unaffected and still allocates suffix 1", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "fresh.txt"), "no prior ref for this run\n");
+
+    const result = preserveInterruptedAttempt(consumer, workspace, "run-fresh", headBefore);
+
+    expect(result.preserved).toBe(true);
+    const refs = partialAttemptRefs(workspace, "run-fresh");
+    expect(refs).toHaveLength(1);
+    expect(refs[0].refname).toBe(`${partialAttemptRef("run-fresh")}/1`);
+    expect(refs[0].sha).toBe(result.sha);
+  });
+
+  it("a run already using the namespaced shape is unaffected by the migration check", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "cycle-one.txt"), "first\n");
+    const first = preserveInterruptedAttempt(consumer, workspace, "run-already-namespaced", headBefore);
+    expect(first.preserved).toBe(true);
+
+    writeFileSync(join(workspace, "cycle-two.txt"), "second\n");
+    const second = preserveInterruptedAttempt(consumer, workspace, "run-already-namespaced", headBefore);
+    expect(second.preserved).toBe(true);
+
+    const refs = partialAttemptRefs(workspace, "run-already-namespaced").sort((a, b) => a.refname.localeCompare(b.refname));
+    expect(refs.map((r) => r.refname)).toEqual([
+      `${partialAttemptRef("run-already-namespaced")}/1`,
+      `${partialAttemptRef("run-already-namespaced")}/2`,
+    ]);
+    expect(refs[0].sha).toBe(first.sha);
+    expect(refs[1].sha).toBe(second.sha);
+  });
+
+  it("the migrated commit stays reachable from some ref after every `update-ref` the migration issues — not just at the end", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "pre-namespace.txt"), "must survive the migration\n");
+    git(workspace, ["add", "-A"]);
+    const treeSha = git(workspace, ["write-tree"]).trim();
+    const bareSha = git(workspace, ["commit-tree", treeSha, "-p", headBefore, "-m", "old-style preserved commit"]).trim();
+    git(workspace, ["update-ref", partialAttemptRef("run-audit"), bareSha]);
+
+    // A `git` shim that forwards every `update-ref` call to the real binary
+    // and then, from OUTSIDE that same process, immediately checks whether
+    // `bareSha` is reachable from any ref — logging one line per call. This
+    // is real git, called synchronously after each real `update-ref` this
+    // migration issues, not a mock: the holding-ref ordering exists
+    // precisely so every line in the log says reachable, including the ones
+    // between the bare ref's deletion and the namespaced ref's creation —
+    // asserting only the end state would miss that window entirely.
+    const shimDir = mkdtempSync(join(tmpdir(), "graph-bro-audit-shim-"));
+    const logPath = join(shimDir, "reachability.log");
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim().split("\n")[0];
+    const gitShimPath = join(shimDir, "git");
+    writeFileSync(
+      gitShimPath,
+      `#!/bin/bash
+set -u
+"${realGit}" "$@"
+status=$?
+
+args=("$@")
+is_update_ref=0
+git_dir=""
+for ((i = 0; i < \${#args[@]}; i++)); do
+  if [ "\${args[i]}" = "update-ref" ]; then is_update_ref=1; fi
+  if [ "\${args[i]}" = "--git-dir" ]; then git_dir="\${args[i+1]:-}"; fi
+done
+
+if [ "$is_update_ref" = "1" ] && [ -n "$git_dir" ]; then
+  out="$("${realGit}" --git-dir "$git_dir" for-each-ref --contains ${bareSha} 2>&1)"
+  if [ -n "$out" ]; then
+    echo "reachable" >> "${logPath}"
+  else
+    echo "UNREACHABLE" >> "${logPath}"
+  fi
+fi
+exit $status
+`,
+    );
+    execFileSync("chmod", ["+x", gitShimPath]);
+
+    const priorPath = process.env.PATH;
+    let lines: string[];
+    try {
+      process.env.PATH = `${shimDir}:${priorPath}`;
+      writeFileSync(join(workspace, "new-interrupted.txt"), "the newly interrupted attempt\n");
+      const result = preserveInterruptedAttempt(consumer, workspace, "run-audit", headBefore);
+      expect(result.preserved).toBe(true);
+      lines = existsSync(logPath) ? readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean) : [];
+    } finally {
+      process.env.PATH = priorPath;
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.every((line) => line === "reachable")).toBe(true);
+  });
+
   it("Covers U6/KTD-20: staging that first fails with a concurrent-modification error and then succeeds still preserves the attempt, rather than throwing", () => {
     const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
     writeFileSync(join(workspace, "mid-edit.txt"), "still being written by a detached process\n");
