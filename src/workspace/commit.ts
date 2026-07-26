@@ -195,9 +195,26 @@ function stageAll(target: WorkspaceGitTarget): void {
       return;
     } catch (err) {
       const detail = `${(err as { stderr?: unknown }).stderr ?? ""}${(err as Error).message ?? ""}`;
-      if (attempt >= STAGE_ATTEMPTS || !CONCURRENT_MODIFICATION.test(detail)) throw err;
+      if (!shouldRetryStaging(detail, attempt)) throw err;
     }
   }
+}
+
+/**
+ * U6/KTD-20: the staging retry's decision, extracted as a pure function of
+ * the error text and how many attempts have already been made — mirroring
+ * `quiescenceWarningFor`'s extraction below for an analogous untestable race.
+ * Proving `stageAll`'s retry-vs-rethrow branch end-to-end means making `git
+ * add -A` fail once and then succeed, which in-process has no seam at all
+ * (no injection point, no delay) short of racing a live background writer;
+ * the decision itself is what carries the behavior, so it is tested directly
+ * instead. `stageAll` keeps ownership of assembling `detail` from `stderr` +
+ * `message` — only it knows the shape of the error it just caught — so this
+ * takes the already-assembled string, letting a test hand it synthetic
+ * stderr text without ever constructing a fake error object.
+ */
+export function shouldRetryStaging(detail: string, attemptNumber: number): boolean {
+  return attemptNumber < STAGE_ATTEMPTS && CONCURRENT_MODIFICATION.test(detail);
 }
 
 function porcelain(target: WorkspaceGitTarget): string {
@@ -438,7 +455,11 @@ export function preserveInterruptedAttempt(
     return { preserved: false };
   }
 
-  runWorkspaceGit(target, ["add", "-A"]);
+  // U6: routed through the same retrying `stageAll` `commitAttempt` uses,
+  // not a bare `git add -A` — this runs on every resume immediately after a
+  // kill, exactly when a detached background writer (left behind by the very
+  // node that was killed) is most likely still modifying the workspace.
+  stageAll(target);
   const treeSha = runWorkspaceGit(target, ["write-tree"]).trim();
   const sha = runWorkspaceGit(target, [
     "commit-tree",

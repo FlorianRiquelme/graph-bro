@@ -10,9 +10,11 @@ import {
   partialAttemptRef,
   preserveInterruptedAttempt,
   quiescenceWarningFor,
+  shouldRetryStaging,
 } from "../../src/workspace/commit.js";
 import type { EventRow } from "../../src/store/trace.js";
 import { reattachToRunBranch } from "../../src/workspace/lifecycle.js";
+import { createGitShim } from "../fixtures/cli-harness.js";
 
 /** `git symbolic-ref -q HEAD` exits 1 (no output) when detached — execFileSync throws on that, so this reports "" instead of letting the throw escape. */
 function symbolicRefOrEmpty(cwd: string): string {
@@ -398,6 +400,49 @@ describe("workspace/commit: preserveInterruptedAttempt (U8, F3/AE9, real git)", 
     // Both commits are independently reachable and hold their own distinct content.
     expect(git(workspace, ["show", `${first.sha}:cycle-one.txt`])).toBe("first interrupted attempt\n");
     expect(git(workspace, ["show", `${second.sha}:cycle-two.txt`])).toBe("second interrupted attempt\n");
+  });
+
+  it("Covers U6/KTD-20: staging that first fails with a concurrent-modification error and then succeeds still preserves the attempt, rather than throwing", () => {
+    const headBefore = git(workspace, ["rev-parse", "HEAD"]).trim();
+    writeFileSync(join(workspace, "mid-edit.txt"), "still being written by a detached process\n");
+
+    // A one-shot `git` shim stands in for a live background writer dying
+    // `git add -A` once with the exact wording `preserveInterruptedAttempt`
+    // must tolerate — deterministic, unlike racing a real writer process.
+    const shim = createGitShim({ match: ["add", "-A"], stderr: "fatal: short read while indexing 'mid-edit.txt'\n" });
+    const priorPath = process.env.PATH;
+    process.env.PATH = `${shim.dir}:${priorPath}`;
+    try {
+      const result = preserveInterruptedAttempt(consumer, workspace, "run-shimmed", headBefore);
+
+      expect(result.preserved).toBe(true);
+      expect(result.sha).toBeTruthy();
+      expect(git(workspace, ["show", `${result.sha}:mid-edit.txt`])).toBe("still being written by a detached process\n");
+    } finally {
+      process.env.PATH = priorPath;
+      shim.cleanup();
+    }
+  });
+});
+
+describe("workspace/commit: shouldRetryStaging (U6/KTD-20 — the staging retry decision, tested directly rather than by racing a live writer)", () => {
+  it("retries for each of the three matched git wordings, case-insensitively", () => {
+    expect(shouldRetryStaging("fatal: short read while indexing 'x'", 1)).toBe(true);
+    expect(shouldRetryStaging("FATAL: SHORT READ WHILE INDEXING 'X'", 1)).toBe(true);
+    expect(shouldRetryStaging("error: unable to index file 'x'", 2)).toBe(true);
+    expect(shouldRetryStaging("Unable To Index File 'x'", 2)).toBe(true);
+    expect(shouldRetryStaging("fatal: x file changed as we read it", 3)).toBe(true);
+    expect(shouldRetryStaging("FILE CHANGED AS WE READ IT", 3)).toBe(true);
+  });
+
+  it("does not retry an unrelated failure — a locked index, a full disk — so a genuine error surfaces immediately rather than being retried five times and reported late", () => {
+    expect(shouldRetryStaging("fatal: Unable to create '.git/index.lock': File exists.", 1)).toBe(false);
+    expect(shouldRetryStaging("fatal: write error: No space left on device", 1)).toBe(false);
+  });
+
+  it("does not retry once the attempt count reaches the cap, even for a matched wording", () => {
+    expect(shouldRetryStaging("fatal: short read while indexing 'x'", 5)).toBe(false);
+    expect(shouldRetryStaging("fatal: short read while indexing 'x'", 6)).toBe(false);
   });
 });
 

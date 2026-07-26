@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,6 +151,89 @@ export function seedWorkspaceForRun(
   }
 
   return { baseRef, workspacePath, runBranch };
+}
+
+export interface GitShimOptions {
+  /**
+   * Contiguous argv tokens to intercept, matched anywhere in the real `git`
+   * invocation — e.g. `["add", "-A"]`, or a single subcommand token such as
+   * `["commit-tree"]` to intercept regardless of the (variable) arguments
+   * that follow it.
+   */
+  match: string[];
+  /** stderr text the shim emits on each intercepted invocation. */
+  stderr: string;
+  /** Exit code for intercepted invocations. Defaults to 1. */
+  exitCode?: number;
+  /** How many times to intercept before delegating to the real git. Defaults to 1 (one-shot). */
+  times?: number;
+}
+
+export interface GitShim {
+  /** Scratch directory to prepend to `PATH` so this shim's `git` is found first. */
+  dir: string;
+  /** Removes the scratch directory. */
+  cleanup: () => void;
+}
+
+/**
+ * U6/KTD-20: a deterministic replacement for racing a live background writer
+ * against `git`. Writes an executable `git` into a fresh scratch directory
+ * that intercepts a matching invocation `times` times (failing it with the
+ * given `stderr`/`exitCode`), then delegates every other invocation —
+ * matched or not, past the intercept count — to the real, absolutely
+ * resolved git, so it is never re-entered via `PATH`. One-shot state lives in
+ * a counter file inside the shim's own scratch directory, so two tests using
+ * this helper concurrently (each with their own `dir`) never interfere.
+ *
+ * Reusable beyond U6: a future test intercepting a different subcommand (say
+ * `commit-tree` or `commit`, whose trailing arguments vary run to run) can
+ * match on just that one token rather than a full trailing argv.
+ */
+export function createGitShim(options: GitShimOptions): GitShim {
+  const { match, stderr, exitCode = 1, times = 1 } = options;
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim().split("\n")[0];
+  const dir = mkdtempSync(join(tmpdir(), "graph-bro-git-shim-"));
+  const gitPath = join(dir, "git");
+
+  // Bash (not sh) for its arrays: matching an arbitrary-length token sequence
+  // anywhere in argv — not just as a trailing suffix — needs a sliding-window
+  // comparison over an argv array, which POSIX sh has no clean way to express.
+  const script = `#!/bin/bash
+set -u
+DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+REAL_GIT=${JSON.stringify(realGit)}
+COUNTER_FILE="$DIR/.shim-count"
+MAX_TIMES=${times}
+EXIT_CODE=${exitCode}
+PATTERN=(${match.map((token) => JSON.stringify(token)).join(" ")})
+
+args=("$@")
+n=\${#PATTERN[@]}
+matched=0
+for ((i = 0; i + n <= \${#args[@]}; i++)); do
+  ok=1
+  for ((j = 0; j < n; j++)); do
+    if [ "\${args[i+j]}" != "\${PATTERN[j]}" ]; then ok=0; break; fi
+  done
+  if [ "$ok" = "1" ]; then matched=1; break; fi
+done
+
+count=0
+[ -f "$COUNTER_FILE" ] && count="$(cat "$COUNTER_FILE")"
+
+if [ "$matched" = "1" ] && [ "$count" -lt "$MAX_TIMES" ]; then
+  echo $((count + 1)) > "$COUNTER_FILE"
+  printf '%s' ${JSON.stringify(stderr)} >&2
+  exit "$EXIT_CODE"
+fi
+
+exec "$REAL_GIT" "$@"
+`;
+  writeFileSync(gitPath, script);
+  chmodSync(gitPath, 0o755);
+
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 export function isAlive(pid: number): boolean {
